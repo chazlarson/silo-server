@@ -145,17 +145,32 @@ export default function MatchItemDialog({ item, open, onOpenChange }: MatchItemD
     });
   }, []);
 
+  const doApply = useCallback(
+    (candidate: MatchCandidate) => {
+      applyMutation.mutate(
+        { item, providerIds: candidate.provider_ids },
+        {
+          onSuccess: () => {
+            onOpenChange(false);
+          },
+        },
+      );
+    },
+    [applyMutation, item, onOpenChange],
+  );
+
   const handleApply = useCallback(() => {
     if (!selectedCandidate) return;
-    applyMutation.mutate(
-      { item, providerIds: selectedCandidate.provider_ids },
-      {
-        onSuccess: () => {
-          onOpenChange(false);
-        },
-      },
-    );
-  }, [selectedCandidate, applyMutation, item, onOpenChange]);
+    doApply(selectedCandidate);
+  }, [selectedCandidate, doApply]);
+
+  const handleCandidateDoubleClick = useCallback(
+    (candidate: MatchCandidate) => {
+      setSelectedCandidate(candidate);
+      doApply(candidate);
+    },
+    [doApply],
+  );
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -331,6 +346,7 @@ export default function MatchItemDialog({ item, open, onOpenChange }: MatchItemD
                             : "border-border hover:bg-muted/50",
                         )}
                         onClick={() => setSelectedCandidate(candidate)}
+                        onDoubleClick={() => handleCandidateDoubleClick(candidate)}
                         data-testid="match-candidate"
                       >
                         {candidate.image_url ? (
