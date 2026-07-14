@@ -666,6 +666,7 @@ func (s *Service) streamFileRecords(ctx context.Context, folderIDs []int, fn fun
 			audio_tracks,
 			subtitle_tracks,
 			external_subtitles,
+			chapters,
 			intro_start,
 			intro_end,
 			credits_start,
@@ -744,6 +745,7 @@ func scanFileRecordRow(row interface {
 	var audioTracksJSON []byte
 	var subtitleTracksJSON []byte
 	var externalSubtitlesJSON []byte
+	var chaptersJSON []byte
 
 	if err := row.Scan(
 		&contentID,
@@ -766,6 +768,7 @@ func scanFileRecordRow(row interface {
 		&audioTracksJSON,
 		&subtitleTracksJSON,
 		&externalSubtitlesJSON,
+		&chaptersJSON,
 		&record.IntroStart,
 		&record.IntroEnd,
 		&record.CreditsStart,
@@ -856,6 +859,12 @@ func scanFileRecordRow(row interface {
 	}
 	if record.ExternalSubtitles == nil {
 		record.ExternalSubtitles = []ExternalSubtitleRecord{}
+	}
+
+	if len(chaptersJSON) > 0 {
+		if err := json.Unmarshal(chaptersJSON, &record.Chapters); err != nil {
+			return FileRecord{}, fmt.Errorf("unmarshaling export chapters: %w", err)
+		}
 	}
 
 	return record, nil

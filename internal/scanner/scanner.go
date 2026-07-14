@@ -2420,9 +2420,6 @@ func needsCriticalProbeRepairScanState(file *scanStateFile) bool {
 	if !file.HasAudioTracks {
 		return true
 	}
-	if !file.HasChapters {
-		return true
-	}
 	return false
 }
 

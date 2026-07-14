@@ -1,6 +1,7 @@
 package adminjob
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -584,14 +585,14 @@ func (r *Runner) executeCatalogImport(job *models.AdminJob) {
 		r.publishJobByID(ctx, notifications.TypeJobProgress, job.ID)
 	}
 
-	var data []byte
+	var importReader io.ReadCloser
 	if req.LocalPath != "" {
-		var err error
-		data, err = os.ReadFile(req.LocalPath)
+		f, err := os.Open(req.LocalPath)
 		if err != nil {
-			r.failJob(job.ID, 0, 0, "Catalog import failed", fmt.Sprintf("reading local file: %v", err))
+			r.failJob(job.ID, 0, 0, "Catalog import failed", fmt.Sprintf("opening local file: %v", err))
 			return
 		}
+		importReader = f
 	} else if req.RemoteURL != "" {
 		if err := r.repo.UpdateProgress(ctx, job.ID, 0, 0, "Downloading catalog import source"); err != nil {
 			slog.Warn("admin jobs: failed to update remote import progress", "job_id", job.ID, "error", err)
@@ -599,7 +600,7 @@ func (r *Runner) executeCatalogImport(job *models.AdminJob) {
 			r.publishJobByID(ctx, notifications.TypeJobProgress, job.ID)
 		}
 		var err error
-		data, err = downloadRemoteCatalogSeed(ctx, req.RemoteURL)
+		importReader, err = streamRemoteCatalogSeed(ctx, req.RemoteURL)
 		if err != nil {
 			r.failJob(job.ID, 0, 0, "Catalog import failed", err.Error())
 			return
@@ -616,12 +617,12 @@ func (r *Runner) executeCatalogImport(job *models.AdminJob) {
 			r.failJob(job.ID, 0, 0, "Catalog import failed", "missing import source object")
 			return
 		}
-		var err error
-		data, err = r.store.GetObject(ctx, req.SourceBucket, req.SourceKey)
+		data, err := r.store.GetObject(ctx, req.SourceBucket, req.SourceKey)
 		if err != nil {
 			r.failJob(job.ID, 0, 0, "Catalog import failed", err.Error())
 			return
 		}
+		importReader = io.NopCloser(bytes.NewReader(data))
 		if req.CleanupSource {
 			defer func() {
 				if err := r.store.DeleteObject(context.Background(), req.SourceBucket, req.SourceKey); err != nil {
@@ -630,12 +631,17 @@ func (r *Runner) executeCatalogImport(job *models.AdminJob) {
 			}()
 		}
 	}
+	defer func() {
+		if importReader != nil {
+			_ = importReader.Close()
+		}
+	}()
 
 	var (
 		lastProgressUpdate time.Time
 		lastProgress       catalogseed.ImportProgress
 	)
-	result, importErr := r.exporter.ImportWithProgress(ctx, data, req.Options, func(progress catalogseed.ImportProgress) {
+	result, importErr := r.exporter.ImportStream(ctx, importReader, req.Options, func(progress catalogseed.ImportProgress) {
 		lastProgress = progress
 		if time.Since(lastProgressUpdate) < time.Second && progress.Current != progress.Total {
 			return
@@ -667,7 +673,7 @@ func (r *Runner) executeCatalogImport(job *models.AdminJob) {
 	r.publishJobByID(completeCtx, notifications.TypeJobCompleted, job.ID)
 }
 
-func downloadRemoteCatalogSeed(ctx context.Context, remoteURL string) ([]byte, error) {
+func streamRemoteCatalogSeed(ctx context.Context, remoteURL string) (io.ReadCloser, error) {
 	parsed, err := url.Parse(remoteURL)
 	if err != nil {
 		return nil, fmt.Errorf("invalid remote URL: %w", err)
@@ -691,18 +697,13 @@ func downloadRemoteCatalogSeed(ctx context.Context, remoteURL string) ([]byte, e
 	if err != nil {
 		return nil, fmt.Errorf("downloading remote catalog seed: %w", err)
 	}
-	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
+		resp.Body.Close()
 		return nil, fmt.Errorf("downloading remote catalog seed: unexpected status %d", resp.StatusCode)
 	}
 
-	data, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("reading remote catalog seed: %w", err)
-	}
-
-	return data, nil
+	return resp.Body, nil
 }
 
 func (r *Runner) executeItemRefresh(job *models.AdminJob) {

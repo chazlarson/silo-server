@@ -229,11 +229,25 @@ type FileRecord struct {
 	IntroEnd          *float64                 `json:"intro_end,omitempty"`
 	CreditsStart      *float64                 `json:"credits_start,omitempty"`
 	CreditsEnd        *float64                 `json:"credits_end,omitempty"`
+	Chapters          []ChapterRecord           `json:"chapters"`
 	ProbeSource       string                   `json:"probe_source"`
 	ProbeUpdatedAt    *time.Time               `json:"probe_updated_at,omitempty"`
 	MissingSince      *time.Time               `json:"missing_since,omitempty"`
 	CreatedAt         time.Time                `json:"created_at"`
 	UpdatedAt         time.Time                `json:"updated_at"`
+}
+
+type ChapterRecord struct {
+	Index               int        `json:"index"`
+	Title               string     `json:"title"`
+	StartSeconds        float64    `json:"start_seconds"`
+	EndSeconds          float64    `json:"end_seconds"`
+	Source              string     `json:"source"`
+	ThumbnailPath       string     `json:"thumbnail_path,omitempty"`
+	ThumbnailThumbhash  string     `json:"thumbnail_thumbhash,omitempty"`
+	ThumbnailRetryAfter *time.Time `json:"thumbnail_retry_after,omitempty"`
+	ThumbnailFailedAt   *time.Time `json:"thumbnail_failed_at,omitempty"`
+	ThumbnailLastError  string     `json:"thumbnail_last_error,omitempty"`
 }
 
 type LibraryLinkRecord struct {
