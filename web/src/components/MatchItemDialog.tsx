@@ -155,27 +155,42 @@ export default function MatchItemDialog({
     });
   }, []);
 
+  const doApply = useCallback(
+    (candidate: MatchCandidate) => {
+      applyMutation.mutate(
+        {
+          item,
+          providerIds: candidate.provider_ids,
+          // Close before following the new ID: the page keys this dialog by
+          // content ID, so it unmounts on navigation and the per-call onSuccess
+          // below never runs, which would leave the page's open state set.
+          onReplaced: (contentID) => {
+            onOpenChange(false);
+            return onReplaced?.(contentID);
+          },
+        },
+        {
+          onSuccess: () => {
+            onOpenChange(false);
+          },
+        },
+      );
+    },
+    [applyMutation, item, onOpenChange, onReplaced],
+  );
+
   const handleApply = useCallback(() => {
     if (!selectedCandidate) return;
-    applyMutation.mutate(
-      {
-        item,
-        providerIds: selectedCandidate.provider_ids,
-        // Close before following the new ID: the page keys this dialog by
-        // content ID, so it unmounts on navigation and the per-call onSuccess
-        // below never runs, which would leave the page's open state set.
-        onReplaced: (contentID) => {
-          onOpenChange(false);
-          return onReplaced?.(contentID);
-        },
-      },
-      {
-        onSuccess: () => {
-          onOpenChange(false);
-        },
-      },
-    );
-  }, [selectedCandidate, applyMutation, item, onOpenChange, onReplaced]);
+    doApply(selectedCandidate);
+  }, [selectedCandidate, doApply]);
+
+  const handleCandidateDoubleClick = useCallback(
+    (candidate: MatchCandidate) => {
+      setSelectedCandidate(candidate);
+      doApply(candidate);
+    },
+    [doApply],
+  );
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -357,6 +372,7 @@ export default function MatchItemDialog({
                             : "border-border hover:bg-muted/50",
                         )}
                         onClick={() => setSelectedCandidate(candidate)}
+                        onDoubleClick={() => handleCandidateDoubleClick(candidate)}
                         data-testid="match-candidate"
                       >
                         {candidate.image_url ? (
