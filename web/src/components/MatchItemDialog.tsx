@@ -1,4 +1,4 @@
-import { useState, useCallback, useMemo, useRef } from "react";
+import { useState, useCallback, useMemo, useRef, type KeyboardEvent } from "react";
 import { Copy, Folder, Plus, Search, X } from "lucide-react";
 import { toast } from "sonner";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
@@ -217,6 +217,12 @@ export default function MatchItemDialog({ item, open, onOpenChange }: MatchItemD
                 id="match-title"
                 value={title}
                 onChange={(e) => setTitle(e.target.value)}
+                onKeyDown={(e: KeyboardEvent<HTMLInputElement>) => {
+                  if (e.key === "Enter") {
+                    e.preventDefault();
+                    handleSearch();
+                  }
+                }}
                 placeholder="Title"
               />
             </div>
