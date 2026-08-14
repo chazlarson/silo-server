@@ -121,6 +121,16 @@ describe("AdminSectionCommandDialog", () => {
     expect(screen.queryByRole("searchbox", { name: "Search admin sections" })).toBeNull();
   });
 
+  it("opens client diagnostics from admin search", async () => {
+    renderDialog();
+
+    const searchBox = await openDialog();
+    await userEvent.type(searchBox, "client diagnostics");
+    await userEvent.click(screen.getByRole("option", { name: /Diagnostics/ }));
+
+    expect(screen.getByLabelText("Current path")).toHaveTextContent("/admin/diagnostics");
+  });
+
   it("closes with Escape", async () => {
     renderDialog();
 

@@ -3,7 +3,32 @@ package catalogseed
 import (
 	"reflect"
 	"testing"
+
+	"github.com/Silo-Server/silo-server/internal/models"
 )
+
+func TestToVideoTrackRecordsPreservesVideoMetadata(t *testing.T) {
+	got := toVideoTrackRecords([]models.VideoTrack{
+		{ColorRange: "tv", DVLevel: 6},
+		{ColorRange: "pc"},
+		{ColorRange: "unknown"},
+	})
+
+	if len(got) != 3 {
+		t.Fatalf("records length = %d, want 3", len(got))
+	}
+	if got[0].ColorRange != "tv" || got[1].ColorRange != "pc" || got[2].ColorRange != "unknown" {
+		t.Fatalf(
+			"ColorRange values = [%q, %q, %q], want [tv, pc, unknown]",
+			got[0].ColorRange,
+			got[1].ColorRange,
+			got[2].ColorRange,
+		)
+	}
+	if got[0].DVLevel != 6 {
+		t.Fatalf("DVLevel = %d, want 6", got[0].DVLevel)
+	}
+}
 
 func TestCatalogSeedSearchUpsertIDsIncludesChangedItemsAndEmbeddings(t *testing.T) {
 	itemStates := map[string]bool{

@@ -345,13 +345,7 @@ func compareStableWebVersions(left, right webStableVersion) int {
 }
 
 func WebComponentStatusForConfig(cfg *config.Config, settings map[string]string) WebComponentStatus {
-	enabled := false
-	if cfg != nil {
-		enabled = cfg.JellyfinCompat.Enabled
-	}
-	if raw := strings.TrimSpace(settings["jellyfin_compat.enabled"]); raw != "" {
-		enabled = strings.EqualFold(raw, "true") || raw == "1" || strings.EqualFold(raw, "yes")
-	}
+	enabled := configuredCompatEnabled(cfg, settings)
 
 	configuredWebEnabled := true
 	if cfg != nil {
@@ -1163,6 +1157,15 @@ func finishWebOperation(root, id string, err error) *WebComponentOperationStatus
 		}
 	}
 	return copied
+}
+
+// CurrentWebOperation reports the install or remove operation in progress for
+// an install root, or nil when none is. Exported so a caller that has to
+// outlive an asynchronous operation — a test cleaning up the root it handed to
+// StartWebComponentRemove, for one — can wait for a terminal state rather than
+// deleting the directory out from under the goroutine still writing to it.
+func CurrentWebOperation(root string) *WebComponentOperationStatus {
+	return currentWebOperation(root)
 }
 
 func currentWebOperation(root string) *WebComponentOperationStatus {

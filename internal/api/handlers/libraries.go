@@ -8,7 +8,6 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
-	"os"
 	"path/filepath"
 	"slices"
 	"sort"
@@ -31,6 +30,7 @@ import (
 	"github.com/Silo-Server/silo-server/internal/metadata"
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/plugins"
+	"github.com/Silo-Server/silo-server/internal/rootcheck"
 	"github.com/Silo-Server/silo-server/internal/scanner"
 	"github.com/Silo-Server/silo-server/internal/scantrigger"
 	"github.com/Silo-Server/silo-server/internal/sections"
@@ -101,19 +101,24 @@ type libraryScanQueuer interface {
 type libraryMovieMatchQueue interface {
 	SyncForFolder(ctx context.Context, folderID int) error
 	DeleteByFolder(ctx context.Context, folderID int) (int, error)
-	CountByFolder(ctx context.Context, folderID int) (int, error)
+	CountStatesByFolder(ctx context.Context, folderID int) (pending int, parked int, err error)
+	CountStatesByFolders(ctx context.Context, folderIDs []int) (map[int]metadata.MatchQueueStateCounts, error)
 	ListByFolder(ctx context.Context, folderID int, limit int, offset int) ([]models.MovieMatchQueueEntry, int, error)
+	RetryNowByFolder(ctx context.Context, folderID int) (int, error)
 }
 
 type librarySeriesMatchQueue interface {
 	SyncForFolder(ctx context.Context, folderID int) error
 	DeleteByFolder(ctx context.Context, folderID int) (int, error)
-	CountByFolder(ctx context.Context, folderID int) (int, error)
+	CountStatesByFolder(ctx context.Context, folderID int) (pending int, parked int, err error)
+	CountStatesByFolders(ctx context.Context, folderIDs []int) (map[int]metadata.MatchQueueStateCounts, error)
 	ListByFolder(ctx context.Context, folderID int, limit int, offset int) ([]models.SeriesRootMatchQueueEntry, int, error)
+	RetryNowByFolder(ctx context.Context, folderID int) (int, error)
 }
 
 type libraryRawMatchBacklog interface {
 	CountUnmatchedMatchBacklogByFolder(ctx context.Context, folderID int, mode scanner.RawMatchBacklogMode) (int, error)
+	CountUnmatchedMatchBacklogByFolders(ctx context.Context, folderIDs []int, mode scanner.RawMatchBacklogMode) (map[int]int, error)
 	ListUnmatchedMatchBacklogByFolder(ctx context.Context, folderID int, mode scanner.RawMatchBacklogMode, limit int, offset int) ([]*models.MediaFile, int, error)
 	SuppressUnmatchedMatchBacklogByFolder(ctx context.Context, folderID int, mode scanner.RawMatchBacklogMode) (int, error)
 	RetryUnmatchedMatchBacklogByFolder(ctx context.Context, folderID int, mode scanner.RawMatchBacklogMode) (int, error)
@@ -251,6 +256,11 @@ type libraryMountCheckRootResponse struct {
 	Reachable    bool    `json:"reachable"`
 	ErrorCode    *string `json:"error_code"`
 	ErrorMessage *string `json:"error_message"`
+	// SuspectEmpty is set when the root is reachable but the library holds
+	// only missing-marked files under it — the signature of a lost mount
+	// exposing an empty mountpoint directory, which a reachability probe
+	// alone cannot detect. Additive field; absent/false for healthy roots.
+	SuspectEmpty bool `json:"suspect_empty"`
 }
 
 type libraryMountCheckResponse struct {
@@ -708,7 +718,11 @@ func (h *LibraryHandler) HandleUpdateLibrary(w http.ResponseWriter, r *http.Requ
 	// existing items adopt the new language instead of keeping the one
 	// stamped at first match. Quick mode suffices: the refresh item lister
 	// includes complete-but-language-mismatched items.
-	if h.JobRepo != nil && !strings.EqualFold(strings.TrimSpace(oldFolder.MetadataLanguage), strings.TrimSpace(folder.MetadataLanguage)) {
+	languageChanged := !strings.EqualFold(strings.TrimSpace(oldFolder.MetadataLanguage), strings.TrimSpace(folder.MetadataLanguage))
+	if languageChanged {
+		h.wakeMetadataMatcher(r.Context(), folder.ID)
+	}
+	if h.JobRepo != nil && languageChanged {
 		job, jobErr := h.JobRepo.CreateLibraryRefresh(r.Context(), currentAdminUserID(r), adminjob.LibraryRefreshRequest{
 			LibraryID:   folder.ID,
 			LibraryName: folder.Name,
@@ -847,8 +861,9 @@ func (h *LibraryHandler) HandleCheckLibraryMount(w http.ResponseWriter, r *http.
 		return
 	}
 
-	resp := checkLibraryMount(folder)
-	if resp.Healthy && folder.ScanWarningCode != nil && *folder.ScanWarningCode == "empty_root" {
+	resp := h.checkLibraryMount(r.Context(), folder)
+	if resp.Healthy && folder.ScanWarningCode != nil &&
+		(*folder.ScanWarningCode == "empty_root" || *folder.ScanWarningCode == "dead_root") {
 		if err := h.folderRepo.ClearScanWarning(r.Context(), folder.ID); err != nil {
 			if errors.Is(err, catalog.ErrFolderNotFound) {
 				writeError(w, http.StatusNotFound, "not_found", "Library not found")
@@ -1234,6 +1249,7 @@ func scanRunResultFromIngest(result *libraryingest.Result) *evt.ScanRunResult {
 		resp.Updated = result.ScanResult.Updated
 		resp.Unchanged = result.ScanResult.Unchanged
 		resp.Missing = result.ScanResult.Missing
+		resp.MissingSkippedProtected = result.ScanResult.MissingSkippedProtected
 		resp.FilesDeleted = result.ScanResult.FilesDeleted
 		resp.MembershipsRemoved = result.ScanResult.MembershipsRemoved
 		resp.ItemsDeleted = result.ScanResult.ItemsDeleted
@@ -1256,7 +1272,7 @@ func scanBoolMetric(result *libraryingest.Result, pick func(*scanner.ScanResult)
 	return pick(result.ScanResult)
 }
 
-func checkLibraryMount(folder *models.MediaFolder) libraryMountCheckResponse {
+func (h *LibraryHandler) checkLibraryMount(ctx context.Context, folder *models.MediaFolder) libraryMountCheckResponse {
 	resp := libraryMountCheckResponse{
 		Status:      "ok",
 		LibraryID:   folder.ID,
@@ -1273,59 +1289,64 @@ func checkLibraryMount(folder *models.MediaFolder) libraryMountCheckResponse {
 	}
 
 	unreachable := 0
-	for _, path := range folder.Paths {
+	emptyPaths := make([]string, 0, len(folder.Paths))
+	probes := rootcheck.ProbeManyWithTimeout(ctx, folder.Paths, rootcheck.DefaultProbeTimeout)
+	for i, path := range folder.Paths {
+		probe := probes[i]
 		root := libraryMountCheckRootResponse{
 			Path:      path,
-			Reachable: true,
+			Reachable: probe.Reachable,
 		}
-
-		info, err := os.Stat(path)
-		if err != nil {
-			code, message := classifyMountCheckError(err, false)
-			root.Reachable = false
-			root.ErrorCode = stringPtr(code)
-			root.ErrorMessage = stringPtr(message)
-		} else if !info.IsDir() {
-			root.Reachable = false
-			root.ErrorCode = stringPtr("not_directory")
-			root.ErrorMessage = stringPtr("Path is not a directory")
-		} else if _, err := os.ReadDir(path); err != nil {
-			code, message := classifyMountCheckError(err, true)
-			root.Reachable = false
-			root.ErrorCode = stringPtr(code)
-			root.ErrorMessage = stringPtr(message)
-		}
-
-		if !root.Reachable {
+		if !probe.Reachable {
+			root.ErrorCode = stringPtr(probe.ErrorCode)
+			root.ErrorMessage = stringPtr(probe.ErrorMessage)
 			unreachable++
 			resp.Healthy = false
+		} else if probe.Empty {
+			emptyPaths = append(emptyPaths, path)
 		}
 		resp.Roots = append(resp.Roots, root)
 	}
 
-	switch unreachable {
-	case 0:
+	// A reachable but literally empty root can be a lost mount that left its
+	// bare mountpoint behind. Cross-check against the catalog: an empty root
+	// holding only missing-marked files is suspect, and reporting it healthy
+	// would both mislead the operator and wrongly clear the dead_root
+	// warning. Best-effort — probe results stand on a query error.
+	suspect := 0
+	if h.pool != nil && len(emptyPaths) > 0 {
+		suspectRoots, err := scanner.NewFileRepository(h.pool).ListRootsWithOnlyMissingFiles(ctx, folder.ID, emptyPaths)
+		if err != nil {
+			slog.WarnContext(ctx, "mount check: suspect-empty root query failed", "component", "api", "library_id", folder.ID, "error", err)
+		} else if len(suspectRoots) > 0 {
+			suspectSet := make(map[string]bool, len(suspectRoots))
+			for _, root := range suspectRoots {
+				suspectSet[root] = true
+			}
+			for i := range resp.Roots {
+				if resp.Roots[i].Reachable && suspectSet[resp.Roots[i].Path] {
+					resp.Roots[i].SuspectEmpty = true
+					suspect++
+					resp.Healthy = false
+				}
+			}
+		}
+	}
+
+	switch {
+	case unreachable == 0 && suspect == 0:
 		resp.Summary = "All configured roots are reachable"
-	case 1:
+	case unreachable == 0:
+		resp.Summary = fmt.Sprintf("%d of %d roots reachable but empty while the library still has cataloged files (lost mount?)", suspect, len(folder.Paths))
+	case suspect > 0:
+		resp.Summary = fmt.Sprintf("%d of %d roots unreachable; %d more reachable but empty while the library still has cataloged files", unreachable, len(folder.Paths), suspect)
+	case unreachable == 1:
 		resp.Summary = fmt.Sprintf("1 of %d roots unreachable", len(folder.Paths))
 	default:
 		resp.Summary = fmt.Sprintf("%d of %d roots unreachable", unreachable, len(folder.Paths))
 	}
 
 	return resp
-}
-
-func classifyMountCheckError(err error, isRead bool) (string, string) {
-	switch {
-	case errors.Is(err, os.ErrNotExist):
-		return "not_found", "Path does not exist"
-	case errors.Is(err, os.ErrPermission):
-		return "permission_denied", "Permission denied"
-	case isRead:
-		return "read_failed", "Failed to read directory"
-	default:
-		return "stat_failed", "Failed to stat path"
-	}
 }
 
 func stringPtr(v string) *string {
@@ -1359,6 +1380,8 @@ type libraryMetadataMatchQueueStatusResponse struct {
 	SeriesCount  int `json:"series_count"`
 	RawFileCount int `json:"raw_file_count"`
 	TotalCount   int `json:"total_count"`
+	PendingCount int `json:"pending_count"`
+	ParkedCount  int `json:"parked_count"`
 }
 
 type libraryMetadataMatchQueueActionResponse struct {
@@ -1374,32 +1397,46 @@ type libraryMetadataMatchQueueActionResponse struct {
 
 type libraryMetadataMatchQueueDetailResponse struct {
 	libraryMetadataMatchQueueStatusResponse
+	Limit    int                                    `json:"limit"`
+	Offset   int                                    `json:"offset"`
 	Movies   []libraryMovieMatchQueueEntryResponse  `json:"movies"`
 	Series   []librarySeriesMatchQueueEntryResponse `json:"series"`
 	RawFiles []libraryRawMatchBacklogEntryResponse  `json:"raw_files"`
 }
 
 type libraryMovieMatchQueueEntryResponse struct {
-	MediaFileID     int        `json:"media_file_id"`
-	MediaFolderID   int        `json:"media_folder_id"`
-	FilePath        string     `json:"file_path"`
-	FirstQueuedAt   time.Time  `json:"first_queued_at"`
-	AvailableAt     time.Time  `json:"available_at"`
-	LastAttemptedAt *time.Time `json:"last_attempted_at,omitempty"`
-	AttemptCount    int        `json:"attempt_count"`
-	LastError       string     `json:"last_error,omitempty"`
-	UpdatedAt       time.Time  `json:"updated_at"`
+	MediaFileID               int             `json:"media_file_id"`
+	MediaFolderID             int             `json:"media_folder_id"`
+	FilePath                  string          `json:"file_path"`
+	FirstQueuedAt             time.Time       `json:"first_queued_at"`
+	AvailableAt               time.Time       `json:"available_at"`
+	LastAttemptedAt           *time.Time      `json:"last_attempted_at,omitempty"`
+	AttemptCount              int             `json:"attempt_count"`
+	LastError                 string          `json:"last_error,omitempty"`
+	State                     string          `json:"state"`
+	FailureKind               string          `json:"failure_kind,omitempty"`
+	FailureDetail             json.RawMessage `json:"failure_detail,omitempty"`
+	DeterministicAttemptCount int             `json:"deterministic_attempt_count"`
+	MatcherRevision           int             `json:"matcher_revision"`
+	ParkedAt                  *time.Time      `json:"parked_at,omitempty"`
+	UpdatedAt                 time.Time       `json:"updated_at"`
 }
 
 type librarySeriesMatchQueueEntryResponse struct {
-	MediaFolderID    int        `json:"media_folder_id"`
-	ObservedRootPath string     `json:"observed_root_path"`
-	FirstQueuedAt    time.Time  `json:"first_queued_at"`
-	AvailableAt      time.Time  `json:"available_at"`
-	LastAttemptedAt  *time.Time `json:"last_attempted_at,omitempty"`
-	AttemptCount     int        `json:"attempt_count"`
-	LastError        string     `json:"last_error,omitempty"`
-	UpdatedAt        time.Time  `json:"updated_at"`
+	MediaFolderID             int             `json:"media_folder_id"`
+	ObservedRootPath          string          `json:"observed_root_path"`
+	FirstQueuedAt             time.Time       `json:"first_queued_at"`
+	AvailableAt               time.Time       `json:"available_at"`
+	LastAttemptedAt           *time.Time      `json:"last_attempted_at,omitempty"`
+	AttemptCount              int             `json:"attempt_count"`
+	LastError                 string          `json:"last_error,omitempty"`
+	State                     string          `json:"state"`
+	FailureKind               string          `json:"failure_kind,omitempty"`
+	FailureDetail             json.RawMessage `json:"failure_detail,omitempty"`
+	DeterministicAttemptCount int             `json:"deterministic_attempt_count"`
+	MatcherRevision           int             `json:"matcher_revision"`
+	ParkedAt                  *time.Time      `json:"parked_at,omitempty"`
+	UpdatedAt                 time.Time       `json:"updated_at"`
 }
 
 type libraryRawMatchBacklogEntryResponse struct {
@@ -1427,18 +1464,21 @@ func (h *LibraryHandler) HandleListMetadataMatchQueues(w http.ResponseWriter, r 
 		return
 	}
 
-	resp := make([]libraryMetadataMatchQueueStatusResponse, 0, len(folders))
+	folderIDs := make([]int, 0, len(folders))
 	for _, folder := range folders {
-		if folder == nil {
-			continue
+		if folder != nil {
+			folderIDs = append(folderIDs, folder.ID)
 		}
-		status, err := h.metadataMatchQueueStatus(r.Context(), folder.ID)
-		if err != nil {
-			slog.ErrorContext(r.Context(), "metadata queue: failed to load queue status", "component", "api", "library_id", folder.ID, "error", err)
-			writeError(w, http.StatusInternalServerError, "internal_error", "Failed to load metadata matcher queue")
-			return
-		}
-		resp = append(resp, status)
+	}
+	statuses, err := h.metadataMatchQueueStatuses(r.Context(), folderIDs)
+	if err != nil {
+		slog.ErrorContext(r.Context(), "metadata queue: failed to load queue statuses", "component", "api", "error", err)
+		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to load metadata matcher queues")
+		return
+	}
+	resp := make([]libraryMetadataMatchQueueStatusResponse, 0, len(folderIDs))
+	for _, folderID := range folderIDs {
+		resp = append(resp, statuses[folderID])
 	}
 
 	writeJSON(w, http.StatusOK, resp)
@@ -1470,6 +1510,12 @@ func (h *LibraryHandler) HandleGetMetadataMatchQueue(w http.ResponseWriter, r *h
 			limit = parsed
 		}
 	}
+	offset := 0
+	if value := strings.TrimSpace(r.URL.Query().Get("offset")); value != "" {
+		if parsed, parseErr := strconv.Atoi(value); parseErr == nil && parsed >= 0 {
+			offset = parsed
+		}
+	}
 
 	status, err := h.metadataMatchQueueStatus(r.Context(), id)
 	if err != nil {
@@ -1480,12 +1526,14 @@ func (h *LibraryHandler) HandleGetMetadataMatchQueue(w http.ResponseWriter, r *h
 
 	resp := libraryMetadataMatchQueueDetailResponse{
 		libraryMetadataMatchQueueStatusResponse: status,
+		Limit:                                   limit,
+		Offset:                                  offset,
 		Movies:                                  []libraryMovieMatchQueueEntryResponse{},
 		Series:                                  []librarySeriesMatchQueueEntryResponse{},
 		RawFiles:                                []libraryRawMatchBacklogEntryResponse{},
 	}
 	if h.MovieMatchQueueRepo != nil {
-		movies, _, err := h.MovieMatchQueueRepo.ListByFolder(r.Context(), id, limit, 0)
+		movies, _, err := h.MovieMatchQueueRepo.ListByFolder(r.Context(), id, limit, offset)
 		if err != nil {
 			slog.ErrorContext(r.Context(), "metadata queue: failed to list movie queue", "component", "api", "library_id", id, "error", err)
 			writeError(w, http.StatusInternalServerError, "internal_error", "Failed to list metadata matcher queue")
@@ -1493,20 +1541,26 @@ func (h *LibraryHandler) HandleGetMetadataMatchQueue(w http.ResponseWriter, r *h
 		}
 		for _, entry := range movies {
 			resp.Movies = append(resp.Movies, libraryMovieMatchQueueEntryResponse{
-				MediaFileID:     entry.MediaFileID,
-				MediaFolderID:   entry.MediaFolderID,
-				FilePath:        entry.FilePath,
-				FirstQueuedAt:   entry.FirstQueuedAt,
-				AvailableAt:     entry.AvailableAt,
-				LastAttemptedAt: entry.LastAttemptedAt,
-				AttemptCount:    entry.AttemptCount,
-				LastError:       entry.LastError,
-				UpdatedAt:       entry.UpdatedAt,
+				MediaFileID:               entry.MediaFileID,
+				MediaFolderID:             entry.MediaFolderID,
+				FilePath:                  entry.FilePath,
+				FirstQueuedAt:             entry.FirstQueuedAt,
+				AvailableAt:               entry.AvailableAt,
+				LastAttemptedAt:           entry.LastAttemptedAt,
+				AttemptCount:              entry.AttemptCount,
+				LastError:                 entry.LastError,
+				State:                     entry.State,
+				FailureKind:               entry.FailureKind,
+				FailureDetail:             entry.FailureDetail,
+				DeterministicAttemptCount: entry.DeterministicAttemptCount,
+				MatcherRevision:           entry.MatcherRevision,
+				ParkedAt:                  entry.ParkedAt,
+				UpdatedAt:                 entry.UpdatedAt,
 			})
 		}
 	}
 	if h.SeriesMatchQueueRepo != nil {
-		series, _, err := h.SeriesMatchQueueRepo.ListByFolder(r.Context(), id, limit, 0)
+		series, _, err := h.SeriesMatchQueueRepo.ListByFolder(r.Context(), id, limit, offset)
 		if err != nil {
 			slog.ErrorContext(r.Context(), "metadata queue: failed to list series queue", "component", "api", "library_id", id, "error", err)
 			writeError(w, http.StatusInternalServerError, "internal_error", "Failed to list metadata matcher queue")
@@ -1514,19 +1568,25 @@ func (h *LibraryHandler) HandleGetMetadataMatchQueue(w http.ResponseWriter, r *h
 		}
 		for _, entry := range series {
 			resp.Series = append(resp.Series, librarySeriesMatchQueueEntryResponse{
-				MediaFolderID:    entry.MediaFolderID,
-				ObservedRootPath: entry.ObservedRootPath,
-				FirstQueuedAt:    entry.FirstQueuedAt,
-				AvailableAt:      entry.AvailableAt,
-				LastAttemptedAt:  entry.LastAttemptedAt,
-				AttemptCount:     entry.AttemptCount,
-				LastError:        entry.LastError,
-				UpdatedAt:        entry.UpdatedAt,
+				MediaFolderID:             entry.MediaFolderID,
+				ObservedRootPath:          entry.ObservedRootPath,
+				FirstQueuedAt:             entry.FirstQueuedAt,
+				AvailableAt:               entry.AvailableAt,
+				LastAttemptedAt:           entry.LastAttemptedAt,
+				AttemptCount:              entry.AttemptCount,
+				LastError:                 entry.LastError,
+				State:                     entry.State,
+				FailureKind:               entry.FailureKind,
+				FailureDetail:             entry.FailureDetail,
+				DeterministicAttemptCount: entry.DeterministicAttemptCount,
+				MatcherRevision:           entry.MatcherRevision,
+				ParkedAt:                  entry.ParkedAt,
+				UpdatedAt:                 entry.UpdatedAt,
 			})
 		}
 	}
 	if h.RawMatchBacklogRepo != nil {
-		rawFiles, _, err := h.RawMatchBacklogRepo.ListUnmatchedMatchBacklogByFolder(r.Context(), id, h.rawMatchBacklogMode(), limit, 0)
+		rawFiles, _, err := h.RawMatchBacklogRepo.ListUnmatchedMatchBacklogByFolder(r.Context(), id, h.rawMatchBacklogMode(), limit, offset)
 		if err != nil {
 			slog.ErrorContext(r.Context(), "metadata queue: failed to list raw backlog", "component", "api", "library_id", id, "error", err)
 			writeError(w, http.StatusInternalServerError, "internal_error", "Failed to list metadata matcher backlog")
@@ -1579,10 +1639,18 @@ func (h *LibraryHandler) HandleRetryMetadataMatchQueue(w http.ResponseWriter, r 
 			writeError(w, http.StatusInternalServerError, "internal_error", "Failed to retry metadata matcher")
 			return
 		}
+		if _, err := h.SeriesMatchQueueRepo.RetryNowByFolder(r.Context(), id); err != nil {
+			writeError(w, http.StatusInternalServerError, "internal_error", "Failed to retry metadata matcher")
+			return
+		}
 	}
 	if h.MovieMatchQueueRepo != nil {
 		if err := h.MovieMatchQueueRepo.SyncForFolder(r.Context(), id); err != nil {
 			slog.ErrorContext(r.Context(), "metadata queue: failed to retry movie queue", "component", "api", "library_id", id, "error", err)
+			writeError(w, http.StatusInternalServerError, "internal_error", "Failed to retry metadata matcher")
+			return
+		}
+		if _, err := h.MovieMatchQueueRepo.RetryNowByFolder(r.Context(), id); err != nil {
 			writeError(w, http.StatusInternalServerError, "internal_error", "Failed to retry metadata matcher")
 			return
 		}
@@ -1682,30 +1750,61 @@ func (h *LibraryHandler) metadataMatchBacklogConfigured() bool {
 }
 
 func (h *LibraryHandler) metadataMatchQueueStatus(ctx context.Context, libraryID int) (libraryMetadataMatchQueueStatusResponse, error) {
-	resp := libraryMetadataMatchQueueStatusResponse{LibraryID: libraryID}
+	statuses, err := h.metadataMatchQueueStatuses(ctx, []int{libraryID})
+	if err != nil {
+		return libraryMetadataMatchQueueStatusResponse{LibraryID: libraryID}, err
+	}
+	return statuses[libraryID], nil
+}
+
+func (h *LibraryHandler) metadataMatchQueueStatuses(ctx context.Context, libraryIDs []int) (map[int]libraryMetadataMatchQueueStatusResponse, error) {
+	statuses := make(map[int]libraryMetadataMatchQueueStatusResponse, len(libraryIDs))
+	for _, libraryID := range libraryIDs {
+		statuses[libraryID] = libraryMetadataMatchQueueStatusResponse{LibraryID: libraryID}
+	}
 	if h.MovieMatchQueueRepo != nil {
-		count, err := h.MovieMatchQueueRepo.CountByFolder(ctx, libraryID)
+		counts, err := h.MovieMatchQueueRepo.CountStatesByFolders(ctx, libraryIDs)
 		if err != nil {
-			return resp, err
+			return nil, err
 		}
-		resp.MovieCount = count
+		for libraryID, count := range counts {
+			status := statuses[libraryID]
+			status.MovieCount = count.Pending + count.Parked
+			status.PendingCount += count.Pending
+			status.ParkedCount += count.Parked
+			statuses[libraryID] = status
+		}
 	}
 	if h.SeriesMatchQueueRepo != nil {
-		count, err := h.SeriesMatchQueueRepo.CountByFolder(ctx, libraryID)
+		counts, err := h.SeriesMatchQueueRepo.CountStatesByFolders(ctx, libraryIDs)
 		if err != nil {
-			return resp, err
+			return nil, err
 		}
-		resp.SeriesCount = count
+		for libraryID, count := range counts {
+			status := statuses[libraryID]
+			status.SeriesCount = count.Pending + count.Parked
+			status.PendingCount += count.Pending
+			status.ParkedCount += count.Parked
+			statuses[libraryID] = status
+		}
 	}
 	if h.RawMatchBacklogRepo != nil {
-		count, err := h.RawMatchBacklogRepo.CountUnmatchedMatchBacklogByFolder(ctx, libraryID, h.rawMatchBacklogMode())
+		counts, err := h.RawMatchBacklogRepo.CountUnmatchedMatchBacklogByFolders(ctx, libraryIDs, h.rawMatchBacklogMode())
 		if err != nil {
-			return resp, err
+			return nil, err
 		}
-		resp.RawFileCount = count
+		for libraryID, count := range counts {
+			status := statuses[libraryID]
+			status.RawFileCount = count
+			status.PendingCount += count
+			statuses[libraryID] = status
+		}
 	}
-	resp.TotalCount = resp.MovieCount + resp.SeriesCount + resp.RawFileCount
-	return resp, nil
+	for libraryID, status := range statuses {
+		status.TotalCount = status.MovieCount + status.SeriesCount + status.RawFileCount
+		statuses[libraryID] = status
+	}
+	return statuses, nil
 }
 
 func (h *LibraryHandler) rawMatchBacklogMode() scanner.RawMatchBacklogMode {
@@ -2096,8 +2195,22 @@ func (h *LibraryHandler) HandleSetLibraryProviders(w http.ResponseWriter, r *htt
 	if h.chainCacheInvalidator != nil {
 		h.chainCacheInvalidator.InvalidateChainCache()
 	}
+	h.wakeMetadataMatcher(r.Context(), id)
 
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func (h *LibraryHandler) wakeMetadataMatcher(ctx context.Context, libraryID int) {
+	if h.MovieMatchQueueRepo != nil {
+		if _, err := h.MovieMatchQueueRepo.RetryNowByFolder(ctx, libraryID); err != nil {
+			slog.WarnContext(ctx, "wake movie metadata matcher", "component", "api", "library_id", libraryID, "error", err)
+		}
+	}
+	if h.SeriesMatchQueueRepo != nil {
+		if _, err := h.SeriesMatchQueueRepo.RetryNowByFolder(ctx, libraryID); err != nil {
+			slog.WarnContext(ctx, "wake series metadata matcher", "component", "api", "library_id", libraryID, "error", err)
+		}
+	}
 }
 
 // seedDefaultChain builds a default provider chain from plugin manifest defaults
@@ -2191,22 +2304,7 @@ func buildSeededChainEntries(level string, candidates []seedCandidate) []metadat
 }
 
 func metadataContentLevelsForLibraryType(libraryType string) []string {
-	switch libraryType {
-	case "series":
-		return []string{"series", "season", "episode"}
-	case "movies", "movie":
-		return []string{"movie"}
-	case "audiobooks", "audiobook":
-		return []string{"audiobook"}
-	case "ebooks", "ebook":
-		return []string{"ebook"}
-	case "manga":
-		return []string{"manga"}
-	case "mixed":
-		return []string{"movie", "series", "season", "episode", "audiobook", "ebook"}
-	default:
-		return nil
-	}
+	return metadata.ContentLevelsForLibraryType(libraryType)
 }
 
 // HandleListStaleIDs handles GET /libraries/stale-ids.
@@ -2242,13 +2340,18 @@ func (h *LibraryHandler) HandleListStaleIDs(w http.ResponseWriter, r *http.Reque
 		Title       string
 		Year        int
 		ContentType string
+		Status      string
+		TmdbID      string
+		TvdbID      string
+		ImdbID      string
 		LibraryID   int
 		LibraryName string
 	}
 	items := make(map[string]itemInfo, len(contentIDs))
 
 	rows, err := h.pool.Query(r.Context(), `
-		SELECT mi.content_id, mi.title, mi.year, mi.type,
+		SELECT mi.content_id, mi.title, mi.year, mi.type, COALESCE(mi.status, ''),
+		       COALESCE(mi.tmdb_id, ''), COALESCE(mi.tvdb_id, ''), COALESCE(mi.imdb_id, ''),
 		       COALESCE(mf_lib.folder_id, 0),
 		       COALESCE(mf_lib.folder_name, '')
 		FROM media_items mi
@@ -2269,18 +2372,31 @@ func (h *LibraryHandler) HandleListStaleIDs(w http.ResponseWriter, r *http.Reque
 	defer rows.Close()
 
 	for rows.Next() {
-		var cid, title, ctype, libName string
+		var cid, title, ctype, status, tmdbID, tvdbID, imdbID, libName string
 		var year, libID int
-		if err := rows.Scan(&cid, &title, &year, &ctype, &libID, &libName); err != nil {
+		if err := rows.Scan(&cid, &title, &year, &ctype, &status, &tmdbID, &tvdbID, &imdbID, &libID, &libName); err != nil {
 			slog.ErrorContext(r.Context(), "scanning item for stale IDs", "component", "api", "error", err)
 			continue
 		}
-		items[cid] = itemInfo{Title: title, Year: year, ContentType: ctype, LibraryID: libID, LibraryName: libName}
+		items[cid] = itemInfo{
+			Title: title, Year: year, ContentType: ctype, Status: status,
+			TmdbID: tmdbID, TvdbID: tvdbID, ImdbID: imdbID,
+			LibraryID: libID, LibraryName: libName,
+		}
 	}
 
 	resp := make([]staleMediaIDResponse, 0, len(staleIDs))
 	for _, s := range staleIDs {
 		info := items[s.ContentID]
+		if !metadata.IsActionableStaleProviderID(&models.MediaItem{
+			ContentID: s.ContentID,
+			Status:    info.Status,
+			TmdbID:    info.TmdbID,
+			TvdbID:    info.TvdbID,
+			ImdbID:    info.ImdbID,
+		}, s) {
+			continue
+		}
 		resp = append(resp, staleMediaIDResponse{
 			ContentID:   s.ContentID,
 			LibraryID:   info.LibraryID,

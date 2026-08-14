@@ -3,21 +3,17 @@ import { Loader, Pause, Play, Radio } from "lucide-react";
 
 import type { AdminSession } from "@/api/types";
 import { Badge } from "@/components/ui/badge";
+import { JellyfinSessionPill } from "@/components/JellyfinSessionPill";
 import { Skeleton } from "@/components/ui/skeleton";
 import { useHouseholdSessions } from "@/hooks/queries/profiles";
 import {
-  formatDecisionLabel,
+  activityMethodMeta,
+  classifyActivityMethod,
   formatSessionBitrate,
   getSessionClientLabel,
   getPlaybackSessionSubtitle,
   getPlaybackSessionTitle,
 } from "@/pages/adminActivityPresentation";
-
-const METHOD_COLORS: Record<string, string> = {
-  direct: "bg-success",
-  remux: "bg-info",
-  transcode: "bg-warning",
-};
 
 function formatElapsed(startedAt: string): string {
   const started = new Date(startedAt).getTime();
@@ -48,8 +44,7 @@ function StreamRow({ session }: { session: AdminSession }) {
   const title = getPlaybackSessionTitle(session);
   const subtitle = getPlaybackSessionSubtitle(session);
   const profileLabel = session.profile_name?.trim() || "Profile";
-  const playMethod = session.play_method || "unknown";
-  const methodColor = METHOD_COLORS[playMethod] ?? "bg-muted-foreground";
+  const methodMeta = activityMethodMeta(classifyActivityMethod(session));
   const bitrate = formatSessionBitrate(session.stream_bitrate_kbps);
   const watchHref =
     session.content_id && session.media_file_id
@@ -71,11 +66,12 @@ function StreamRow({ session }: { session: AdminSession }) {
             {session.is_paused ? <Pause className="h-3 w-3" /> : <Play className="h-3 w-3" />}
             {session.is_paused ? "Paused" : "Playing"}
           </Badge>
-          <span className={`inline-flex h-2 w-2 rounded-full ${methodColor}`} />
+          <span className={`inline-flex h-2 w-2 rounded-full ${methodMeta.swatchClass}`} />
           <span className="text-muted-foreground text-xs">
-            {formatDecisionLabel(session.play_method)}
+            {methodMeta.label}
             {bitrate ? ` · ${bitrate}` : ""}
           </span>
+          <JellyfinSessionPill session={session} />
         </div>
 
         <div className="min-w-0">

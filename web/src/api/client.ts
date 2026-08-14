@@ -1,5 +1,6 @@
 import type { ApiError, RefreshResponse } from "./types";
 import { storage } from "../utils/storage";
+import { randomUUID } from "../lib/uuid";
 
 type ProfileUnverifiedListener = () => void;
 let profileUnverifiedListener: ProfileUnverifiedListener | null = null;
@@ -9,9 +10,18 @@ export function onProfileUnverified(listener: ProfileUnverifiedListener | null) 
 }
 
 let accessToken: string | null = null;
+let authContextVersion = 0;
 let refreshPromise: Promise<boolean> | null = null;
 
 export function setAccessToken(token: string | null) {
+  if (accessToken !== token) authContextVersion += 1;
+  accessToken = token;
+}
+
+function refreshCurrentAccessToken(token: string): void {
+  // Token rotation preserves the authenticated account/server context. A
+  // queued request may use its captured predecessor once, safely refresh, and
+  // retry with this successor without changing account authority.
   accessToken = token;
 }
 
@@ -82,25 +92,67 @@ export function getProfileToken(): string | null {
   return profileToken;
 }
 
-function getOrCreateDeviceId(): string | null {
+/**
+ * Complete request authority for one queued profile intent. It is deliberately
+ * an in-memory value: access and PIN tokens must never enter storage, query
+ * caches, logs, or persisted mutation state through this snapshot.
+ */
+export interface ProfileRequestContextSnapshot {
+  accessToken: string;
+  authContextVersion: number;
+  serverOrigin: string;
+  profileId: string;
+  profileToken: string | null;
+}
+
+function currentServerOrigin(): string {
+  return typeof globalThis.location === "undefined" ? "" : globalThis.location.origin;
+}
+
+/** Capture account, server, profile, and PIN authority in one synchronous turn. */
+export function captureProfileRequestContext(): ProfileRequestContextSnapshot | null {
+  const profileId = getProfileId();
+  if (!accessToken || !profileId) return null;
+  return {
+    accessToken,
+    authContextVersion,
+    serverOrigin: currentServerOrigin(),
+    profileId,
+    profileToken: getProfileToken(),
+  };
+}
+
+/**
+ * A session-authority change advances authContextVersion even if an account
+ * later happens to return to the same token. Queued work can therefore never
+ * cross a logout, impersonation, account switch, or server-origin switch
+ * unnoticed. Automatic token rotation deliberately preserves the context.
+ * Profile/PIN changes are excluded so an already-created intent remains bound
+ * to its captured profile authority through a same-account refresh.
+ */
+export function isProfileRequestContextCurrent(snapshot: ProfileRequestContextSnapshot): boolean {
+  return (
+    snapshot.authContextVersion === authContextVersion &&
+    snapshot.serverOrigin === currentServerOrigin()
+  );
+}
+
+function isCapturedProfileAuthorityActive(snapshot: ProfileRequestContextSnapshot): boolean {
+  return (
+    isProfileRequestContextCurrent(snapshot) &&
+    getProfileId() === snapshot.profileId &&
+    getProfileToken() === snapshot.profileToken
+  );
+}
+
+export function getOrCreateDeviceId(): string {
   const existing = storage.get(storage.KEYS.DEVICE_ID);
   if (existing) {
     return existing;
   }
 
-  let nextId: string | null = null;
-  try {
-    nextId =
-      typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
-        ? crypto.randomUUID()
-        : `web-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
-  } catch {
-    nextId = `web-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
-  }
-
-  if (nextId) {
-    storage.set(storage.KEYS.DEVICE_ID, nextId);
-  }
+  const nextId = randomUUID();
+  storage.set(storage.KEYS.DEVICE_ID, nextId);
   return nextId;
 }
 
@@ -137,14 +189,13 @@ function detectDeviceName(): string {
 
 function getDeviceHeaders(): Record<string, string> {
   const deviceId = getOrCreateDeviceId();
-  if (!deviceId) {
-    return {};
-  }
-
   return {
     "X-Silo-Device-Id": deviceId,
     "X-Silo-Device-Name": detectDeviceName(),
     "X-Silo-Device-Platform": detectDevicePlatform(),
+    // Browser preferences roam between browsers without changing TV, mobile,
+    // tablet, or desktop-native layouts.
+    "X-Silo-Client-Family": "web",
   };
 }
 
@@ -152,10 +203,22 @@ async function attemptRefresh(): Promise<boolean> {
   const rt = getRefreshToken();
   if (!rt) return false;
 
+  // A refresh response belongs only to the account/server that started it.
+  // Discarding it after a context switch prevents a delayed old-account
+  // response from overwriting the new account's access or refresh token.
+  const startingAuthContextVersion = authContextVersion;
+  const startingServerOrigin = currentServerOrigin();
+
   try {
     const data = await refreshAccessToken(rt, fetch);
     if (!data) return false;
-    setAccessToken(data.access_token);
+    if (
+      startingAuthContextVersion !== authContextVersion ||
+      startingServerOrigin !== currentServerOrigin()
+    ) {
+      return false;
+    }
+    refreshCurrentAccessToken(data.access_token);
     setRefreshToken(data.refresh_token);
     return true;
   } catch {
@@ -265,6 +328,14 @@ function hasHeader(headers: Record<string, string>, name: string): boolean {
   return Object.keys(headers).some((key) => key.toLowerCase() === target);
 }
 
+function setHeader(headers: Record<string, string>, name: string, value: string): void {
+  const target = name.toLowerCase();
+  for (const key of Object.keys(headers)) {
+    if (key.toLowerCase() === target) delete headers[key];
+  }
+  headers[name] = value;
+}
+
 interface ParsedApiError {
   /** Normalized error with guaranteed `error`/`message` fields. */
   apiErr: ApiError;
@@ -340,34 +411,7 @@ export async function restoreUserSession<TUser>({
   };
 }
 
-export async function api<T>(path: string, options: RequestInit = {}): Promise<T> {
-  const headers = buildApiHeaders(options);
-
-  let res = await fetch(`/api/v1${path}`, { ...options, headers });
-
-  // Auto-refresh on 401
-  if (res.status === 401 && getRefreshToken()) {
-    if (!refreshPromise) {
-      refreshPromise = attemptRefresh().finally(() => {
-        refreshPromise = null;
-      });
-    }
-    const refreshed = await refreshPromise;
-    if (refreshed) {
-      headers["Authorization"] = `Bearer ${accessToken}`;
-      res = await fetch(`/api/v1${path}`, { ...options, headers });
-    }
-  }
-
-  if (!res.ok) {
-    const parsed = await parseApiError(res);
-    if (res.status === 403 && parsed.apiErr.error === "profile_unverified") {
-      setProfileToken(null);
-      profileUnverifiedListener?.();
-    }
-    throw apiClientErrorFrom(res.status, parsed);
-  }
-
+async function readApiResponse<T>(res: Response): Promise<T> {
   // Handle empty successful responses.
   if (res.status === 204 || res.status === 205) {
     return undefined as T;
@@ -379,6 +423,127 @@ export async function api<T>(path: string, options: RequestInit = {}): Promise<T
   return JSON.parse(text) as T;
 }
 
+export async function api<T>(path: string, options: RequestInit = {}): Promise<T> {
+  return readApiResponse<T>(await apiResponse(path, options));
+}
+
+/**
+ * Sends a request with one captured account/profile authority. The explicit
+ * headers cannot be replaced by the current session, and a stale snapshot is
+ * rejected before fetch.
+ */
+export async function apiWithProfileRequestContext<T>(
+  path: string,
+  snapshot: ProfileRequestContextSnapshot,
+  options: RequestInit = {},
+): Promise<T> {
+  if (!isProfileRequestContextCurrent(snapshot)) {
+    throw new StaleApiRequestContextError();
+  }
+  const headers = { ...(options.headers as Record<string, string>) };
+  setHeader(headers, "Authorization", `Bearer ${snapshot.accessToken}`);
+  setHeader(headers, "X-Profile-Id", snapshot.profileId);
+  setHeader(headers, "X-Profile-Token", snapshot.profileToken ?? "");
+  const response = await apiResponseInternal(path, { ...options, headers }, snapshot);
+  if (!isProfileRequestContextCurrent(snapshot)) {
+    throw new StaleApiRequestContextError();
+  }
+  return readApiResponse<T>(response);
+}
+
+export class StaleApiRequestContextError extends Error {
+  constructor() {
+    super("The account or server changed before the queued request could be sent.");
+    this.name = "StaleApiRequestContextError";
+  }
+}
+
+/** Performs an authenticated API request while leaving the successful body unread. */
+export async function apiResponse(path: string, options: RequestInit = {}): Promise<Response> {
+  return apiResponseInternal(path, options);
+}
+
+async function apiResponseInternal(
+  path: string,
+  options: RequestInit,
+  snapshot?: ProfileRequestContextSnapshot,
+): Promise<Response> {
+  if (snapshot && !isProfileRequestContextCurrent(snapshot)) {
+    throw new StaleApiRequestContextError();
+  }
+  const explicitAuthorization = hasHeader(
+    (options.headers as Record<string, string> | undefined) ?? {},
+    "Authorization",
+  );
+  const headers = buildApiHeaders(options);
+  const requestProfileId = headers["X-Profile-Id"] ?? null;
+  const requestProfileToken = headers["X-Profile-Token"] ?? null;
+
+  let res = await fetch(`/api/v1${path}`, { ...options, headers });
+
+  if (snapshot && !isProfileRequestContextCurrent(snapshot)) {
+    throw new StaleApiRequestContextError();
+  }
+
+  // Auto-refresh on 401. An ordinary explicit Authorization header opts out,
+  // but a captured profile request is a stronger contract: it may rotate the
+  // token only while its account/server generation remains current, then retry
+  // with the new access token and the exact captured profile/PIN headers.
+  if (
+    res.status === 401 &&
+    getRefreshToken() &&
+    (snapshot !== undefined || !explicitAuthorization)
+  ) {
+    if (snapshot && !isProfileRequestContextCurrent(snapshot)) {
+      throw new StaleApiRequestContextError();
+    }
+    if (!refreshPromise) {
+      refreshPromise = attemptRefresh().finally(() => {
+        refreshPromise = null;
+      });
+    }
+    const refreshed = await refreshPromise;
+    if (snapshot && !isProfileRequestContextCurrent(snapshot)) {
+      throw new StaleApiRequestContextError();
+    }
+    if (refreshed) {
+      // Keep the profile and device identity captured for the original
+      // request. A household profile can change while refresh is pending;
+      // rebuilding every header here could replay an old-profile mutation
+      // under the newly selected profile. Only the refreshed account token
+      // is allowed to change for this retry.
+      const refreshedHeaders = { ...headers };
+      if (accessToken) {
+        setHeader(refreshedHeaders, "Authorization", `Bearer ${accessToken}`);
+      } else if (snapshot) {
+        throw new StaleApiRequestContextError();
+      } else {
+        delete refreshedHeaders.Authorization;
+      }
+      res = await fetch(`/api/v1${path}`, { ...options, headers: refreshedHeaders });
+      if (snapshot && !isProfileRequestContextCurrent(snapshot)) {
+        throw new StaleApiRequestContextError();
+      }
+    }
+  }
+
+  if (!res.ok) {
+    const parsed = await parseApiError(res);
+    if (
+      res.status === 403 &&
+      parsed.apiErr.error === "profile_unverified" &&
+      (snapshot
+        ? isCapturedProfileAuthorityActive(snapshot)
+        : getProfileId() === requestProfileId && getProfileToken() === requestProfileToken)
+    ) {
+      setProfileToken(null);
+      profileUnverifiedListener?.();
+    }
+    throw apiClientErrorFrom(res.status, parsed);
+  }
+  return res;
+}
+
 function buildApiHeaders(options: RequestInit = {}): Record<string, string> {
   const headers: Record<string, string> = {
     ...(options.headers as Record<string, string>),
@@ -386,18 +551,20 @@ function buildApiHeaders(options: RequestInit = {}): Record<string, string> {
   if (!(options.body instanceof FormData) && !hasHeader(headers, "Content-Type")) {
     headers["Content-Type"] = "application/json";
   }
-  if (accessToken) {
+  if (accessToken && !hasHeader(headers, "Authorization")) {
     headers["Authorization"] = `Bearer ${accessToken}`;
   }
   const profileId = getProfileId();
-  if (profileId) {
+  if (profileId && !hasHeader(headers, "X-Profile-Id")) {
     headers["X-Profile-Id"] = profileId;
   }
   const profToken = getProfileToken();
-  if (profToken) {
+  if (profToken && !hasHeader(headers, "X-Profile-Token")) {
     headers["X-Profile-Token"] = profToken;
   }
-  Object.assign(headers, getDeviceHeaders());
+  for (const [name, value] of Object.entries(getDeviceHeaders())) {
+    setHeader(headers, name, value);
+  }
   return headers;
 }
 
@@ -421,26 +588,7 @@ export async function apiDownload(
   filename: string,
   options: RequestInit = {},
 ): Promise<void> {
-  let headers = buildApiHeaders(options);
-  let res = await fetch(`/api/v1${path}`, { ...options, headers });
-
-  if (res.status === 401 && getRefreshToken()) {
-    if (!refreshPromise) {
-      refreshPromise = attemptRefresh().finally(() => {
-        refreshPromise = null;
-      });
-    }
-    const refreshed = await refreshPromise;
-    if (refreshed) {
-      headers = buildApiHeaders(options);
-      headers["Authorization"] = `Bearer ${accessToken}`;
-      res = await fetch(`/api/v1${path}`, { ...options, headers });
-    }
-  }
-
-  if (!res.ok) {
-    throw apiClientErrorFrom(res.status, await parseApiError(res));
-  }
+  const res = await apiResponse(path, options);
 
   const blob = await res.blob();
   const url = URL.createObjectURL(blob);
@@ -458,26 +606,7 @@ export async function apiDownload(
 export const API_BLOB_MAX_BYTES = 512 * 1024 * 1024;
 
 export async function apiBlob(path: string, options: RequestInit = {}): Promise<Blob> {
-  let headers = buildApiHeaders(options);
-  let res = await fetch(`/api/v1${path}`, { ...options, headers });
-
-  if (res.status === 401 && getRefreshToken()) {
-    if (!refreshPromise) {
-      refreshPromise = attemptRefresh().finally(() => {
-        refreshPromise = null;
-      });
-    }
-    const refreshed = await refreshPromise;
-    if (refreshed) {
-      headers = buildApiHeaders(options);
-      headers["Authorization"] = `Bearer ${accessToken}`;
-      res = await fetch(`/api/v1${path}`, { ...options, headers });
-    }
-  }
-
-  if (!res.ok) {
-    throw apiClientErrorFrom(res.status, await parseApiError(res));
-  }
+  const res = await apiResponse(path, options);
 
   // Reject oversized bodies up front instead of crashing the tab while
   // buffering them. When the header is absent, proceed; streaming byte counts

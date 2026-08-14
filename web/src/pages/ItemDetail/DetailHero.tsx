@@ -1,6 +1,7 @@
-import { type ReactNode, useState } from "react";
+import { type ReactNode } from "react";
 import { Languages } from "lucide-react";
 import { decodeThumbhash } from "@/lib/thumbhash";
+import { useImageLoaded } from "@/hooks/useImageLoaded";
 
 interface DetailHeroProps {
   title: string;
@@ -62,8 +63,8 @@ export default function DetailHero({
   variant = "full",
   topNav,
 }: DetailHeroProps) {
-  const [backdropLoaded, setBackdropLoaded] = useState(false);
-  const [posterLoaded, setPosterLoaded] = useState(false);
+  const { loaded: backdropLoaded, onLoad: onBackdropLoad } = useImageLoaded(backdropUrl);
+  const { loaded: posterLoaded, onLoad: onPosterLoad } = useImageLoaded(posterUrl);
   const backdropPlaceholder = backdropThumbhash ? decodeThumbhash(backdropThumbhash) : "";
   const posterPlaceholder = posterThumbhash ? decodeThumbhash(posterThumbhash) : "";
   const isCompact = variant === "compact";
@@ -119,7 +120,7 @@ export default function DetailHero({
               alt=""
               className={`h-full w-full object-cover object-[center_20%] transition-opacity duration-300 will-change-transform ${backdropLoaded ? "opacity-100" : "opacity-0"}`}
               style={{ animation: "var(--animate-ken-burns-a)" }}
-              onLoad={() => setBackdropLoaded(true)}
+              onLoad={onBackdropLoad}
             />
           )}
         </div>
@@ -151,25 +152,31 @@ export default function DetailHero({
             {/* Poster */}
             {!hidePoster && (
               <div
-                className={`media-card-image border-border/20 border shadow-[var(--shadow-md)] ${posterSizeClass}`}
-                style={
-                  posterPlaceholder && !posterLoaded
-                    ? {
-                        backgroundImage: `url(${posterPlaceholder})`,
-                        backgroundSize: "cover",
-                        backgroundPosition: "center",
-                      }
-                    : undefined
-                }
+                className={`media-card-image border-border/20 relative border shadow-[var(--shadow-md)] ${posterSizeClass}`}
               >
                 {posterUrl ? (
-                  <img
-                    key={posterUrl}
-                    src={posterUrl}
-                    alt={title}
-                    className={`w-full object-cover ${posterAspect} transition-opacity duration-300 ${posterLoaded ? "opacity-100" : "opacity-0"}`}
-                    onLoad={() => setPosterLoaded(true)}
-                  />
+                  <>
+                    <img
+                      key={posterUrl}
+                      src={posterUrl}
+                      alt={title}
+                      className={`w-full object-cover ${posterAspect} ${posterLoaded ? "opacity-100" : "opacity-0"}`}
+                      onLoad={onPosterLoad}
+                    />
+                    <span
+                      key={`placeholder-${posterUrl}`}
+                      aria-hidden="true"
+                      data-testid="detail-hero-poster-placeholder"
+                      className={`bg-surface pointer-events-none absolute inset-0 bg-cover bg-center transition-opacity duration-300 ${
+                        posterLoaded ? "opacity-0" : "opacity-100"
+                      }`}
+                      style={
+                        posterPlaceholder
+                          ? { backgroundImage: `url(${posterPlaceholder})` }
+                          : undefined
+                      }
+                    />
+                  </>
                 ) : (
                   <div
                     className={`text-muted-foreground bg-surface flex items-center justify-center p-6 text-center text-sm ${posterAspect}`}

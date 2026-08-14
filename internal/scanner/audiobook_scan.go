@@ -88,6 +88,9 @@ func audiobookFolderUnchanged(existing []*models.MediaFile, onDisk []audiobookDi
 	}
 	byPath := make(map[string]*models.MediaFile, len(existing))
 	for _, mf := range existing {
+		if mf == nil || mf.HasLegacyAttachedPictureVideo() {
+			return false
+		}
 		byPath[mf.FilePath] = mf
 	}
 	for _, d := range onDisk {
@@ -299,7 +302,7 @@ func splitAudiobookReconcileRoots(scans []audiobookRootScan) (roots []string, se
 //
 // Each immediate subdirectory of one of folder.Paths is treated as a
 // single audiobook. Subdirectories that contain zero audio files are
-// silently skipped (parseAudiobookFolder returns os.ErrNotExist).
+// silently skipped (parseAudiobookFolder returns errFolderHasNoMedia).
 //
 // This bypasses the per-file movie/TV pipeline because audiobooks are
 // inherently folder-scoped (one book = one item, possibly multi-file).
@@ -319,14 +322,14 @@ func (s *Scanner) ScanAudiobookFolder(ctx context.Context, folder *models.MediaF
 	for i := range scans {
 		candidates = append(candidates, scans[i].candidates...)
 	}
-	reconcileRoots, seenPaths, sawFiles := splitAudiobookReconcileRoots(scans)
+	reconcileRoots, seenPaths, _ := splitAudiobookReconcileRoots(scans)
 
 	if len(candidates) == 0 {
 		// No books on disk. Still reconcile (guarded) so a legitimately-emptied
 		// library converges — but only when a root was readable, and the
 		// empty-walk guard requires operator confirmation before deleting.
 		if len(reconcileRoots) > 0 {
-			if err := s.reconcileAudiobookMissingFiles(ctx, folder, reconcileRoots, seenPaths, sawFiles, fullScan); err != nil {
+			if err := s.reconcileAudiobookMissingFiles(ctx, folder, reconcileRoots, seenPaths, fullScan); err != nil {
 				slog.WarnContext(ctx, "audiobook scan: missing-file reconcile failed", "component", "scanner", "folder_id", folder.ID, "error", err)
 			}
 		} else if len(scans) > 0 {
@@ -352,8 +355,8 @@ func (s *Scanner) ScanAudiobookFolder(ctx context.Context, folder *models.MediaF
 		processed int64
 		failed    int64
 		skipped   int64
-		failMu    sync.Mutex
-		failures  []error
+		cancelMu  sync.Mutex
+		failures  scanFailures
 		cancelErr error
 	)
 	start := time.Now()
@@ -367,17 +370,15 @@ func (s *Scanner) ScanAudiobookFolder(ctx context.Context, folder *models.MediaF
 				}
 				if err := s.reconcileAudiobookFolder(ctx, folder, path, &skipped); err != nil {
 					if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-						failMu.Lock()
+						cancelMu.Lock()
 						if cancelErr == nil {
 							cancelErr = err
 						}
-						failMu.Unlock()
+						cancelMu.Unlock()
 						return
 					}
 					atomic.AddInt64(&failed, 1)
-					failMu.Lock()
-					failures = append(failures, fmt.Errorf("%s: %w", path, err))
-					failMu.Unlock()
+					failures.addf("%s: %w", path, err)
 					slog.WarnContext(ctx, "audiobook scan: folder failed", "component", "scanner",
 						"folder_id", folder.ID,
 						"path", path,
@@ -425,13 +426,13 @@ func (s *Scanner) ScanAudiobookFolder(ctx context.Context, folder *models.MediaF
 		failedCount := atomic.LoadInt64(&failed)
 		skippedCount := atomic.LoadInt64(&skipped)
 		if failedCount > 0 && skippedCount == 0 && failedCount == processedCount {
-			return fmt.Errorf("audiobook scan failed for every attempted folder_id=%d: %w", folder.ID, errors.Join(failures...))
+			return fmt.Errorf("audiobook scan failed for every attempted folder_id=%d: %w", folder.ID, failures.join())
 		}
 	}
 
 	// Reconcile files that vanished from disk now that the full walk's
 	// seenPaths is known and the scan completed without cancellation.
-	if err := s.reconcileAudiobookMissingFiles(ctx, folder, reconcileRoots, seenPaths, sawFiles, fullScan); err != nil {
+	if err := s.reconcileAudiobookMissingFiles(ctx, folder, reconcileRoots, seenPaths, fullScan); err != nil {
 		slog.WarnContext(ctx, "audiobook scan: missing-file reconcile failed", "component", "scanner", "folder_id", folder.ID, "error", err)
 	}
 	return nil
@@ -444,38 +445,19 @@ func (s *Scanner) ScanAudiobookFolder(ctx context.Context, folder *models.MediaF
 // the newly indexed path instead of leaving a stale duplicate). A scan that saw
 // zero files while the DB still has rows only reconciles when the operator has
 // confirmed cleanup, so an unmounted source can't wipe the catalog.
-func (s *Scanner) reconcileAudiobookMissingFiles(ctx context.Context, folder *models.MediaFolder, roots []string, seenPaths map[string]bool, sawFiles, fullScan bool) error {
+func (s *Scanner) reconcileAudiobookMissingFiles(ctx context.Context, folder *models.MediaFolder, roots []string, seenPaths map[string]bool, fullScan bool) error {
 	if s.fileRepo == nil || s.libraryRepo == nil || len(roots) == 0 {
 		return nil
 	}
 
-	if !sawFiles {
-		existingCount := 0
-		for _, root := range roots {
-			existing, err := s.fileRepo.GetByFolderAndPathPrefix(ctx, folder.ID, root)
-			if err != nil {
-				return fmt.Errorf("listing existing audiobook files for %q: %w", root, err)
-			}
-			existingCount += len(existing)
-		}
-		if existingCount > 0 {
-			var guard ebookCleanupGuardRepo
-			if s.folderRepo != nil {
-				guard = s.folderRepo
-			}
-			// Only a full scan may consume the operator's one-shot empty-cleanup
-			// allowance; an incremental/subtree scan that happens to see zero
-			// files must not (mirrors the ebook path).
-			allowed, err := ebookEmptyCleanupAllowed(ctx, guard, folder.ID, fullScan)
-			if err != nil {
-				return err
-			}
-			if !allowed {
-				slog.WarnContext(ctx, "audiobook scan: walk saw zero files but the database has files under the scanned roots; skipping reconciliation until cleanup is confirmed", "component", "scanner",
-					"folder_id", folder.ID, "existing_files", existingCount)
-				return nil
-			}
-		}
+	confirmedCleanup, blockAll, err := s.emptyCleanupDecision(
+		ctx, folder, roots, seenPaths, fullScan, "audiobook",
+	)
+	if err != nil {
+		return err
+	}
+	if blockAll {
+		return nil
 	}
 
 	now := time.Now().UTC()
@@ -500,25 +482,12 @@ func (s *Scanner) reconcileAudiobookMissingFiles(ctx context.Context, folder *mo
 		}
 	}
 
-	if s.emptyTrashAfterScan {
-		trashed, err := s.fileRepo.DeleteMissingByFolder(ctx, folder.ID, s.fileRemovalGrace)
-		if err != nil {
-			return fmt.Errorf("emptying trash for folder %d: %w", folder.ID, err)
-		}
-		if trashed > 0 {
-			slog.InfoContext(ctx, "audiobook scan: emptied trash", "component", "scanner", "folder_id", folder.ID, "deleted", trashed)
-		}
+	trashed, removedMemberships, deletedItems, err := s.sweepMissingAndReconcile(ctx, folder, confirmedCleanup)
+	if trashed > 0 {
+		slog.InfoContext(ctx, "audiobook scan: emptied trash", "component", "scanner", "folder_id", folder.ID, "deleted", trashed)
 	}
-
-	removedMemberships, deletedItems, orphanedImageDirs, err := s.reconcileLibraryMemberships(ctx, folder.ID)
 	if err != nil {
-		return fmt.Errorf("reconciling library membership for folder %d: %w", folder.ID, err)
-	}
-	if s.s3Client != nil && len(orphanedImageDirs) > 0 {
-		bucket := s.s3Client.Bucket()
-		for _, dir := range orphanedImageDirs {
-			_, _ = s.s3Client.DeletePrefix(ctx, bucket, dir)
-		}
+		return err
 	}
 	if missing > 0 || removedMemberships > 0 || deletedItems > 0 {
 		slog.InfoContext(ctx, "audiobook scan: reconciled missing files", "component", "scanner",
@@ -543,7 +512,7 @@ func (s *Scanner) reconcileAudiobookFolder(ctx context.Context, folder *models.M
 	}
 	parsed, err := parseAudiobookFolder(ctx, s.ffprobePath, folderPath)
 	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
+		if errors.Is(err, errFolderHasNoMedia) {
 			return nil
 		}
 		return fmt.Errorf("parse audiobook folder %s: %w", folderPath, err)

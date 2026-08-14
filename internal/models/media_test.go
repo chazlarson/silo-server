@@ -1,6 +1,9 @@
 package models
 
-import "testing"
+import (
+	"encoding/json"
+	"testing"
+)
 
 func TestPersonKindAudiobookRoles(t *testing.T) {
 	cases := []struct {
@@ -14,5 +17,114 @@ func TestPersonKindAudiobookRoles(t *testing.T) {
 		if got := tc.kind.String(); got != tc.want {
 			t.Errorf("%d.String() = %q, want %q", tc.kind, got, tc.want)
 		}
+	}
+}
+
+func TestNormalizeVideoBitDepth(t *testing.T) {
+	tests := []struct {
+		name        string
+		explicit    int
+		pixelFormat string
+		profile     string
+		want        int
+	}{
+		{name: "explicit wins", explicit: 8, pixelFormat: "yuv420p10le", profile: "Main 10", want: 8},
+		{name: "hevc ten bit pixel format", pixelFormat: "yuv420p10le", profile: "Main 10", want: 10},
+		{name: "p010 pixel format", pixelFormat: "p010le", profile: "Main 10", want: 10},
+		{name: "main ten profile fallback", pixelFormat: "", profile: "Main 10", want: 10},
+		{name: "ordinary planar eight bit", pixelFormat: "yuv420p", profile: "Main", want: 8},
+		{name: "unknown remains unknown", pixelFormat: "unknown", profile: "", want: 0},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := NormalizeVideoBitDepth(test.explicit, test.pixelFormat, test.profile); got != test.want {
+				t.Fatalf("NormalizeVideoBitDepth(%d, %q, %q) = %d, want %d", test.explicit, test.pixelFormat, test.profile, got, test.want)
+			}
+		})
+	}
+}
+
+func TestVideoTrackColorRangeJSON(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		value   string
+		present bool
+	}{
+		{name: "limited", value: "tv", present: true},
+		{name: "full", value: "pc", present: true},
+		{name: "unspecified", value: "unknown", present: true},
+		{name: "empty omitted", value: "", present: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			data, err := json.Marshal(VideoTrack{ColorRange: test.value})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var decoded map[string]any
+			if err := json.Unmarshal(data, &decoded); err != nil {
+				t.Fatal(err)
+			}
+			got, present := decoded["color_range"]
+			if present != test.present {
+				t.Fatalf("color_range present = %v, want %v (%s)", present, test.present, data)
+			}
+			if test.present && got != test.value {
+				t.Fatalf("color_range = %#v, want %q", got, test.value)
+			}
+		})
+	}
+}
+
+// An audio-only verdict drives playback planning down a route family with no
+// video, HDR, or subtitle-burn gates, so it has to distinguish a genuine
+// audiobook from a video file whose probe never filled in its track rows.
+func TestMediaFileIsAudioOnly(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		file *MediaFile
+		want bool
+	}{
+		{name: "nil file", file: nil},
+		{
+			name: "audiobook",
+			file: &MediaFile{BaseType: "audiobook", CodecAudio: "aac", AudioTracks: []AudioTrack{{Codec: "aac"}}},
+			want: true,
+		},
+		{
+			name: "fully probed video",
+			file: &MediaFile{CodecVideo: "h264", VideoTracks: []VideoTrack{{Codec: "h264"}}},
+		},
+		{
+			name: "video with no track rows",
+			file: &MediaFile{CodecVideo: "h264"},
+		},
+		{
+			name: "video track without flat codec",
+			file: &MediaFile{VideoTracks: []VideoTrack{{Codec: "h264"}}},
+		},
+		{
+			name: "missing video metadata is not audio-only evidence for a movie",
+			file: &MediaFile{BaseType: "movie", CodecVideo: "  ", CodecAudio: "flac", AudioTracks: []AudioTrack{{Codec: "flac"}}},
+		},
+		{
+			name: "podcast with no video stream",
+			file: &MediaFile{BaseType: "podcast", CodecAudio: "aac", AudioTracks: []AudioTrack{{Codec: "aac"}}},
+			want: true,
+		},
+		{
+			name: "legacy audiobook cover art is not playable video",
+			file: &MediaFile{BaseType: "audiobook", CodecVideo: "mjpeg", CodecAudio: "aac", VideoTracks: []VideoTrack{{Codec: "mjpeg"}}, AudioTracks: []AudioTrack{{Codec: "aac"}}},
+			want: true,
+		},
+		{
+			name: "mjpeg movie remains video",
+			file: &MediaFile{BaseType: "movie", CodecVideo: "mjpeg", CodecAudio: "aac", VideoTracks: []VideoTrack{{Codec: "mjpeg"}}, AudioTracks: []AudioTrack{{Codec: "aac"}}},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := test.file.IsAudioOnly(); got != test.want {
+				t.Fatalf("IsAudioOnly() = %v, want %v", got, test.want)
+			}
+		})
 	}
 }

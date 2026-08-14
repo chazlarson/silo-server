@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import {
   BrowserRouter,
   Routes,
@@ -18,12 +18,14 @@ import { ThemeProvider } from "@/hooks/useTheme";
 import { DateTimeFormatProvider, useDateTimeFormat } from "@/hooks/useDateTimeFormat";
 import { CustomThemeProvider } from "@/contexts/CustomThemeProvider";
 import { BrandingProvider } from "@/contexts/BrandingProvider";
+import { UICustomizationProvider } from "@/contexts/UICustomizationProvider";
 import { ErrorBoundary } from "@/components/ErrorBoundary";
 import ImpersonationBanner from "@/components/ImpersonationBanner";
 import { loadStoredImpersonationAdminSession } from "@/lib/impersonationSession";
 import { Toaster } from "@/components/ui/sonner";
 import { RealtimeEventsProvider } from "@/components/RealtimeEventsProvider";
 import { useEventChannel } from "@/components/realtimeEventsContext";
+import { useSettingValuesRealtime } from "@/hooks/queries/settingValues";
 import Layout from "@/components/Layout";
 import AdminLayout from "@/components/AdminLayout";
 import Home from "@/pages/Home";
@@ -40,6 +42,7 @@ import PersonDetail from "@/pages/PersonDetail";
 import Collections from "@/pages/Collections";
 import CollectionEditor from "@/pages/CollectionEditor";
 import Notifications from "@/pages/Notifications";
+import DeviceSettings from "@/pages/settings/DeviceSettings";
 import NotificationsSettings from "@/pages/settings/NotificationsSettings";
 import Requests from "@/pages/Requests";
 import RequestBrowse from "@/pages/RequestBrowse";
@@ -47,6 +50,7 @@ import RequestDetail from "@/pages/RequestDetail";
 import AdminDashboard from "@/pages/AdminDashboard";
 import AdminActivity from "@/pages/AdminActivity";
 import AdminLogs from "@/pages/AdminLogs";
+import AdminDiagnostics from "@/pages/AdminDiagnostics";
 import AdminAccessGroups from "@/pages/AdminAccessGroups";
 import AdminUsers from "@/pages/AdminUsers";
 import AdminRequests from "@/pages/AdminRequests";
@@ -74,10 +78,14 @@ import Recommendations from "@/pages/Recommendations";
 import RecommendationsSection from "@/pages/RecommendationsSection";
 import Calendar from "@/pages/Calendar";
 import Signup from "@/pages/Signup";
+import InviteClaim from "@/pages/InviteClaim";
+import HouseholdSetup from "@/pages/HouseholdSetup";
 import TasteSeed from "@/pages/TasteSeed";
 import { useFavorites } from "@/hooks/queries/favorites";
 import { useRequestFeatureStatus } from "@/hooks/queries/useRequests";
 import { isTasteSeedDismissed } from "@/lib/tasteSeed";
+import { OnboardingGate } from "@/components/onboarding/OnboardingGate";
+import { useOnboardingState } from "@/hooks/queries/onboarding";
 import SettingsLayout from "@/pages/SettingsLayout";
 import AppearanceSettings from "@/pages/settings/AppearanceSettings";
 import AccessibilitySettings from "@/pages/settings/AccessibilitySettings";
@@ -92,6 +100,8 @@ import HomeScreenSettings from "@/pages/settings/HomeScreenSettings";
 import ThemeEditorSettings from "@/pages/settings/ThemeEditorSettings";
 import CardOverlaySettings from "@/pages/settings/CardOverlaySettings";
 import PersonalizeSettings from "@/pages/settings/PersonalizeSettings";
+import ConnectAppsSettings from "@/pages/settings/ConnectAppsSettings";
+import InterfaceSettings from "@/pages/settings/InterfaceSettings";
 import WatchTogetherJoin from "@/pages/WatchTogetherJoin";
 import WatchTogetherRoomPage from "@/pages/WatchTogetherRoomPage";
 import WatchRoute from "@/pages/WatchRoute";
@@ -102,7 +112,6 @@ import {
   WatchPlaybackProvider,
 } from "@/playback/WatchPlaybackChrome";
 import { AudiobookPlaybackProvider } from "@/pages/audiobooks/player/audiobookPlaybackContext";
-import type { ReactNode } from "react";
 import {
   buildLegacyBrowseCatalogHref,
   buildPersonalCatalogHref,
@@ -232,8 +241,14 @@ function RequireRequestsEnabled({ children }: { children: ReactNode }) {
 function TasteSeedGate({ children }: { children: ReactNode }) {
   const { profile } = useAuth();
   const { data: favorites, isPending, isError } = useFavorites();
+  const onboarding = useOnboardingState({ enabled: profile !== null });
 
   if (isPending || isError || !profile) return <>{children}</>;
+
+  // While the feature tour is pending (or its state unknown) the tour owns
+  // the first-run moment — it ends by handing off to /taste-seed itself, so
+  // redirecting now would jump the queue.
+  if (onboarding.data === undefined || !onboarding.data.done) return <>{children}</>;
 
   const hasFavorites = (favorites?.length ?? 0) > 0;
   const dismissed = isTasteSeedDismissed(profile.id);
@@ -361,6 +376,14 @@ function ReactiveAppRoutes() {
   return <AppRoutes />;
 }
 
+function UICustomizedLayout({ children }: { children: ReactNode }) {
+  return (
+    <UICustomizationProvider>
+      <Layout>{children}</Layout>
+    </UICustomizationProvider>
+  );
+}
+
 function AppRoutes() {
   return (
     <Routes>
@@ -369,6 +392,8 @@ function AppRoutes() {
       <Route path="/activate" element={<ActivateDevice />} />
       <Route path="/setup" element={<SetupWizard />} />
       <Route path="/signup" element={<Signup />} />
+      <Route path="/invite/:token" element={<InviteClaim />} />
+      <Route path="/household-setup" element={<HouseholdSetup />} />
       <Route
         path="/*"
         element={
@@ -412,6 +437,7 @@ function AppRoutes() {
                   <Route index element={<AdminDashboard />} />
                   <Route path="activity" element={<AdminActivity />} />
                   <Route path="logs" element={<AdminLogs />} />
+                  <Route path="diagnostics" element={<AdminDiagnostics />} />
                   <Route path="libraries" element={<AdminLibraries />} />
                   <Route path="maintenance" element={<AdminMaintenance />} />
                   <Route path="collections" element={<AdminCollections />} />
@@ -445,14 +471,15 @@ function AppRoutes() {
                   path="/settings/*"
                   element={
                     <RequireProfile>
-                      <Layout>
+                      <UICustomizedLayout>
                         <SettingsLayout />
-                      </Layout>
+                      </UICustomizedLayout>
                     </RequireProfile>
                   }
                 >
-                  <Route index element={<Navigate to="playback" replace />} />
+                  <Route index element={null} />
                   <Route path="appearance" element={<AppearanceSettings />} />
+                  <Route path="interface" element={<InterfaceSettings />} />
                   <Route path="theme-editor" element={<ThemeEditorSettings />} />
                   <Route path="accessibility" element={<AccessibilitySettings />} />
                   <Route path="playback" element={<PlaybackSettings />} />
@@ -473,21 +500,25 @@ function AppRoutes() {
                   <Route path="home-screen" element={<HomeScreenSettings />} />
                   <Route path="card-overlays" element={<CardOverlaySettings />} />
                   <Route path="personalize" element={<PersonalizeSettings />} />
+                  <Route path="devices" element={<DeviceSettings />} />
                   <Route path="notifications" element={<NotificationsSettings />} />
+                  <Route path="connect-apps" element={<ConnectAppsSettings />} />
                   <Route path="*" element={<Navigate to="/settings/playback" replace />} />
                 </Route>
                 <Route
                   path="/*"
                   element={
                     <RequireProfile>
-                      <Layout>
+                      <UICustomizedLayout>
                         <Routes>
                           <Route
                             path="/"
                             element={
-                              <TasteSeedGate>
-                                <Home />
-                              </TasteSeedGate>
+                              <OnboardingGate>
+                                <TasteSeedGate>
+                                  <Home />
+                                </TasteSeedGate>
+                              </OnboardingGate>
                             }
                           />
                           <Route path="/catalog" element={<Catalog />} />
@@ -574,7 +605,7 @@ function AppRoutes() {
                           />
                           <Route path="*" element={<Navigate to="/" replace />} />
                         </Routes>
-                      </Layout>
+                      </UICustomizedLayout>
                     </RequireProfile>
                   }
                 />
@@ -592,6 +623,9 @@ function RealtimeEventChannels() {
 
   useEventChannel("catalog");
   useEventChannel("user_state");
+  // Subscribes user_settings and invalidates the canonical value queries, so a
+  // setting changed on another device (or by an admin) reaches this tab.
+  useSettingValuesRealtime();
   // Profile-scoped; the server rejects the subscription until the connection
   // is bound to a profile via the websocket ticket, which is harmless.
   useEventChannel("notifications");

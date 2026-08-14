@@ -11,6 +11,12 @@ import {
   type RealtimeConnectionState,
 } from "@/components/realtimeEventsContext";
 import type { TaskInfo, ScanRun } from "@/api/types";
+import {
+  activityMethodMeta,
+  classifyActivityMethod,
+  compareActivityMethods,
+} from "@/pages/adminActivityPresentation";
+import { cn } from "@/lib/utils";
 
 const CONNECTION_PROBLEM_INDICATOR_DELAY_MS = 4_000;
 const MAX_ACTIVITY_SCAN_ROWS = 25;
@@ -20,6 +26,7 @@ const ACTIVE_SCAN_SNAPSHOT_LIMIT = 500;
 interface ServerActivityProps {
   /** Hide the trigger button entirely when there is no activity */
   hideWhenEmpty?: boolean;
+  className?: string;
 }
 
 // ── Data hook ────────────────────────────────────────────────
@@ -42,7 +49,7 @@ function useServerActivityData() {
   const streamCounts = useMemo(() => {
     const counts: Record<string, number> = {};
     for (const s of sessions) {
-      const method = s.play_method || "unknown";
+      const method = classifyActivityMethod(s);
       counts[method] = (counts[method] || 0) + 1;
     }
     return counts;
@@ -94,7 +101,7 @@ function useDelayedConnectionProblem(connectionState: RealtimeConnectionState) {
   return isNonLive && connectionProblemState;
 }
 
-export default function ServerActivity({ hideWhenEmpty = false }: ServerActivityProps) {
+export default function ServerActivity({ hideWhenEmpty = false, className }: ServerActivityProps) {
   const [open, setOpen] = useState(false);
   const location = useLocation();
 
@@ -127,7 +134,10 @@ export default function ServerActivity({ hideWhenEmpty = false }: ServerActivity
               ? `Server activity: ${activeScansMayBeTruncated ? "at least " : ""}${totalActive} active`
               : "Server activity"
           }
-          className="hover:bg-accent/60 relative flex h-9 w-9 items-center justify-center rounded-xl transition-colors"
+          className={cn(
+            "hover:bg-accent/60 relative flex h-9 w-9 items-center justify-center rounded-xl transition-colors",
+            className,
+          )}
         >
           <Activity
             className={`h-[18px] w-[18px] ${
@@ -181,9 +191,11 @@ export default function ServerActivity({ hideWhenEmpty = false }: ServerActivity
                 >
                   {sessions.length > 0 ? (
                     <div className="space-y-1.5">
-                      {Object.entries(streamCounts).map(([method, count]) => (
-                        <StreamCountRow key={method} method={method} count={count} />
-                      ))}
+                      {Object.entries(streamCounts)
+                        .sort(([a], [b]) => compareActivityMethods(a, b))
+                        .map(([method, count]) => (
+                          <StreamCountRow key={method} method={method} count={count} />
+                        ))}
                     </div>
                   ) : (
                     <EmptyRow>No active streams</EmptyRow>
@@ -299,12 +311,6 @@ function ActivitySection({
   );
 }
 
-const METHOD_META: Record<string, { label: string; color: string }> = {
-  direct: { label: "Direct Play", color: "bg-success" },
-  remux: { label: "Remux", color: "bg-info" },
-  transcode: { label: "Transcode", color: "bg-warning" },
-};
-
 function formatBadgeCount(count: number, countIsLowerBound = false) {
   if (countIsLowerBound) {
     return count > MAX_BADGE_COUNT ? `${MAX_BADGE_COUNT}+` : `${count}+`;
@@ -313,12 +319,12 @@ function formatBadgeCount(count: number, countIsLowerBound = false) {
 }
 
 function StreamCountRow({ method, count }: { method: string; count: number }) {
-  const { label = method, color = "bg-muted-foreground" } = METHOD_META[method] ?? {};
+  const meta = activityMethodMeta(method);
   return (
     <div className="flex items-center gap-2.5">
-      <span className={`h-2 w-2 rounded-full ${color}`} />
+      <span className={`h-2 w-2 rounded-full ${meta.swatchClass}`} />
       <span className="text-[12px] font-medium">
-        {count} {label}
+        {count} {meta.label}
       </span>
     </div>
   );

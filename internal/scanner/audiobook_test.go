@@ -67,11 +67,11 @@ type fakeScannerCoverCacher struct {
 	contentID string
 }
 
-func (f *fakeScannerCoverCacher) CacheAudiobookCover(_ context.Context, data []byte, contentID string) (string, string, string, error) {
+func (f *fakeScannerCoverCacher) CacheAudiobookCover(_ context.Context, data []byte, contentID string) (string, string, error) {
 	f.calls++
 	f.data = append([]byte(nil), data...)
 	f.contentID = contentID
-	return "local/audiobooks/" + contentID + "/poster", ".webp", "thumbhash", nil
+	return "local/audiobooks/" + contentID + "/poster/original.test-revision.webp", "thumbhash", nil
 }
 
 func TestApplyAudiobookEmbeddedCoverStoresPosterDuringScan(t *testing.T) {
@@ -108,7 +108,7 @@ func TestApplyAudiobookEmbeddedCoverStoresPosterDuringScan(t *testing.T) {
 	if len(exec.args) != 3 {
 		t.Fatalf("Exec args = %#v, want 3 args", exec.args)
 	}
-	if exec.args[0] != "local/audiobooks/content-1/poster/original.webp" {
+	if exec.args[0] != "local/audiobooks/content-1/poster/original.test-revision.webp" {
 		t.Fatalf("poster arg = %#v", exec.args[0])
 	}
 	if exec.args[1] != "thumbhash" || exec.args[2] != "content-1" {
@@ -245,6 +245,43 @@ func TestParseAudiobookFolderSingleM4B(t *testing.T) {
 	}
 	if len(got.Files[0].Chapters) != 2 {
 		t.Errorf("file 0 chapters = %d, want 2", len(got.Files[0].Chapters))
+	}
+}
+
+func TestParseAudiobookFolderEmptyFolderSignalsNoMedia(t *testing.T) {
+	_, err := parseAudiobookFolder(context.Background(), "ffprobe", t.TempDir())
+	if !errors.Is(err, errFolderHasNoMedia) {
+		t.Fatalf("empty folder error = %v, want errFolderHasNoMedia", err)
+	}
+}
+
+// A missing or misconfigured ffprobe binary must not look like an empty
+// folder: exec wraps fs.ErrNotExist when the binary does not exist, so a
+// reconcile that skipped on os.ErrNotExist silently indexed nothing while
+// reporting processed=N failed=0.
+func TestParseAudiobookFolderUnusableFFprobeIsNotSkippable(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "part1.m4b"), []byte("not really audio"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := parseAudiobookFolder(context.Background(), "/nonexistent/bin/ffprobe", dir)
+	if err == nil {
+		t.Fatal("parseAudiobookFolder with an unusable ffprobe returned no error")
+	}
+	if errors.Is(err, errFolderHasNoMedia) {
+		t.Fatalf("error = %v, must not be reported as an empty folder", err)
+	}
+}
+
+// A folder that disappears between the scan walk and the parse is a normal
+// mid-scan rename/delete race, not a scan failure: it must stay skippable.
+func TestParseAudiobookFolderVanishedFolderSignalsNoMedia(t *testing.T) {
+	gone := filepath.Join(t.TempDir(), "renamed-away")
+
+	_, err := parseAudiobookFolder(context.Background(), "ffprobe", gone)
+	if !errors.Is(err, errFolderHasNoMedia) {
+		t.Fatalf("vanished folder error = %v, want errFolderHasNoMedia", err)
 	}
 }
 
@@ -632,6 +669,19 @@ func TestAudiobookFolderUnchangedAllMatch(t *testing.T) {
 	}
 	if !audiobookFolderUnchanged(files, onDisk) {
 		t.Fatal("expected unchanged=true when sizes+mtimes match")
+	}
+}
+
+func TestAudiobookFolderUnchangedRepairsLegacyCoverArtRows(t *testing.T) {
+	now := time.Now().UTC()
+	files := []*models.MediaFile{{
+		FilePath: "/lib/Author/Book/a.m4b", FileSize: 100, FileModifiedAt: &now,
+		BaseType: "audiobook", CodecVideo: "mjpeg", CodecAudio: "aac",
+		VideoTracks: []models.VideoTrack{{Codec: "mjpeg"}}, AudioTracks: []models.AudioTrack{{Codec: "aac"}},
+	}}
+	onDisk := []audiobookDiskFile{{Path: files[0].FilePath, Size: files[0].FileSize, ModTime: now}}
+	if audiobookFolderUnchanged(files, onDisk) {
+		t.Fatal("legacy cover-art rows must bypass the unchanged fast path")
 	}
 }
 

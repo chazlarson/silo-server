@@ -506,6 +506,7 @@ func (s *directContentService) BrowseItems(ctx context.Context, session *Session
 	if len(collected) > requestedLimit {
 		collected = collected[:requestedLimit]
 	}
+	fillListItemDurations(ctx, s.detailSvc, collected)
 
 	// The handler's resolveUserStateForContentIDs overlay only covers items
 	// with their own progress rows, which a series never has — aggregate
@@ -594,6 +595,7 @@ func (s *directContentService) SearchItems(ctx context.Context, session *Session
 		listItems = append(listItems, mediaItemToListItem(mi))
 	}
 	presignCompatListItems(ctx, s.detailSvc, listItems)
+	fillListItemDurations(ctx, s.detailSvc, listItems)
 	s.enrichListItemsUserData(ctx, session, listItems)
 
 	return &upstreamBrowseResponse{
@@ -833,14 +835,14 @@ func (s *directContentService) ListSeasons(ctx context.Context, session *Session
 	progressMap := s.batchProgressForEpisodes(ctx, session, allEpisodeIDs)
 
 	if len(seasons) > 0 {
+		if s.detailSvc != nil {
+			if localized, locErr := s.detailSvc.LocalizeSeasonModels(ctx, seasons, filter); locErr == nil && len(localized) == len(seasons) {
+				seasons = localized
+			}
+		}
 		result := make([]upstreamSeason, 0, len(seasons))
 		for _, season := range seasons {
 			eps := groupedEpisodes[season.SeasonNumber]
-			if s.detailSvc != nil {
-				if localized, locErr := s.detailSvc.LocalizeSeasonModel(ctx, season, filter); locErr == nil && localized != nil {
-					season = localized
-				}
-			}
 			us := modelSeasonToUpstream(season, len(eps))
 			applySeasonUserData(&us, eps, progressMap)
 			result = append(result, us)
@@ -920,14 +922,14 @@ func (s *directContentService) ListEpisodes(ctx context.Context, session *Sessio
 			progressMap = progressEntries
 		}
 	}
+	if s.detailSvc != nil {
+		if localized, locErr := s.detailSvc.LocalizeEpisodeModels(ctx, episodes, filter); locErr == nil && len(localized) == len(episodes) {
+			episodes = localized
+		}
+	}
 
 	result := make([]upstreamEpisode, 0, len(episodes))
 	for _, ep := range episodes {
-		if s.detailSvc != nil {
-			if localized, locErr := s.detailSvc.LocalizeEpisodeModel(ctx, ep, filter); locErr == nil && localized != nil {
-				ep = localized
-			}
-		}
 		ue := modelEpisodeToUpstream(ep, seriesID)
 		if progress, ok := progressMap[ep.ContentID]; ok {
 			progressCopy := progress

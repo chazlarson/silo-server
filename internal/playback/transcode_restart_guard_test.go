@@ -74,6 +74,47 @@ func TestRestartInvokesRestartHook(t *testing.T) {
 	}
 }
 
+func TestRestartCopySeekOriginIsReplacedOrCleared(t *testing.T) {
+	truePath, err := exec.LookPath("true")
+	if err != nil {
+		t.Skipf("`true` not found in PATH: %v", err)
+	}
+
+	newSession := func() *TranscodeSession {
+		return &TranscodeSession{
+			outputDir: t.TempDir(),
+			opts: TranscodeOpts{
+				TargetCodecVideo:       "copy",
+				SegmentDuration:        2,
+				SeekSeconds:            18,
+				StreamOriginSeconds:    10,
+				CopySeekAnchorResolved: true,
+				StartSegmentNumber:     5,
+				FFmpegPath:             truePath,
+			},
+		}
+	}
+
+	resolved := newSession()
+	if err := resolved.RestartWithCopySeekAnchor(context.Background(), 100, 48, 96); err != nil {
+		t.Fatalf("RestartWithCopySeekAnchor: %v", err)
+	}
+	resolvedOpts := resolved.Opts()
+	if resolvedOpts.SeekSeconds != 100 || resolvedOpts.StreamOriginSeconds != 96 ||
+		!resolvedOpts.CopySeekAnchorResolved || resolvedOpts.StartSegmentNumber != 48 {
+		t.Fatalf("resolved restart opts = %+v", resolvedOpts)
+	}
+
+	unresolved := newSession()
+	if err := unresolved.Restart(context.Background(), 100, 50); err != nil {
+		t.Fatalf("Restart: %v", err)
+	}
+	unresolvedOpts := unresolved.Opts()
+	if unresolvedOpts.StreamOriginSeconds != 0 || unresolvedOpts.CopySeekAnchorResolved {
+		t.Fatalf("generic restart retained stale copy origin: %+v", unresolvedOpts)
+	}
+}
+
 // TestRestartIsSingleFlight covers the other half: Restart must be
 // single-flight per session. A second caller arriving while a restart is in
 // progress must return immediately without killing the process the first

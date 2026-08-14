@@ -114,13 +114,53 @@ func ListCollections(db *sql.DB, profileID string) ([]Collection, error) {
 		if err := rows.Scan(&c.ID, &c.ProfileID, &c.CreatorProfileID, &c.Name, &c.CollectionType, &c.IsShared, &c.QueryDefinition, &c.SortConfig, &c.CreatedAt, &c.UpdatedAt); err != nil {
 			return nil, err
 		}
-		c.AllowedProfileIDs, err = listCollectionProfiles(db, c.ID)
-		if err != nil {
-			return nil, err
-		}
 		collections = append(collections, c)
 	}
-	return collections, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if err := attachCollectionProfiles(db, profileID, collections); err != nil {
+		return nil, err
+	}
+	return collections, nil
+}
+
+// attachCollectionProfiles fills AllowedProfileIDs for every collection with a
+// single batched query, avoiding the N+1 round trip a per-collection lookup
+// would create.
+func attachCollectionProfiles(db *sql.DB, profileID string, collections []Collection) error {
+	if len(collections) == 0 {
+		return nil
+	}
+	rows, err := db.Query(
+		`SELECT allowed.collection_id, allowed.profile_id
+		 FROM personal_collection_profiles AS visible
+		 JOIN personal_collection_profiles AS allowed
+		   ON allowed.collection_id = visible.collection_id
+		 WHERE visible.profile_id = ?
+		 ORDER BY allowed.profile_id ASC`,
+		profileID,
+	)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	byCollection := make(map[string][]string, len(collections))
+	for rows.Next() {
+		var collectionID, profileID string
+		if err := rows.Scan(&collectionID, &profileID); err != nil {
+			return err
+		}
+		byCollection[collectionID] = append(byCollection[collectionID], profileID)
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for i := range collections {
+		collections[i].AllowedProfileIDs = byCollection[collections[i].ID]
+	}
+	return nil
 }
 
 // UpdateCollection renames a collection and updates its updated_at timestamp.
@@ -201,6 +241,11 @@ func DeleteCollection(db *sql.DB, id string) error {
 	defer tx.Rollback()
 
 	if _, err := tx.Exec(`DELETE FROM personal_collection_items WHERE collection_id = ?`, id); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`
+		DELETE FROM collection_sort_preferences
+		WHERE collection_kind = 'user' AND collection_id = ?`, id); err != nil {
 		return err
 	}
 	if _, err := tx.Exec(`DELETE FROM personal_collections WHERE id = ?`, id); err != nil {

@@ -1,13 +1,14 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
-import type { PlayerFileVersion, PlayerSubtitleTrackSignature, WatchPageProps } from "../types";
+import type { PlayerFileVersion, PlayerPlaybackStateChange, WatchPageProps } from "../types";
 import type { PlaybackRealtimeEventEnvelope } from "../realtime-protocol";
+import type { SubtitleInventoryItemV3 } from "../protocol-v3";
 import { usePlaybackSession } from "../hooks/usePlaybackSession";
 import { usePlayerConfig } from "../context/PlayerConfigContext";
 import { playerFetch } from "../player-fetch";
 import { resolvePlayableSubtitles } from "../utils/playableSubtitles";
-import { derivePersistedSubtitleMode } from "../utils/subtitleMode";
 import { patchVersionMarkers, resolveActiveVersionMarkers } from "../utils/watchPageMarkers";
+import { buildSubtitleChoiceRequests } from "../utils/subtitleChoicePersistence";
 import { VideoPlayer } from "./VideoPlayer";
 import { fetchWatchDetail } from "@/hooks/queries/items";
 import { itemKeys } from "@/hooks/queries/keys";
@@ -70,6 +71,7 @@ export function WatchPage({
   initialPosition,
   forceInitialPosition,
   qualityPreference,
+  maxBitrateKbps,
   explicitAudioTrackIndex,
   preferredSubtitleLanguage,
   preferredSubtitleTrackSignature,
@@ -123,6 +125,7 @@ export function WatchPage({
     initialPosition,
     forceInitialPosition,
     qualityPreference,
+    maxBitrateKbps,
     resumeHints,
     explicitAudioTrackIndex,
   );
@@ -167,39 +170,41 @@ export function WatchPage({
     [session],
   );
 
+  const updatePlaybackState = session.updatePlaybackState;
+  const handlePlaybackStateChange = useCallback(
+    (state: PlayerPlaybackStateChange) => {
+      updatePlaybackState(state.currentTime, state.playing);
+      onPlaybackStateChange?.(state);
+    },
+    [onPlaybackStateChange, updatePlaybackState],
+  );
+
+  /**
+   * Persists an in-player subtitle choice for the whole series.
+   *
+   * buildSubtitleChoiceRequests decides what a pick is worth storing and
+   * where; this only issues the requests. They are independent on purpose: a
+   * failed settings write must not cost the user the track they picked, and a
+   * failed track write must not cost them the language, so each is best effort
+   * on its own rather than one composite request that half-applies.
+   */
   const handleSubtitleChanged = useCallback(
-    (index: number | null) => {
-      const seriesId = seriesContext?.seriesId ?? contentId;
-      if (!seriesId) return;
-
-      const track = index !== null ? playableSubtitles.find((s) => s.index === index) : null;
-      // Never persist an index we can't resolve to a real track (e.g. the
-      // in-progress AI live track's sentinel index): it would store a
-      // nonexistent track with empty language and clobber the saved preference.
-      if (index !== null && !track) return;
-      const trackSignature: PlayerSubtitleTrackSignature | null = track
-        ? {
-            source: track.source,
-            language: track.language,
-            codec: track.codec,
-            label: track.label,
-            forced: track.forced,
-            hearing_impaired: track.hearing_impaired,
-          }
-        : null;
-
-      playerFetch(config, `/subtitle-prefs/${seriesId}`, {
-        method: "PUT",
-        body: JSON.stringify({
-          subtitle_language: track?.language ?? "",
-          subtitle_track_index: index ?? -1,
-          subtitle_mode: derivePersistedSubtitleMode(index),
-          track_signature: trackSignature,
-          show_forced_subtitles: showForcedSubtitles,
-        }),
-      }).catch(() => {
-        // Best effort.
+    (index: number | null, inventoryTrack?: SubtitleInventoryItemV3) => {
+      const requests = buildSubtitleChoiceRequests({
+        seriesId: seriesContext?.seriesId ?? contentId,
+        index,
+        tracks: playableSubtitles,
+        inventoryTrack,
+        showForcedSubtitles,
       });
+      for (const request of requests) {
+        void playerFetch(config, request.path, {
+          method: "PUT",
+          body: JSON.stringify(request.body),
+        }).catch(() => {
+          // Best effort.
+        });
+      }
     },
     [config, seriesContext, contentId, playableSubtitles, showForcedSubtitles],
   );
@@ -371,7 +376,9 @@ export function WatchPage({
     [session.mediaFileId],
   );
 
-  if (!session.streamUrl || !session.sessionId) {
+  // The plan is the player's contract: without one there is no transport, no
+  // timeline and no track inventory to render against.
+  if (!session.plan || !session.streamUrl || !session.sessionId) {
     if (session.loading) {
       return (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black">
@@ -408,30 +415,6 @@ export function WatchPage({
     );
   }
 
-  if (session.error && !session.replacing) {
-    return (
-      <div className="bg-background fixed inset-0 z-50 flex items-center justify-center px-6">
-        <div className="surface-panel-subtle flex max-w-md flex-col items-center gap-4 rounded-[1.8rem] px-8 py-8 text-center">
-          <div className="space-y-2">
-            <p className="text-base font-semibold text-white">
-              {session.errorTitle ?? "Playback unavailable"}
-            </p>
-            <p className="text-sm text-white/60">{session.error}</p>
-          </div>
-          <button
-            onClick={() => {
-              void onExit();
-            }}
-            type="button"
-            className="rounded-[0.95rem] bg-white/10 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-white/20"
-          >
-            Go Back
-          </button>
-        </div>
-      </div>
-    );
-  }
-
   // Find the duration of the selected file so the player knows the total
   // length even when the stream is chunked (no Content-Length header).
   const selectedDuration =
@@ -450,8 +433,12 @@ export function WatchPage({
       title={title}
       year={year}
       streamUrl={session.streamUrl}
-      playMethod={session.playMethod!}
-      playbackInfo={session.playbackInfo}
+      plan={session.plan}
+      planRevision={session.planRevision}
+      shouldAutoPlay={session.shouldAutoPlay}
+      replanning={session.replanning}
+      replanError={session.error}
+      replanErrorTitle={session.errorTitle}
       sessionId={session.sessionId}
       selectedVersion={selectedVersion}
       versions={playbackVersions}
@@ -460,6 +447,11 @@ export function WatchPage({
       onSwitchVersion={handleSwitchVersion}
       subtitleUrls={playableSubtitles}
       initialPosition={session.initialPosition}
+      onQualitySelect={session.changeQuality}
+      onSubtitleTrackChange={session.changeSubtitleTrack}
+      onPlanFailure={session.recoverFromFailure}
+      onReanchorSeek={session.reanchorSeek}
+      onApplySubtitleTrack={session.applySubtitleTrack}
       preferredSubtitleLanguage={preferredSubtitleLanguage}
       preferredSubtitleTrackSignature={preferredSubtitleTrackSignature}
       subtitleMode={subtitleMode}
@@ -486,13 +478,15 @@ export function WatchPage({
         )
       }
       duration={selectedDuration}
-      qualityPreference={qualityPreference}
+      // The session's preference, not the caller's: the server normalizes what
+      // was requested and the menu has to light up whatever it settled on.
+      qualityPreference={session.qualityPreference}
       seriesContext={seriesContext}
       onNavigateEpisode={onNavigateEpisode}
       displayMode={displayMode}
       onPictureInPictureChange={onPictureInPictureChange}
       autoEnterPictureInPicture={autoEnterPictureInPicture}
-      onPlaybackStateChange={onPlaybackStateChange}
+      onPlaybackStateChange={handlePlaybackStateChange}
       onPlaybackTransportReady={onPlaybackTransportReady}
       onRealtimeEvent={handleRealtimeEvent}
       onRealtimeConnectionStateChange={setRealtimeConnectionState}

@@ -8,6 +8,8 @@ import (
 	"github.com/Silo-Server/silo-server/internal/models"
 )
 
+const LibraryCollectionVisibilityVisible = "visible"
+
 // AccessFilter captures effective viewer access constraints for catalog reads.
 type AccessFilter struct {
 	AllowedLibraryIDs     []int
@@ -19,11 +21,20 @@ type AccessFilter struct {
 	// language. Presentation language resolves: explicit PresentationLanguage
 	// → ProfilePreferredLanguage → the library's metadata_language.
 	ProfilePreferredLanguage string
-	MaxContentRating         string
-	MaxPlaybackQuality       string
-	SelectedFileID           int
-	UserID                   int
-	ProfileID                string
+	// MetadataLanguageOverrides maps an item's original language to a target
+	// language before ProfilePreferredLanguage is used as the fallback.
+	MetadataLanguageOverrides map[string]string
+	// PresentationOriginalLanguage supplies a parent series' original language
+	// while localizing season and episode rows, which do not duplicate it.
+	PresentationOriginalLanguage string
+	MaxContentRating             string
+	MaxPlaybackQuality           string
+	SelectedFileID               int
+	UserID                       int
+	ProfileID                    string
+	// DeviceID identifies the requesting client for device-scoped setting
+	// resolution. It does not participate in catalog access control.
+	DeviceID string
 	// NamePrefix, when non-empty, restricts results to items whose
 	// LOWER(COALESCE(NULLIF(BTRIM(sort_title),''), title)) starts with the
 	// given (case-insensitive) prefix. Pushed into the SQL WHERE clause so
@@ -34,6 +45,29 @@ type AccessFilter struct {
 	// "podcast" — they're served by the ABS-compat API instead). Applied by
 	// every query builder that consumes an AccessFilter.
 	ExcludedMediaTypes []string
+}
+
+// CanAccessLibraryCollection reports whether a visible server collection is
+// reachable through at least one library in the viewer's effective scope.
+// Collections without explicit library scope retain their legacy unrestricted
+// visibility, but restricted viewers cannot address them by ID.
+func CanAccessLibraryCollection(collection *models.LibraryCollection, filter AccessFilter) bool {
+	if collection == nil || collection.Visibility != LibraryCollectionVisibilityVisible {
+		return false
+	}
+	if len(collection.LibraryIDs) == 0 {
+		return filter.AllowedLibraryIDs == nil && len(filter.DisabledLibraryIDs) == 0
+	}
+	for _, libraryID := range collection.LibraryIDs {
+		if filter.AllowedLibraryIDs != nil && !intInSlice(libraryID, filter.AllowedLibraryIDs) {
+			continue
+		}
+		if intInSlice(libraryID, filter.DisabledLibraryIDs) {
+			continue
+		}
+		return true
+	}
+	return false
 }
 
 func applyAccessFilter(alias string, filter AccessFilter, conditions *[]string, args *[]any, argIdx *int) {
@@ -137,10 +171,15 @@ func intInSlice(value int, values []int) bool {
 	return false
 }
 
-// FilterMediaFilesByAccess drops file versions that exceed the viewer's
-// effective quality ceiling.
+// FilterMediaFilesByAccess drops file versions the viewer cannot access:
+// files in libraries outside their allowed set, in libraries they disabled,
+// or above their effective quality ceiling — the same predicate as
+// FileAllowedByAccess.
 func FilterMediaFilesByAccess(files []*models.MediaFile, filter AccessFilter) []*models.MediaFile {
-	if len(files) == 0 || strings.TrimSpace(filter.MaxPlaybackQuality) == "" {
+	unrestricted := filter.AllowedLibraryIDs == nil &&
+		len(filter.DisabledLibraryIDs) == 0 &&
+		strings.TrimSpace(filter.MaxPlaybackQuality) == ""
+	if len(files) == 0 || unrestricted {
 		return files
 	}
 

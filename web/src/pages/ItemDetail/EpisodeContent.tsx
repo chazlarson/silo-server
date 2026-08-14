@@ -32,6 +32,7 @@ import MediaInfoDialog from "./components/MediaInfoDialog";
 import SubtitleSearchDialog from "./components/SubtitleSearchDialog";
 import { sortByResolution } from "./components/VersionFlyout";
 import { selectDefaultPlaybackVariantVersion } from "./components/versionRankingUtils";
+import { resolveSelectedMediaSummary } from "./components/selectedMediaSummary";
 import { EpisodeCarouselSkeleton } from "./components/SectionSkeletons";
 import {
   getSeasonDisplayTitle,
@@ -44,13 +45,8 @@ import {
   canCurateMetadata as canCurateMetadataForUser,
   canEditMarkers as canEditMarkersForUser,
 } from "@/lib/permissions";
-
-function formatDuration(minutes: number): string {
-  if (minutes <= 0) return "";
-  const h = Math.floor(minutes / 60);
-  const m = minutes % 60;
-  return h > 0 ? `${h}h ${m}m` : `${m}m`;
-}
+import { formatRuntimeMinutes } from "@/lib/mediaFormat";
+import { useQualityPreference } from "@/hooks/queries/qualityPreference";
 
 export default function EpisodeContent({ item }: { item: ItemDetail & { type: "episode" } }) {
   const { translating: overviewTranslating, onTranslate: onTranslateOverview } =
@@ -61,6 +57,10 @@ export default function EpisodeContent({ item }: { item: ItemDetail & { type: "e
   const { user } = useAuth();
   const isAdmin = useIsActingAdmin();
   const { profile: currentProfile } = useCurrentProfile();
+  // The resolution cap comes from the settings contract, where the quality
+  // picker writes; the profile column it falls back to is only the pre-cutover
+  // choice, since that picker no longer mirrors into it.
+  const qualityPreference = useQualityPreference(currentProfile?.quality_preference);
   const canCurateMetadata = canCurateMetadataForUser(user, currentProfile);
   const canEditMarkers = canEditMarkersForUser(user, currentProfile);
   const [editOpen, setEditOpen] = useState(false);
@@ -83,11 +83,11 @@ export default function EpisodeContent({ item }: { item: ItemDetail & { type: "e
         sortedVersions,
         item.playback_variants,
         userData,
-        currentProfile?.quality_preference,
+        qualityPreference,
         item.effective_version_edition_key,
       ),
     [
-      currentProfile?.quality_preference,
+      qualityPreference,
       item.effective_version_edition_key,
       item.playback_variants,
       sortedVersions,
@@ -101,6 +101,10 @@ export default function EpisodeContent({ item }: { item: ItemDetail & { type: "e
         ? (sortedVersions.find((version) => version.file_id === manualSelectedFileId) ?? null)
         : null) ?? defaultSelectedVersion,
     [defaultSelectedVersion, manualSelectedFileId, sortedVersions],
+  );
+  const selectedMediaSummary = useMemo(
+    () => resolveSelectedMediaSummary(selectedVersion, item.playback_variants, item.runtime ?? 0),
+    [item.playback_variants, item.runtime, selectedVersion],
   );
   const openMediaInfo = useCallback(
     (fileId?: number) => {
@@ -283,7 +287,9 @@ export default function EpisodeContent({ item }: { item: ItemDetail & { type: "e
         logoUrl={item.logo_url}
         metadata={
           <div className="flex flex-wrap items-center gap-2">
-            <MetadataBadges duration={formatDuration(item.runtime ?? 0) || undefined} />
+            <MetadataBadges
+              duration={formatRuntimeMinutes(selectedMediaSummary.durationMinutes) || undefined}
+            />
             {item.air_date && (
               <span className="metadata-badge">
                 {(() => {
@@ -298,7 +304,7 @@ export default function EpisodeContent({ item }: { item: ItemDetail & { type: "e
                 })()}
               </span>
             )}
-            <QualityBadges versions={item.versions ?? []} />
+            <QualityBadges summary={selectedMediaSummary} />
           </div>
         }
         scoreRow={
@@ -380,7 +386,7 @@ export default function EpisodeContent({ item }: { item: ItemDetail & { type: "e
             onSearchSubtitles={
               (item.versions?.length ?? 0) > 0 ? () => setSubtitleSearchOpen(true) : undefined
             }
-            qualityPreference={currentProfile?.quality_preference}
+            qualityPreference={qualityPreference}
             audioSelectionMode={audioSelectionMode}
             explicitAudioTrackIndex={explicitAudioTrackIndex}
             onSelectAudioTrack={handleSelectAudioTrack}

@@ -3,6 +3,7 @@ package playback
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -11,19 +12,30 @@ import (
 	"strings"
 )
 
+const (
+	subtitleCodecPGS       = "pgs"
+	subtitleCodecPGSShort  = "pgssub"
+	subtitleCodecPGSFFmpeg = "hdmv_pgs_subtitle"
+	subtitleCodecDVDShort  = "dvdsub"
+	subtitleCodecVOBShort  = "vobsub"
+	subtitleCodecDVDFFmpeg = "dvd_subtitle"
+	subtitleCodecDVBShort  = "dvbsub"
+	subtitleCodecDVBFFmpeg = "dvb_subtitle"
+)
+
 // bitmapSubtitleCodecs lists subtitle codecs that cannot be extracted as text
 // and must be burned into the video stream.
 var bitmapSubtitleCodecs = map[string]bool{
-	"pgs":               true,
-	"hdmv_pgs_subtitle": true,
-	"dvd_subtitle":      true,
-	"dvb_subtitle":      true,
+	subtitleCodecPGS:       true,
+	subtitleCodecPGSFFmpeg: true,
+	subtitleCodecDVDFFmpeg: true,
+	subtitleCodecDVBFFmpeg: true,
 }
 
 // NeedsBurnIn reports whether the given subtitle codec is bitmap-based and
 // requires burning into the video stream (cannot be extracted as text).
 func NeedsBurnIn(subtitleCodec string) bool {
-	return bitmapSubtitleCodecs[strings.ToLower(subtitleCodec)]
+	return bitmapSubtitleCodecs[normalizeCodecV3(subtitleCodec)]
 }
 
 // pgsSubtitleCodecs lists PGS (Blu-ray bitmap) subtitle codec names. Unlike
@@ -32,13 +44,13 @@ func NeedsBurnIn(subtitleCodec string) bool {
 // option. The web player burns in all bitmap codecs; DVD/DVB bitmap subs also
 // require burn-in for native clients that cannot render them directly.
 var pgsSubtitleCodecs = map[string]bool{
-	"pgs":               true,
-	"hdmv_pgs_subtitle": true,
+	subtitleCodecPGS:       true,
+	subtitleCodecPGSFFmpeg: true,
 }
 
 // IsPGS reports whether the given subtitle codec is PGS format.
 func IsPGS(codec string) bool {
-	return pgsSubtitleCodecs[strings.ToLower(codec)]
+	return pgsSubtitleCodecs[normalizeCodecV3(codec)]
 }
 
 // assSubtitleCodecs lists subtitle codecs that are ASS/SSA format and support
@@ -233,6 +245,41 @@ func ConvertToVTT(input []byte, fromFormat string) ([]byte, error) {
 	default:
 		return nil, fmt.Errorf("unsupported subtitle format for VTT conversion: %s", fromFormat)
 	}
+}
+
+// ConvertToVTTWithFFmpeg converts subtitle formats that require a real parser
+// (notably ASS/SSA) from in-memory data. It keeps downloaded subtitle
+// conversion on the same executable path as external sidecar conversion.
+func ConvertToVTTWithFFmpeg(ctx context.Context, input []byte, fromFormat, ffmpegPath string) ([]byte, error) {
+	if converted, err := ConvertToVTT(input, fromFormat); err == nil {
+		return converted, nil
+	}
+	inputFormat := strings.ToLower(strings.TrimSpace(fromFormat))
+	if inputFormat == "ssa" {
+		inputFormat = "ass"
+	}
+	if inputFormat == "" {
+		return nil, errors.New("subtitle format is required")
+	}
+	if strings.TrimSpace(ffmpegPath) == "" {
+		ffmpegPath = "ffmpeg"
+	}
+	cmd := exec.CommandContext(ctx, ffmpegPath,
+		"-hide_banner", "-loglevel", "error",
+		"-f", inputFormat, "-i", "pipe:0",
+		"-f", "webvtt", "pipe:1",
+	)
+	cmd.Stdin = bytes.NewReader(input)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return nil, fmt.Errorf("ffmpeg subtitle conversion failed: %w (stderr: %s)", err, truncateStderr(stderr.String()))
+	}
+	if stdout.Len() == 0 {
+		return nil, errors.New("ffmpeg produced empty subtitle output")
+	}
+	return stdout.Bytes(), nil
 }
 
 // srtToVTT converts SRT subtitle content to WebVTT format.

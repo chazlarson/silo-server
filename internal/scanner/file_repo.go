@@ -2198,6 +2198,50 @@ func (r *FileRepository) CountUnmatchedMatchBacklogByFolder(ctx context.Context,
 	return total, nil
 }
 
+// CountUnmatchedMatchBacklogByFolders counts raw matcher work for multiple
+// libraries in one query. Libraries without eligible files are omitted.
+func (r *FileRepository) CountUnmatchedMatchBacklogByFolders(ctx context.Context, folderIDs []int, mode RawMatchBacklogMode) (map[int]int, error) {
+	counts := make(map[int]int, len(folderIDs))
+	if len(folderIDs) == 0 {
+		return counts, nil
+	}
+	rows, err := r.pool.Query(ctx, `
+		SELECT mf.media_folder_id, COUNT(*)
+		FROM media_files mf
+		JOIN media_folders folders ON folders.id = mf.media_folder_id
+		WHERE mf.media_folder_id = ANY($1)
+		  AND (mf.content_id IS NULL OR mf.content_id = '') AND mf.extra_id IS NULL
+		  AND mf.missing_since IS NULL
+		  AND mf.match_suppressed_at IS NULL
+		  AND folders.enabled = true
+		  AND (
+			$2 = 'generic'
+			OR ($2 = 'non_series' AND lower(trim(folders.type)) NOT IN ('series', 'tv', 'show', 'tvshows'))
+			OR (
+				$2 = 'mixed'
+				AND lower(trim(folders.type)) NOT IN ('series', 'tv', 'show', 'tvshows', 'movie', 'movies')
+				AND lower(trim(COALESCE(mf.base_type, ''))) NOT IN ('series', 'movie')
+			)
+		  )
+		GROUP BY mf.media_folder_id
+	`, folderIDs, string(normalizeRawMatchBacklogMode(mode)))
+	if err != nil {
+		return nil, fmt.Errorf("counting unmatched match backlog by folders: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var folderID, count int
+		if err := rows.Scan(&folderID, &count); err != nil {
+			return nil, fmt.Errorf("scanning unmatched match backlog counts: %w", err)
+		}
+		counts[folderID] = count
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterating unmatched match backlog counts: %w", err)
+	}
+	return counts, nil
+}
+
 // ListUnmatchedMatchBacklogByFolder lists raw unmatched files that are still
 // eligible for the background matcher.
 func (r *FileRepository) ListUnmatchedMatchBacklogByFolder(ctx context.Context, folderID int, mode RawMatchBacklogMode, limit int, offset int) ([]*models.MediaFile, int, error) {
@@ -2616,17 +2660,127 @@ func (r *FileRepository) MarkMissing(ctx context.Context, id int, since time.Tim
 // hidden from clients; the grace only delays deleting the row so a file that
 // reappears within the window restores without re-probing or re-matching.
 // A zero grace deletes all missing-marked rows immediately.
+//
+// Rows whose file_path lies at or under one of protectedRoots are never
+// deleted, no matter how long they have been missing: an unreachable library
+// root (dead drive, lost mount) is temporarily offline, not removed, so its
+// catalog state must survive until the root is reachable again. Passing no
+// protected roots preserves the historical folder-wide sweep exactly.
 // Returns the number of rows deleted.
-func (r *FileRepository) DeleteMissingByFolder(ctx context.Context, folderID int, gracePeriod time.Duration) (int, error) {
+func (r *FileRepository) DeleteMissingByFolder(ctx context.Context, folderID int, gracePeriod time.Duration, protectedRoots []string) (int, error) {
 	cutoff := time.Now().UTC().Add(-gracePeriod)
-	tag, err := r.pool.Exec(ctx,
-		"DELETE FROM media_files WHERE media_folder_id = $1 AND missing_since IS NOT NULL AND missing_since < $2",
-		folderID, cutoff,
-	)
+	query := "DELETE FROM media_files WHERE media_folder_id = $1 AND missing_since IS NOT NULL AND missing_since < $2"
+	args := []any{folderID, cutoff}
+	if clauses, clauseArgs := rootCoverageClauses(protectedRoots, len(args)+1); len(clauses) > 0 {
+		query += " AND NOT (" + strings.Join(clauses, " OR ") + ")"
+		args = append(args, clauseArgs...)
+	}
+	tag, err := r.pool.Exec(ctx, query, args...)
 	if err != nil {
 		return 0, fmt.Errorf("deleting missing files for folder %d: %w", folderID, err)
 	}
 	return int(tag.RowsAffected()), nil
+}
+
+// ListRootsWithCatalogedFiles returns the subset of roots (in input order)
+// that still have any media_files rows at or under them in the folder,
+// whether those rows are present or already marked missing.
+//
+// This is the proactive counterpart to ListRootsWithOnlyMissingFiles. That
+// query requires a root to have NO live rows left, which means it can only
+// recognise a lost mount after a scan has already marked its files missing —
+// i.e. after the damage is done. For deciding whether to mark in the first
+// place, the question is simply "does the catalog believe anything lives
+// here", because an empty-but-reachable directory that still owns cataloged
+// files is the signature of a dropped mount exposing its bare mountpoint.
+//
+// A genuinely emptied root also matches, which is intended: emptying a root
+// is confirmed through the operator's one-time cleanup allowance rather than
+// inferred from a single scan.
+func (r *FileRepository) ListRootsWithCatalogedFiles(ctx context.Context, folderID int, roots []string) ([]string, error) {
+	if len(roots) == 0 {
+		return nil, nil
+	}
+	patterns := make([]string, len(roots))
+	for i, root := range roots {
+		patterns[i] = pathscope.PrefixLike(root)
+	}
+	rows, err := r.pool.Query(ctx, `
+		SELECT r.root
+		FROM unnest($2::text[], $3::text[]) WITH ORDINALITY AS r(root, pattern, ord)
+		WHERE EXISTS (
+			SELECT 1 FROM media_files mf
+			WHERE mf.media_folder_id = $1
+			  AND (mf.file_path = r.root OR mf.file_path LIKE r.pattern ESCAPE '\')
+		)
+		ORDER BY r.ord
+	`, folderID, roots, patterns)
+	if err != nil {
+		return nil, fmt.Errorf("querying roots with cataloged files: %w", err)
+	}
+	defer rows.Close()
+
+	occupied := make([]string, 0)
+	for rows.Next() {
+		var root string
+		if err := rows.Scan(&root); err != nil {
+			return nil, fmt.Errorf("scanning root with cataloged files: %w", err)
+		}
+		occupied = append(occupied, root)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterating roots with cataloged files: %w", err)
+	}
+	return occupied, nil
+}
+
+// ListRootsWithOnlyMissingFiles returns the subset of roots (in input order)
+// that still have media_files rows at or under them in the folder but none
+// that are present (missing_since IS NULL). A reachable root in this state is
+// "suspect empty": it is the on-disk signature of a mount that dropped out
+// while leaving an empty, stat-able mountpoint directory, which a
+// reachability probe cannot distinguish from an intentionally emptied root.
+func (r *FileRepository) ListRootsWithOnlyMissingFiles(ctx context.Context, folderID int, roots []string) ([]string, error) {
+	if len(roots) == 0 {
+		return nil, nil
+	}
+	patterns := make([]string, len(roots))
+	for i, root := range roots {
+		patterns[i] = pathscope.PrefixLike(root)
+	}
+	rows, err := r.pool.Query(ctx, `
+		SELECT r.root
+		FROM unnest($2::text[], $3::text[]) WITH ORDINALITY AS r(root, pattern, ord)
+		WHERE EXISTS (
+			SELECT 1 FROM media_files mf
+			WHERE mf.media_folder_id = $1
+			  AND (mf.file_path = r.root OR mf.file_path LIKE r.pattern ESCAPE '\')
+		)
+		AND NOT EXISTS (
+			SELECT 1 FROM media_files mf
+			WHERE mf.media_folder_id = $1
+			  AND (mf.file_path = r.root OR mf.file_path LIKE r.pattern ESCAPE '\')
+			  AND mf.missing_since IS NULL
+		)
+		ORDER BY r.ord
+	`, folderID, roots, patterns)
+	if err != nil {
+		return nil, fmt.Errorf("querying roots with only missing files: %w", err)
+	}
+	defer rows.Close()
+
+	suspect := make([]string, 0)
+	for rows.Next() {
+		var root string
+		if err := rows.Scan(&root); err != nil {
+			return nil, fmt.Errorf("scanning suspect-empty root: %w", err)
+		}
+		suspect = append(suspect, root)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterating suspect-empty roots: %w", err)
+	}
+	return suspect, nil
 }
 
 // DeleteByIDs removes specific media file rows by primary key.
@@ -2671,13 +2825,8 @@ func (r *FileRepository) ListIDsOutsideRoots(ctx context.Context, folderID int, 
 
 	args := make([]any, 0, 1+len(roots)*2)
 	args = append(args, folderID)
-	coveredClauses := make([]string, 0, len(roots))
-	for i, root := range roots {
-		pathArg := 2 + (i * 2)
-		likeArg := pathArg + 1
-		coveredClauses = append(coveredClauses, fmt.Sprintf("(file_path = $%d OR file_path LIKE $%d ESCAPE '\\')", pathArg, likeArg))
-		args = append(args, root, pathPrefixLike(root))
-	}
+	coveredClauses, coveredArgs := rootCoverageClauses(roots, 2)
+	args = append(args, coveredArgs...)
 
 	query := `SELECT id FROM media_files WHERE media_folder_id = $1 AND NOT (` + strings.Join(coveredClauses, " OR ") + `)`
 	rows, err := r.pool.Query(ctx, query, args...)
@@ -2775,6 +2924,44 @@ func (r *FileRepository) GetByContentID(ctx context.Context, contentID string) (
 	defer rows.Close()
 
 	return scanMediaFiles(rows)
+}
+
+// FirstDurationsByContentIDs returns the probed duration (seconds) of the
+// first live file backing each content id, using the same "first file with
+// duration > 0, ordered by id" rule as the v1 API's contentDurationSeconds.
+// Ids with no live probed file are absent from the map. Resolution is
+// intentionally not access-scoped; callers have already filtered the items.
+func (r *FileRepository) FirstDurationsByContentIDs(ctx context.Context, contentIDs []string) (map[string]int, error) {
+	result := make(map[string]int)
+	if len(contentIDs) == 0 {
+		return result, nil
+	}
+
+	rows, err := r.pool.Query(ctx, `
+		SELECT DISTINCT ON (content_id) content_id, duration
+		FROM media_files
+		WHERE content_id = ANY($1)
+		  AND episode_id IS NULL
+		  AND missing_since IS NULL
+		  AND duration > 0
+		ORDER BY content_id, id ASC`, contentIDs)
+	if err != nil {
+		return nil, fmt.Errorf("querying first durations by content ids: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var contentID string
+		var duration int
+		if err := rows.Scan(&contentID, &duration); err != nil {
+			return nil, fmt.Errorf("scanning first duration by content id: %w", err)
+		}
+		result[contentID] = duration
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterating first durations by content ids: %w", err)
+	}
+	return result, nil
 }
 
 // GetByExtraID returns the live files backing a local extra
@@ -3390,6 +3577,43 @@ func (r *FileRepository) GetByEpisodeID(ctx context.Context, episodeID string) (
 	return scanMediaFiles(rows)
 }
 
+// FirstDurationsByEpisodeIDs returns the probed duration (seconds) of the
+// first live file backing each episode id, using the same "first file with
+// duration > 0, ordered by id" rule as the v1 API's contentDurationSeconds.
+// Ids with no live probed file are absent from the map. Resolution is
+// intentionally not access-scoped; callers have already filtered the items.
+func (r *FileRepository) FirstDurationsByEpisodeIDs(ctx context.Context, episodeIDs []string) (map[string]int, error) {
+	result := make(map[string]int)
+	if len(episodeIDs) == 0 {
+		return result, nil
+	}
+
+	rows, err := r.pool.Query(ctx, `
+		SELECT DISTINCT ON (episode_id) episode_id, duration
+		FROM media_files
+		WHERE episode_id = ANY($1)
+		  AND missing_since IS NULL
+		  AND duration > 0
+		ORDER BY episode_id, id ASC`, episodeIDs)
+	if err != nil {
+		return nil, fmt.Errorf("querying first durations by episode ids: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var episodeID string
+		var duration int
+		if err := rows.Scan(&episodeID, &duration); err != nil {
+			return nil, fmt.Errorf("scanning first duration by episode id: %w", err)
+		}
+		result[episodeID] = duration
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterating first durations by episode ids: %w", err)
+	}
+	return result, nil
+}
+
 // ListMissingChapterThumbnails returns present media files in enabled,
 // opted-in libraries that either have no chapter probe data yet or still have
 // chapters missing thumbnail assets.
@@ -3448,4 +3672,10 @@ func nilIfZero(n int) *int {
 
 func pathPrefixLike(pathPrefix string) string {
 	return pathscope.PrefixLike(pathPrefix)
+}
+
+// rootCoverageClauses builds one SQL predicate per root matching file_path
+// rows that live at or under that root; see pathscope.CoverageClauses.
+func rootCoverageClauses(roots []string, firstArg int) ([]string, []any) {
+	return pathscope.CoverageClauses("file_path", roots, firstArg)
 }

@@ -143,6 +143,7 @@ type VideoTrackRecord struct {
 	Codec           string `json:"codec,omitempty"`
 	DolbyVision     string `json:"dolby_vision,omitempty"`
 	DVProfile       int    `json:"dv_profile,omitempty"`
+	DVLevel         int    `json:"dv_level,omitempty"`
 	DVBLCompatID    int    `json:"dv_bl_compat_id,omitempty"`
 	DVELPresent     bool   `json:"dv_el_present,omitempty"`
 	HDR10Plus       bool   `json:"hdr10_plus,omitempty"`
@@ -156,6 +157,7 @@ type VideoTrackRecord struct {
 	Bitrate         int    `json:"bitrate,omitempty"`
 	VideoRange      string `json:"video_range,omitempty"`
 	VideoRangeType  string `json:"video_range_type,omitempty"`
+	ColorRange      string `json:"color_range,omitempty"`
 	ColorPrimaries  string `json:"color_primaries,omitempty"`
 	ColorSpace      string `json:"color_space,omitempty"`
 	ColorTransfer   string `json:"color_transfer,omitempty"`

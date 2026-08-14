@@ -111,15 +111,17 @@ func NewRouter(deps Dependencies) chi.Router {
 	// Compat transcode reconstruct is driven by the recipe carried in the durable
 	// compat playback store (jellycompat_playback_sessions); no separate native
 	// recipe table is needed.
-	if cleaned, err := playbackHandler.CleanupOrphanedTranscodes(); err != nil {
-		slog.Warn("jellycompat transcode cleanup failed", "dir", playbackHandler.TranscodeDir, "error", err)
-	} else if cleaned > 0 {
-		slog.Info("jellycompat transcode cleanup removed orphaned dirs", "dir", playbackHandler.TranscodeDir, "count", cleaned)
-	}
+	//
+	// This shares TranscodeDir with the native api sweep but snapshots only this
+	// manager's live set; see the api NewRouter call site for why cross-manager
+	// reaping of a >24h idle dir is bounded and safe.
+	playback.StartPeriodicOrphanCleanup(deps.AppContext, "jellycompat", playbackHandler.TranscodeDir, playbackHandler.CleanupOrphanedTranscodes, playback.OrphanCleanupInterval)
 	playbackHandler.profileRefreshRequester = deps.RecWorker
 	playbackHandler.SettingsRepo = deps.SettingsRepo
 	playbackHandler.RecipeNodeStore = deps.RecipeNodeStore
 	playbackHandler.SessionSyncer = deps.SessionSyncer
+	playbackHandler.WatchScrobbler = deps.WatchScrobbler
+	playbackHandler.StableIdentityResolver = deps.StableIdentityResolver
 	if subtitleRepo != nil {
 		playbackHandler.SubtitleRepo = subtitleRepo
 		playbackHandler.S3Client = deps.S3Client
@@ -129,7 +131,7 @@ func NewRouter(deps Dependencies) chi.Router {
 	imagesHandler.collections = itemsHandler.collections
 	imagesHandler.frontendFS = deps.FrontendFS
 	displayPrefsHandler := NewDisplayPreferencesHandler(deps.UserStoreProvider)
-	recsHandler := NewRecommendationsHandler(deps.Recommender, deps.ItemRepo, deps.ContentService, deps.UserDataService, deps.IDCodec, deps.Config, deps.AccessFilterFn)
+	recsHandler := NewRecommendationsHandler(deps.Recommender, deps.ItemRepo, deps.DetailSvc, deps.ContentService, deps.UserDataService, deps.IDCodec, deps.Config, deps.AccessFilterFn)
 
 	r.Get("/System/Info/Public", systemHandler.HandlePublicInfo)
 	r.Get("/System/Info", systemHandler.HandleInfo)

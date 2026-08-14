@@ -3,6 +3,7 @@ package userdb
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"strconv"
 	"time"
@@ -172,7 +173,7 @@ func (s *SQLiteUserStore) AddFavorite(_ context.Context, profileID, mediaItemID 
 	return AddFavorite(s.db, profileID, mediaItemID)
 }
 
-func (s *SQLiteUserStore) AddFavoriteAt(_ context.Context, profileID, mediaItemID string, addedAt time.Time) error {
+func (s *SQLiteUserStore) AddFavoriteAt(_ context.Context, profileID, mediaItemID string, addedAt time.Time) (bool, error) {
 	return AddFavoriteAt(s.db, profileID, mediaItemID, addedAt)
 }
 
@@ -345,6 +346,14 @@ func (s *SQLiteUserStore) ListDevices(_ context.Context) ([]userstore.DeviceEntr
 	return ListDevices(s.db)
 }
 
+func (s *SQLiteUserStore) DeviceExists(_ context.Context, profileID, deviceID string) (bool, error) {
+	return DeviceExists(s.db, profileID, deviceID)
+}
+
+func (s *SQLiteUserStore) ForgetDevice(_ context.Context, profileID, deviceID string) error {
+	return ForgetDevice(s.db, profileID, deviceID)
+}
+
 func (s *SQLiteUserStore) SetDeviceSetting(_ context.Context, entry userstore.DeviceSettingEntry) error {
 	return SetDeviceSetting(s.db, entry)
 }
@@ -367,6 +376,14 @@ func (s *SQLiteUserStore) ListDeviceSettings(_ context.Context, key string) ([]u
 
 func (s *SQLiteUserStore) ListAllDeviceSettings(_ context.Context) ([]userstore.DeviceSettingEntry, error) {
 	return ListAllDeviceSettings(s.db)
+}
+
+func (s *SQLiteUserStore) GetJellycompatDisplayPrefs(_ context.Context, prefsID, client string) (string, error) {
+	return GetJellycompatDisplayPrefs(s.db, prefsID, client)
+}
+
+func (s *SQLiteUserStore) SetJellycompatDisplayPrefs(_ context.Context, prefsID, client, value string) error {
+	return SetJellycompatDisplayPrefs(s.db, prefsID, client, value)
 }
 
 func (s *SQLiteUserStore) SetSubtitlePreference(_ context.Context, pref userstore.SubtitlePreference) error {
@@ -405,6 +422,18 @@ func (s *SQLiteUserStore) DeleteSeriesPlaybackPreference(_ context.Context, prof
 	return DeleteSeriesPlaybackPreference(s.db, profileID, seriesID)
 }
 
+func (s *SQLiteUserStore) SetCollectionSortPreference(_ context.Context, pref userstore.CollectionSortPreference) error {
+	return SetCollectionSortPreference(s.db, pref)
+}
+
+func (s *SQLiteUserStore) GetCollectionSortPreference(_ context.Context, profileID, collectionKind, collectionID string) (*userstore.CollectionSortPreference, error) {
+	return GetCollectionSortPreference(s.db, profileID, collectionKind, collectionID)
+}
+
+func (s *SQLiteUserStore) ClearCollectionSortPreference(_ context.Context, profileID, collectionKind, collectionID string) error {
+	return ClearCollectionSortPreference(s.db, profileID, collectionKind, collectionID)
+}
+
 func (s *SQLiteUserStore) GetLibraryPlaybackPreference(_ context.Context, profileID string, libraryID int) (*userstore.LibraryPlaybackPreference, error) {
 	return GetLibraryPlaybackPreference(s.db, profileID, libraryID)
 }
@@ -419,4 +448,68 @@ func (s *SQLiteUserStore) UpsertLibraryPlaybackPreference(_ context.Context, pre
 
 func (s *SQLiteUserStore) DeleteLibraryPlaybackPreference(_ context.Context, profileID string, libraryID int) error {
 	return DeleteLibraryPlaybackPreference(s.db, profileID, libraryID)
+}
+
+// --- Onboarding ---
+
+func (s *SQLiteUserStore) GetOnboardingState(_ context.Context, profileID, tourID string) (*userstore.OnboardingState, error) {
+	return GetOnboardingState(s.db, profileID, tourID)
+}
+
+func (s *SQLiteUserStore) UpsertOnboardingState(_ context.Context, state userstore.OnboardingState) error {
+	return UpsertOnboardingState(s.db, state)
+}
+
+// --- Canonical typed setting values ---
+
+func (s *SQLiteUserStore) GetSettingValue(_ context.Context, id userstore.SettingIdentity) (*userstore.SettingValue, error) {
+	return GetSettingValue(s.db, id)
+}
+
+func (s *SQLiteUserStore) ListSettingValuesForResolution(_ context.Context, query userstore.SettingResolutionQuery) ([]userstore.SettingValue, error) {
+	return ListSettingValuesForResolution(s.db, query)
+}
+
+func (s *SQLiteUserStore) ListAllSettingValues(_ context.Context) ([]userstore.SettingValue, error) {
+	return ListAllSettingValues(s.db)
+}
+
+func (s *SQLiteUserStore) UpsertSettingValue(_ context.Context, id userstore.SettingIdentity, value json.RawMessage) (*userstore.SettingValue, error) {
+	return UpsertSettingValue(s.db, id, value)
+}
+
+func (s *SQLiteUserStore) CompareAndSetSettingValue(ctx context.Context, id userstore.SettingIdentity, value json.RawMessage, expectedRevision int64) (*userstore.SettingValue, error) {
+	return CompareAndSetSettingValue(ctx, s.db, id, value, expectedRevision)
+}
+
+func (s *SQLiteUserStore) DeleteSettingValue(_ context.Context, id userstore.SettingIdentity) (bool, error) {
+	return DeleteSettingValue(s.db, id)
+}
+
+func (s *SQLiteUserStore) DeleteSettingValuesForProfile(_ context.Context, profileID string) (int64, error) {
+	return DeleteSettingValuesForProfile(s.db, profileID)
+}
+
+func (s *SQLiteUserStore) DeleteSettingValuesForDevice(_ context.Context, profileID, deviceID string) (int64, error) {
+	return DeleteSettingValuesForDevice(s.db, profileID, deviceID)
+}
+
+func (s *SQLiteUserStore) DeleteSettingValuesForLibrary(_ context.Context, libraryID int) (int64, error) {
+	return DeleteSettingValuesForLibrary(s.db, libraryID)
+}
+
+func (s *SQLiteUserStore) DeleteSettingValuesForSeries(_ context.Context, seriesID string) (int64, error) {
+	return DeleteSettingValuesForSeries(s.db, seriesID)
+}
+
+func (s *SQLiteUserStore) GetSettingMutation(_ context.Context, mutationID string) (*userstore.SettingMutationRecord, error) {
+	return GetSettingMutation(s.db, mutationID)
+}
+
+func (s *SQLiteUserStore) PutSettingMutation(_ context.Context, record userstore.SettingMutationRecord) (userstore.SettingMutationRecord, bool, error) {
+	return PutSettingMutation(s.db, record)
+}
+
+func (s *SQLiteUserStore) DeleteExpiredSettingMutations(_ context.Context, before time.Time) (int64, error) {
+	return DeleteExpiredSettingMutations(s.db, before)
 }

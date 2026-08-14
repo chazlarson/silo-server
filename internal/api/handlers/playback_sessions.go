@@ -48,7 +48,10 @@ type playbackSessionRow struct {
 	ClientIP                 string    `json:"client_ip,omitempty"`
 	ClientName               string    `json:"client_name,omitempty"`
 	ClientVersion            string    `json:"client_version,omitempty"`
+	ClientBuild              string    `json:"client_build,omitempty"`
+	ClientChannel            string    `json:"client_channel,omitempty"`
 	ClientLabel              string    `json:"client_label,omitempty"`
+	ClientLabelFull          string    `json:"client_label_full,omitempty"`
 	ClientUserAgent          string    `json:"client_user_agent,omitempty"`
 	AudioTrackIndex          int       `json:"audio_track_index"`
 	TranscodeAudio           bool      `json:"transcode_audio"`
@@ -72,6 +75,40 @@ type playbackSessionRow struct {
 	RequestedVideoResolution string    `json:"requested_video_resolution,omitempty"`
 	VideoDecision            string    `json:"video_decision,omitempty"`
 	AudioDecision            string    `json:"audio_decision,omitempty"`
+	EffectivePlayMethod      string    `json:"effective_play_method,omitempty"`
+	IsJellyfinClient         bool      `json:"is_jellyfin_client,omitempty"`
+	CompatOrigin             bool      `json:"-"`
+}
+
+// playbackSessionsCapabilitiesResponse advertises the additive fields of the
+// live admin session payload so independently deployed clients (Android,
+// Apple) can feature-detect them. Both fields are omitempty on the wire, so
+// absence on a row is otherwise indistinguishable from an older server.
+type playbackSessionsCapabilitiesResponse struct {
+	// EffectivePlayMethod reports that rows carry effective_play_method.
+	EffectivePlayMethod bool `json:"effective_play_method"`
+	// EffectivePlayMethodValues is the closed bucket vocabulary a supported
+	// server emits (absent field = unknown).
+	EffectivePlayMethodValues []string `json:"effective_play_method_values"`
+	// IsJellyfinClient reports that rows carry is_jellyfin_client.
+	IsJellyfinClient bool `json:"is_jellyfin_client"`
+	// ClientBuild reports that rows carry client_build (and the exact-version
+	// client_label_full derived from it).
+	ClientBuild bool `json:"client_build"`
+	// ClientChannel reports that rows carry client_channel.
+	ClientChannel bool `json:"client_channel"`
+}
+
+// HandleGetSessionsCapabilities exposes additive feature support for the live
+// admin session payload (GET /admin/sessions/capabilities).
+func (h *AdminHandler) HandleGetSessionsCapabilities(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, playbackSessionsCapabilitiesResponse{
+		EffectivePlayMethod:       true,
+		EffectivePlayMethodValues: []string{"direct", "remux", "transcode", "audio"},
+		IsJellyfinClient:          true,
+		ClientBuild:               true,
+		ClientChannel:             true,
+	})
 }
 
 // PlaybackSessionsQuery scopes live session listing.
@@ -155,6 +192,8 @@ func (l *PlaybackSessionsLoader) Load(
 			COALESCE(HOST(s.client_ip), ''),
 			COALESCE(s.client_name, ''),
 			COALESCE(s.client_version, ''),
+			COALESCE(s.client_build, ''),
+			COALESCE(s.client_channel, ''),
 			COALESCE(s.client_user_agent, ''),
 			COALESCE(s.audio_track_index, 0),
 			COALESCE(s.transcode_audio, FALSE),
@@ -173,7 +212,8 @@ func (l *PlaybackSessionsLoader) Load(
 			mf.audio_channels,
 			COALESCE(mf.audio_tracks::text, '[]'),
 			COALESCE(requested_mf.codec_video, ''),
-			COALESCE(requested_mf.resolution, '')
+			COALESCE(requested_mf.resolution, ''),
+			COALESCE(s.compat_origin, FALSE)
 		 FROM playback_sessions_sync s
 		 LEFT JOIN users u ON u.id = s.user_id
 		 LEFT JOIN media_files mf ON mf.id = s.media_file_id
@@ -211,10 +251,12 @@ func (l *PlaybackSessionsLoader) Load(
 			&posterPath,
 			&s.PlayMethod, &s.ReportingNode, &s.NodeDisplayName, &s.FileDuration, &s.StartedAt, &s.UpdatedAt,
 			&s.PositionSeconds, &s.IsPaused, &s.HasPlaybackControl, &s.ClientIP, &s.ClientName, &s.ClientVersion,
+			&s.ClientBuild, &s.ClientChannel,
 			&s.ClientUserAgent, &s.AudioTrackIndex, &s.TranscodeAudio, &streamBitrateKbps,
 			&s.TranscodeNodeURL, &s.TargetResolution, &s.TargetVideoCodec, &s.TargetAudioCodec, &targetBitrateKbps,
 			&s.TranscodeHWAccel, &s.SourceContainer, &sourceBitrateKbps, &s.SourceVideoCodec, &s.SourceVideoResolution,
 			&s.SourceAudioCodec, &sourceAudioChannels, &audioTracksJSON, &s.RequestedVideoCodec, &s.RequestedVideoResolution,
+			&s.CompatOrigin,
 		); err != nil {
 			return nil, fmt.Errorf("scanning playback session: %w", err)
 		}
@@ -224,6 +266,13 @@ func (l *PlaybackSessionsLoader) Load(
 		s.SourceBitrateKbps = sourceBitrateKbps
 		s.SourceAudioChannels = sourceAudioChannels
 		s.ClientLabel = playbackClientDisplayName(s.ClientName, s.ClientVersion, s.ClientUserAgent)
+		// Only worth the bytes when it says more than the compact label — which
+		// it does not for any client without a build or a non-release channel,
+		// i.e. most of a 200-row page. Clients read client_label when
+		// client_label_full is absent, so omitting the duplicate costs nothing.
+		if full := playbackClientFullDisplayName(s.ClientName, s.ClientVersion, s.ClientBuild, s.ClientChannel, s.ClientUserAgent); full != s.ClientLabel {
+			s.ClientLabelFull = full
+		}
 		enrichPlaybackSessionRow(&s, audioTracksJSON)
 		sessions = append(sessions, s)
 	}
@@ -248,6 +297,8 @@ func enrichPlaybackSessionRow(row *playbackSessionRow, audioTracksJSON []byte) {
 	}
 
 	row.VideoDecision, row.AudioDecision = sessionComponentDecision(row.PlayMethod, row.TranscodeAudio, row.TargetVideoCodec)
+	row.EffectivePlayMethod = effectivePlayMethod(row.VideoDecision, row.AudioDecision)
+	row.IsJellyfinClient = row.CompatOrigin || isJellyfinEcosystemClient(row.ClientName, row.ClientUserAgent)
 
 	var audioTracks []models.AudioTrack
 	if len(audioTracksJSON) > 0 {
@@ -335,6 +386,78 @@ func sessionComponentDecision(playMethod string, transcodeAudio bool, targetVide
 	}
 }
 
+// effectivePlayMethod reduces the per-stream decisions to the single bucket
+// the admin activity views aggregate on. Raw play_method is misleading there:
+// an HLS repackage reports play_method "transcode" with a copied video stream,
+// and an audio-only re-encode reports "remux" — the decisions carry what
+// actually costs CPU.
+//   - video re-encoded        -> "transcode"
+//   - only audio re-encoded   -> "audio"
+//   - streams only repackaged -> "remux"
+//   - nothing touched         -> "direct"
+//
+// Returns "" when the decisions are unknown (empty or unrecognized
+// play_method, e.g. a stale row from an older node), so consumers can
+// distinguish "unknown" from a definite bucket instead of inventing one.
+func effectivePlayMethod(videoDecision, audioDecision string) string {
+	switch {
+	case videoDecision == "" && audioDecision == "":
+		return ""
+	case videoDecision == "transcode":
+		return "transcode"
+	case audioDecision == "transcode":
+		return "audio"
+	case videoDecision == "direct" && audioDecision == "direct":
+		return "direct"
+	default:
+		return "remux"
+	}
+}
+
+// jellyfinClientTokens identifies Jellyfin-ecosystem clients — sessions served
+// through the Jellyfin compatibility surface — by client name (parsed from the
+// MediaBrowser auth header) or user agent. This is the single source of truth
+// behind is_jellyfin_client, which the admin UIs surface as the "JF" pill;
+// keep it in step with the display-labeling rules in
+// playbackClientDisplayName so a client that gets a label also gets the flag.
+// Kodi and mpv reach Silo only through the Jellyfin compat surface today
+// (jellyfin-kodi/JellyCon, jellyfin-mpv-shim). Generic browser tokens are
+// deliberately excluded: the native web player shares those user agents.
+var jellyfinClientTokens = []string{
+	"jellyfin",
+	"findroid",
+	"streamyfin",
+	"swiftfin",
+	"jellycon",
+	"wholphin",
+	"fladder",
+	"vidhub",
+	"senplayer",
+	"infuse",
+	"delfin",
+	"finamp",
+	"kodi",
+	"mpv",
+}
+
+// isJellyfinEcosystemClient reports whether the session's client metadata
+// matches a known Jellyfin-ecosystem client. This heuristic remains a fallback
+// for rows created before compat-origin identity was persisted.
+func isJellyfinEcosystemClient(clientName, userAgent string) bool {
+	for _, value := range []string{clientName, userAgent} {
+		value = strings.ToLower(strings.TrimSpace(value))
+		if value == "" {
+			continue
+		}
+		for _, token := range jellyfinClientTokens {
+			if strings.Contains(value, token) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func firstNonEmptyValue(values ...string) string {
 	for _, value := range values {
 		if trimmed := strings.TrimSpace(value); trimmed != "" {
@@ -344,11 +467,47 @@ func firstNonEmptyValue(values ...string) string {
 	return ""
 }
 
+// playbackClientFullDisplayName renders the client's exact identity — version,
+// opaque build, and non-default channel — for surfaces that can afford the
+// width (expanded session details, tooltips). The name-and-version half is
+// whatever the compact label resolved, so a client identified only by its user
+// agent still gets its build named: a client that bothered to report a build
+// has earned having it displayed, whether or not it also named itself.
+func playbackClientFullDisplayName(name, version, build, channel, userAgent string) string {
+	label := playbackClientDisplayName(name, version, userAgent)
+	if label == "" {
+		return ""
+	}
+
+	build = strings.TrimSpace(build)
+	channel = strings.TrimSpace(channel)
+	// "release" is the assumed channel, so naming it adds width without adding
+	// information; every other channel is worth calling out.
+	if strings.EqualFold(channel, "release") {
+		channel = ""
+	}
+	var qualifiers []string
+	if build != "" {
+		qualifiers = append(qualifiers, "build "+build)
+	}
+	if channel != "" {
+		qualifiers = append(qualifiers, channel)
+	}
+	if len(qualifiers) > 0 {
+		label += " (" + strings.Join(qualifiers, ", ") + ")"
+	}
+	return label
+}
+
+// playbackClientDisplayName renders the compact label the session lists show.
+// A client that reports its own name keeps its version verbatim — truncating
+// "1.0.0" to "1" hid the only field that identifies the running build. Labels
+// derived from a user agent stay shortened, where a full browser version
+// ("120.0.6099.109") is noise.
 func playbackClientDisplayName(name, version, userAgent string) string {
 	name = strings.TrimSpace(name)
-	version = shortPlaybackClientVersion(version)
 	if name != "" {
-		if version != "" {
+		if version = strings.TrimSpace(version); version != "" {
 			return name + " " + version
 		}
 		return name
@@ -407,8 +566,71 @@ func playbackClientDisplayName(name, version, userAgent string) string {
 	case strings.Contains(lower, "python-requests"):
 		return "Python requests"
 	default:
+		if label := androidDeviceLabel(userAgent); label != "" {
+			return label
+		}
 		return firstUserAgentProduct(userAgent)
 	}
+}
+
+// knownAndroidDeviceLabels maps Android / Fire OS build model codes to friendly
+// product names for the admin session view. Keys are uppercased so the lookup is
+// case-insensitive. This only affects the displayed label — the session still
+// stores the raw model code in its user agent.
+var knownAndroidDeviceLabels = map[string]string{
+	"AFTKRT":            "Fire TV Stick 4K Max",
+	"AFTMM":             "Fire TV Stick 4K",
+	"AFTKM":             "Fire TV Stick 4K (2nd Gen)",
+	"AFTKA":             "Fire TV Stick 4K Max (1st Gen)",
+	"AFTSSS":            "Fire TV Stick (3rd Gen)",
+	"AFTSS":             "Fire TV Stick Lite (1st Gen)",
+	"AFTT":              "Fire TV Stick (2nd Gen)",
+	"AFTB":              "Fire TV (1st Gen)",
+	"AFTS":              "Fire TV (2nd Gen)",
+	"AFTN":              "Fire TV (3rd Gen)",
+	"AFTR":              "Fire TV Cube (2nd Gen)",
+	"AFTA":              "Fire TV Cube (1st Gen)",
+	"SHIELD ANDROID TV": "NVIDIA Shield",
+}
+
+// androidDeviceLabel derives a friendly device label from a bare Android / Fire OS
+// user agent of the form "... (Linux; U; Android <ver>; <MODEL> Build/<build>)".
+// The model is the whole segment between the last ';' and 'Build/', so multi-word
+// models ("Pixel 7", "SHIELD Android TV") survive intact. Known model codes map to
+// a product name; anything else falls back to "Android · <MODEL>" rather than the
+// uninformative "Dalvik". Returns "" when no model can be parsed.
+func androidDeviceLabel(userAgent string) string {
+	buildIndex := strings.Index(userAgent, "Build/")
+	if buildIndex < 0 {
+		return ""
+	}
+
+	prefix := userAgent[:buildIndex]
+	separator := strings.LastIndex(prefix, ";")
+	if separator < 0 {
+		return ""
+	}
+	hasAndroidPlatform := false
+	for _, segment := range strings.Split(prefix[:separator], ";") {
+		segment = strings.TrimSpace(strings.Trim(segment, "()"))
+		if strings.HasPrefix(strings.ToLower(segment), "android ") {
+			hasAndroidPlatform = true
+			break
+		}
+	}
+	if !hasAndroidPlatform {
+		return ""
+	}
+
+	model := prefix[separator+1:]
+	model = strings.TrimSpace(strings.Trim(strings.TrimSpace(model), "();"))
+	if model == "" {
+		return ""
+	}
+	if label, ok := knownAndroidDeviceLabels[strings.ToUpper(model)]; ok {
+		return label
+	}
+	return "Android · " + model
 }
 
 func containsAny(value string, needles []string) bool {

@@ -185,6 +185,43 @@ func (m *TranscodeManager) RegisterTranscodeSession(sessionID string, ts *Transc
 	m.transcodeMu.Unlock()
 }
 
+// SwapTranscodeSession atomically publishes a prepared successor and returns
+// the predecessor without closing it. Protocol-v3 replans use plan-scoped
+// output directories, so the caller can commit state first, publish the new
+// process, and only then reap the old process without either process writing to
+// the other's directory.
+func (m *TranscodeManager) SwapTranscodeSession(sessionID string, successor *TranscodeSession) *TranscodeSession {
+	m.transcodeMu.Lock()
+	predecessor := m.transcodes[sessionID]
+	m.transcodes[sessionID] = successor
+	m.transcodeMu.Unlock()
+	return predecessor
+}
+
+// SwapTranscodeSessionIf publishes successor only while the live map still
+// contains expected. Callers use it after staging a process in a distinct
+// output directory so a stale replacement cannot overwrite a newer process.
+func (m *TranscodeManager) SwapTranscodeSessionIf(
+	sessionID string,
+	expected *TranscodeSession,
+	successor *TranscodeSession,
+) bool {
+	m.transcodeMu.Lock()
+	defer m.transcodeMu.Unlock()
+	if m.transcodes[sessionID] != expected {
+		return false
+	}
+	m.transcodes[sessionID] = successor
+	return true
+}
+
+// StopRemoteTranscode removes only the remote node process. It deliberately
+// leaves the local live-map entry untouched for an atomic remote-to-local v3
+// replacement.
+func (m *TranscodeManager) StopRemoteTranscode(sessionID, transcodeNodeURL string) {
+	m.deleteRemoteTranscode(sessionID, transcodeNodeURL)
+}
+
 // LockSessionLifecycle acquires the per-session lifecycle mutex and returns a
 // release func. Every path that spawns ffmpeg into a session's output directory
 // (fresh start, restart, reconstruct) must hold it across "check existing → spawn
@@ -226,12 +263,33 @@ func (m *TranscodeManager) LockSessionLifecycle(sessionID string) func() {
 // replaced it, the stale handle is not re-spawned and ErrSessionSuperseded is
 // returned.
 func (m *TranscodeManager) RestartSessionLocked(ctx context.Context, sessionID string, ts *TranscodeSession, seekSeconds float64, startSegment int) error {
+	return m.restartSessionLocked(sessionID, ts, func() error {
+		return ts.Restart(ctx, seekSeconds, startSegment)
+	})
+}
+
+func (m *TranscodeManager) restartSessionLocked(sessionID string, ts *TranscodeSession, restart func() error) error {
 	unlock := m.LockSessionLifecycle(sessionID)
 	defer unlock()
 	if live := m.GetTranscodeSession(sessionID); live != ts {
 		return ErrSessionSuperseded
 	}
-	return ts.Restart(ctx, seekSeconds, startSegment)
+	return restart()
+}
+
+// RestartSessionLockedWithCopySeekAnchor is RestartSessionLocked with the
+// resolved keyframe origin for a legacy copy-video seek restart.
+func (m *TranscodeManager) RestartSessionLockedWithCopySeekAnchor(
+	ctx context.Context,
+	sessionID string,
+	ts *TranscodeSession,
+	seekSeconds float64,
+	startSegment int,
+	streamOriginSeconds float64,
+) error {
+	return m.restartSessionLocked(sessionID, ts, func() error {
+		return ts.RestartWithCopySeekAnchor(ctx, seekSeconds, startSegment, streamOriginSeconds)
+	})
 }
 
 // markReconstructing records that sessionID's ffmpeg is mid-reconstruct and
@@ -348,20 +406,30 @@ func (m *TranscodeManager) ReconstructSession(ctx context.Context, sessionID str
 	}
 
 	s := &Session{
-		ID:                card.SessionID,
-		UserID:            card.UserID,
-		ProfileID:         card.ProfileID,
-		MediaFileID:       card.MediaFileID,
-		PlayMethod:        method,
-		BasePlayMethod:    method,
-		TranscodeNodeURL:  card.TranscodeNodeURL,
-		AudioTrackIndex:   card.AudioTrackIndex,
-		TranscodeAudio:    card.TranscodeAudio,
-		TargetResolution:  card.TargetResolution,
-		TargetVideoCodec:  card.TargetCodecVideo,
-		TargetAudioCodec:  card.TargetCodecAudio,
-		TargetBitrateKbps: card.TargetBitrateKbps,
-		TranscodeHWAccel:  card.HWAccel,
+		ID:                     card.SessionID,
+		UserID:                 card.UserID,
+		ProfileID:              card.ProfileID,
+		MediaFileID:            card.MediaFileID,
+		PlayMethod:             method,
+		BasePlayMethod:         method,
+		TranscodeNodeURL:       card.TranscodeNodeURL,
+		TranscodeTransportID:   card.TranscodeTransportID,
+		AudioTrackIndex:        card.AudioTrackIndex,
+		TranscodeAudio:         card.TranscodeAudio,
+		RemuxDVMode:            card.RemuxDVMode,
+		TargetResolution:       card.TargetResolution,
+		TargetVideoCodec:       card.TargetCodecVideo,
+		TargetAudioCodec:       card.TargetCodecAudio,
+		TargetAudioChannels:    card.TargetAudioChannels,
+		TargetAudioBitrateKbps: card.TargetAudioBitrateKbps,
+		TargetBitrateKbps:      card.TargetBitrateKbps,
+		TranscodeHWAccel:       card.HWAccel,
+		// Client metadata survives the restart so the admin views keep the
+		// client label and Jellyfin identification for the session's lifetime.
+		ClientName:       normalizeClientMetadataValue(card.ClientName, 128),
+		ClientVersion:    normalizeClientMetadataValue(card.ClientVersion, 64),
+		ClientUserAgent:  normalizeClientMetadataValue(card.ClientUserAgent, 512),
+		IsJellyfinCompat: card.IsJellyfinCompat,
 		// Preserve the byte-affecting recipe so an audio switch after a restart
 		// rebuilds the same stream (subtitles/cadence) instead of dropping them.
 		SubtitleTrackIndex: card.SubtitleTrackIndex,
@@ -505,7 +573,7 @@ func (m *TranscodeManager) doReconstructTranscode(ctx context.Context, sessionID
 	defer release()
 
 	cfg := m.runtimeConfig()
-	outputDir := filepath.Join(cfg.TranscodeDir, sessionID)
+	outputDir := reconstructionOutputDir(cfg.TranscodeDir, sessionID, card.OutputSubdir)
 	opts := card.TranscodeOpts(outputDir, cfg.FFmpegPath, m.logSink())
 	// Re-resolve environment-specific encode knobs from current config so an
 	// operator config change applies to reconstructed sessions too.
@@ -584,6 +652,17 @@ func (m *TranscodeManager) doReconstructTranscode(ctx context.Context, sessionID
 		"session", sessionID, "playback_session_id", sessionID,
 		"requested_segment", requestedSegment, "start_segment_number", opts.StartSegmentNumber)
 	return transcodeSession
+}
+
+func reconstructionOutputDir(root, sessionID, signedSubdir string) string {
+	outputSubdir := sessionID
+	if candidate := filepath.Clean(signedSubdir); candidate != "." && !filepath.IsAbs(candidate) && candidate != ".." && !strings.HasPrefix(candidate, ".."+string(filepath.Separator)) {
+		first, _, _ := strings.Cut(candidate, string(filepath.Separator))
+		if first == sessionID || strings.HasPrefix(first, sessionID+"-") {
+			outputSubdir = candidate
+		}
+	}
+	return filepath.Join(root, outputSubdir)
 }
 
 // MonitorLocalTranscodeExit watches a local ffmpeg process and, on an error exit,

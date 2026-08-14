@@ -11,7 +11,24 @@ type ScanResult struct {
 	ItemsDeleted       int
 	Errors             int
 	EmptyRootGuarded   bool
-	RootObservations   []RootObservation
+	// MissingSkippedProtected counts files the scan did not find on disk but
+	// left alone because they sit under an unreachable or suspect-empty root.
+	// A non-zero value means the library is partly offline, not partly gone.
+	MissingSkippedProtected int
+	// UnreachableRoots lists configured library roots that failed the
+	// reachability probe at scan start. Files under them are left untouched:
+	// not marked missing, not trashed, and not purged. A root that does not
+	// answer tells us nothing about whether its files still exist, and
+	// marking them missing would hide working titles from every catalog read
+	// until the next successful scan.
+	UnreachableRoots []string
+	// SuspectEmptyRoots lists roots that probed reachable but were literally
+	// empty directories while the library still holds cataloged files under
+	// them — the signature of a lost mount exposing its bare mountpoint
+	// directory. They receive the same exemptions as UnreachableRoots until
+	// the operator confirms cleanup or the files return.
+	SuspectEmptyRoots []string
+	RootObservations  []RootObservation
 }
 
 // FileHints contains the OSHash gathered during scanning.
@@ -38,29 +55,32 @@ type ProbeData struct {
 
 // VideoTrackInfo describes a probed video track.
 type VideoTrackInfo struct {
-	Title           string
-	Codec           string
-	DolbyVision     string
-	DVProfile       int
-	DVBLCompatID    int
-	DVELPresent     bool
-	HDR10Plus       bool
-	Profile         string
-	Level           int
-	Width           int
-	Height          int
-	AspectRatio     string
-	Interlaced      bool
-	FrameRate       string
-	Bitrate         int
-	VideoRange      string
-	VideoRangeType  string
-	ColorPrimaries  string
-	ColorSpace      string
-	ColorTransfer   string
-	BitDepth        int
-	PixelFormat     string
-	ReferenceFrames int
+	Title              string
+	Codec              string
+	DolbyVision        string
+	DVProfile          int
+	DVLevel            int
+	DVBLCompatID       int
+	DVELPresent        bool
+	DVEnhancementLayer string
+	HDR10Plus          bool
+	Profile            string
+	Level              int
+	Width              int
+	Height             int
+	AspectRatio        string
+	Interlaced         bool
+	FrameRate          string
+	Bitrate            int
+	VideoRange         string
+	VideoRangeType     string
+	ColorRange         string
+	ColorPrimaries     string
+	ColorSpace         string
+	ColorTransfer      string
+	BitDepth           int
+	PixelFormat        string
+	ReferenceFrames    int
 }
 
 // AudioTrackInfo describes a probed audio track.

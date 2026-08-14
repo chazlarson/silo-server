@@ -26,6 +26,134 @@ func RunProgressSince(t *testing.T, newStore func(t *testing.T) userstore.UserSt
 	})
 }
 
+// RunCollectionSortPreferences runs the preference timestamp and profile
+// lifecycle conformance checks against a UserStore implementation.
+func RunCollectionSortPreferences(t *testing.T, newStore func(t *testing.T) userstore.UserStore) {
+	t.Run("TimestampAndProfileLifecycle", func(t *testing.T) {
+		testCollectionSortPreferences(t, newStore)
+	})
+}
+
+func testCollectionSortPreferences(t *testing.T, newStore func(t *testing.T) userstore.UserStore) {
+	ctx := context.Background()
+	store := newStore(t)
+	const (
+		profileID       = "sort-pref-profile"
+		viewerProfileID = "sort-pref-viewer"
+		titleSortField  = "title"
+		ascendingOrder  = "asc"
+	)
+
+	if err := store.CreateProfile(ctx, userstore.Profile{ID: profileID, Name: "Sort Pref"}); err != nil {
+		t.Fatalf("CreateProfile: %v", err)
+	}
+	if err := store.CreateProfile(ctx, userstore.Profile{ID: viewerProfileID, Name: "Sort Pref Viewer"}); err != nil {
+		t.Fatalf("CreateProfile(viewer): %v", err)
+	}
+	if err := store.SetCollectionSortPreference(ctx, userstore.CollectionSortPreference{
+		ProfileID:      profileID,
+		CollectionKind: userstore.CollectionKindLibrary,
+		CollectionID:   "collection-1",
+		SortField:      titleSortField,
+		SortOrder:      ascendingOrder,
+	}); err != nil {
+		t.Fatalf("SetCollectionSortPreference: %v", err)
+	}
+	pref, err := store.GetCollectionSortPreference(ctx, profileID, userstore.CollectionKindLibrary, "collection-1")
+	if err != nil || pref == nil {
+		t.Fatalf("GetCollectionSortPreference = %v, err = %v", pref, err)
+	}
+	if _, err := time.Parse(time.RFC3339, pref.UpdatedAt); err != nil {
+		t.Fatalf("UpdatedAt = %q, want RFC3339 timestamp: %v", pref.UpdatedAt, err)
+	}
+
+	for _, invalid := range []userstore.CollectionSortPreference{
+		{
+			ProfileID:      profileID,
+			CollectionKind: "invalid",
+			CollectionID:   "collection-invalid-kind",
+			SortField:      titleSortField,
+			SortOrder:      ascendingOrder,
+		},
+		{
+			ProfileID:      profileID,
+			CollectionKind: userstore.CollectionKindLibrary,
+			CollectionID:   "collection-invalid-order",
+			SortField:      titleSortField,
+			SortOrder:      "sideways",
+		},
+	} {
+		if err := store.SetCollectionSortPreference(ctx, invalid); err == nil {
+			t.Fatalf("SetCollectionSortPreference accepted invalid preference: %+v", invalid)
+		}
+	}
+
+	deletedCollection, err := store.CreateCollection(ctx, userstore.CreateCollectionInput{
+		CreatorProfileID: profileID,
+		Name:             "Deleted sort preference target",
+	})
+	if err != nil {
+		t.Fatalf("CreateCollection(delete target): %v", err)
+	}
+	if err := store.SetCollectionSortPreference(ctx, userstore.CollectionSortPreference{
+		ProfileID:      viewerProfileID,
+		CollectionKind: userstore.CollectionKindUser,
+		CollectionID:   deletedCollection.ID,
+		SortField:      "year",
+		SortOrder:      "desc",
+	}); err != nil {
+		t.Fatalf("SetCollectionSortPreference(delete target): %v", err)
+	}
+	if err := store.DeleteCollection(ctx, deletedCollection.ID); err != nil {
+		t.Fatalf("DeleteCollection: %v", err)
+	}
+	deletedPref, err := store.GetCollectionSortPreference(ctx, viewerProfileID, userstore.CollectionKindUser, deletedCollection.ID)
+	if err != nil {
+		t.Fatalf("GetCollectionSortPreference(deleted collection): %v", err)
+	}
+	if deletedPref != nil {
+		t.Fatalf("preference survived collection deletion: %+v", deletedPref)
+	}
+
+	profileDeletedCollection, err := store.CreateCollection(ctx, userstore.CreateCollectionInput{
+		CreatorProfileID: profileID,
+		Name:             "Profile-deleted sort preference target",
+	})
+	if err != nil {
+		t.Fatalf("CreateCollection(profile delete target): %v", err)
+	}
+	if err := store.SetCollectionSortPreference(ctx, userstore.CollectionSortPreference{
+		ProfileID:      viewerProfileID,
+		CollectionKind: userstore.CollectionKindUser,
+		CollectionID:   profileDeletedCollection.ID,
+		SortField:      titleSortField,
+		SortOrder:      ascendingOrder,
+	}); err != nil {
+		t.Fatalf("SetCollectionSortPreference(profile delete target): %v", err)
+	}
+
+	if err := store.DeleteProfile(ctx, profileID); err != nil {
+		t.Fatalf("DeleteProfile: %v", err)
+	}
+	deletedPref, err = store.GetCollectionSortPreference(ctx, viewerProfileID, userstore.CollectionKindUser, profileDeletedCollection.ID)
+	if err != nil {
+		t.Fatalf("GetCollectionSortPreference(profile-deleted collection): %v", err)
+	}
+	if deletedPref != nil {
+		t.Fatalf("preference survived creator profile deletion: %+v", deletedPref)
+	}
+	if err := store.CreateProfile(ctx, userstore.Profile{ID: profileID, Name: "Recreated"}); err != nil {
+		t.Fatalf("CreateProfile(recreate): %v", err)
+	}
+	pref, err = store.GetCollectionSortPreference(ctx, profileID, userstore.CollectionKindLibrary, "collection-1")
+	if err != nil {
+		t.Fatalf("GetCollectionSortPreference(recreated profile): %v", err)
+	}
+	if pref != nil {
+		t.Fatalf("stale preference survived profile recreation: %+v", pref)
+	}
+}
+
 // RunSuite runs all conformance tests against a UserStore implementation.
 // The newStore function should return a fresh, empty store for each test.
 func RunSuite(t *testing.T, newStore func(t *testing.T) userstore.UserStore) {
@@ -76,6 +204,12 @@ func RunSuite(t *testing.T, newStore func(t *testing.T) userstore.UserStore) {
 	})
 	t.Run("HomeDismissals", func(t *testing.T) {
 		testHomeDismissals(t, newStore)
+	})
+	t.Run("SettingValues", func(t *testing.T) {
+		RunSettingValues(t, newStore)
+	})
+	t.Run("JellycompatDisplayPrefs", func(t *testing.T) {
+		RunJellycompatDisplayPrefs(t, newStore)
 	})
 }
 

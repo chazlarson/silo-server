@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"math"
 	"net/http"
 	"net/url"
@@ -30,11 +31,14 @@ import (
 	"github.com/Silo-Server/silo-server/internal/catalog"
 	"github.com/Silo-Server/silo-server/internal/clientip"
 	"github.com/Silo-Server/silo-server/internal/config"
+	"github.com/Silo-Server/silo-server/internal/diagnostics"
 	evt "github.com/Silo-Server/silo-server/internal/events"
 	"github.com/Silo-Server/silo-server/internal/markers"
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/notifications"
 	"github.com/Silo-Server/silo-server/internal/policy"
+	"github.com/Silo-Server/silo-server/internal/settingscontract"
+	"github.com/Silo-Server/silo-server/internal/settingsmigrate"
 	subtitleai "github.com/Silo-Server/silo-server/internal/subtitles/ai"
 	"github.com/Silo-Server/silo-server/internal/userstore"
 )
@@ -62,6 +66,30 @@ type ServerSettingsStore interface {
 	Get(ctx context.Context, key string) (string, error)
 	Set(ctx context.Context, key, value string) error
 	GetAll(ctx context.Context) (map[string]string, error)
+}
+
+type serverSettingsAtomicUpdater interface {
+	UpdateAtomic(
+		ctx context.Context,
+		update func(current map[string]string) (map[string]string, error),
+	) error
+}
+
+func updateServerSettingsAtomically(
+	ctx context.Context,
+	store ServerSettingsStore,
+	update func(current map[string]string) (map[string]string, error),
+) error {
+	if updater, ok := store.(serverSettingsAtomicUpdater); ok {
+		return updater.UpdateAtomic(ctx, update)
+	}
+	return errors.New("settings store does not support atomic updates")
+}
+
+type DiagnosticsEnablementStore interface {
+	PutStream(ctx context.Context, bucket, key string, r io.Reader, contentType string) error
+	DeleteObject(ctx context.Context, bucket, key string) error
+	Bucket() string
 }
 
 type AdminJobCreator interface {
@@ -97,6 +125,7 @@ type AdminHandler struct {
 	EventBus                     cache.EventBus
 	EventsHub                    *evt.Hub
 	SettingsRepo                 ServerSettingsStore
+	DiagnosticsStore             DiagnosticsEnablementStore
 	JobRepo                      AdminJobCreator
 	ItemRefreshResolver          ItemRefreshScopeResolver
 	ImpersonationService         ImpersonationService
@@ -104,6 +133,7 @@ type AdminHandler struct {
 	AccessGroups                 AccessGroupValidator
 	BootstrapSensitiveConfigured map[string]bool
 	BootstrapSensitiveValues     map[string]string
+	RedisBootstrapAvailable      bool
 	OnUserSessionsRevoked        func(ctx context.Context, userID int)
 	OnServerSettingUpdated       func(ctx context.Context, key, value string)
 	RestartStatus                *ServerRestartStatusTracker
@@ -1246,6 +1276,26 @@ func (h *AdminHandler) HandleGetSettings(w http.ResponseWriter, r *http.Request)
 	writeJSON(w, http.StatusOK, all)
 }
 
+// HandleGetEffectiveSettings handles GET /admin/settings/effective. Unlike the
+// legacy raw endpoint, missing rows are populated with the exact defaults used
+// by runtime readers so an untouched form always describes active behavior.
+func (h *AdminHandler) HandleGetEffectiveSettings(w http.ResponseWriter, r *http.Request) {
+	if h.SettingsRepo == nil {
+		writeError(w, http.StatusInternalServerError, "internal_error", "Settings store not configured")
+		return
+	}
+	all, err := h.SettingsRepo.GetAll(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to load settings")
+		return
+	}
+	effective := h.effectiveAdminSettings(all)
+	for key := range sensitiveSettingKeys {
+		delete(effective, key)
+	}
+	writeJSON(w, http.StatusOK, effective)
+}
+
 type sensitiveStatusResponse struct {
 	Configured   []string `json:"configured"`
 	ManagedByEnv []string `json:"managed_by_env,omitempty"`
@@ -1287,7 +1337,7 @@ func (h *AdminHandler) HandleGetSensitiveStatus(w http.ResponseWriter, r *http.R
 
 	managedByEnv := make([]string, 0, len(h.BootstrapSensitiveConfigured))
 	for key, configured := range h.BootstrapSensitiveConfigured {
-		if configured && sensitiveSettingKeys[key] {
+		if configured {
 			managedByEnv = append(managedByEnv, key)
 		}
 	}
@@ -1305,10 +1355,6 @@ type adminSettingResponse struct {
 	// RestartRequired reports whether the saved value only takes effect
 	// after a server restart (set on update responses only).
 	RestartRequired bool `json:"restart_required,omitempty"`
-}
-
-type adminSettingsListResponse struct {
-	Settings []adminSettingResponse `json:"settings"`
 }
 
 type adminDeviceSettingResponse struct {
@@ -1365,345 +1411,6 @@ type adminDeviceDetailResponse struct {
 	Settings       []adminDeviceSettingResponse `json:"settings"`
 }
 
-// HandleListUserSettings handles GET /admin/users/{id}/settings.
-func (h *AdminHandler) HandleListUserSettings(w http.ResponseWriter, r *http.Request) {
-	userID, ok := parseAdminUserIDParam(w, r)
-	if !ok {
-		return
-	}
-	store, ok := h.adminUserStore(w, r, userID)
-	if !ok {
-		return
-	}
-	entries, err := store.ListSettings(r.Context())
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to list settings")
-		return
-	}
-	resp := adminSettingsListResponse{
-		Settings: make([]adminSettingResponse, 0, len(entries)),
-	}
-	for _, entry := range entries {
-		if !keyUsesUserScope(entry.Key) {
-			continue
-		}
-		resp.Settings = append(resp.Settings, adminSettingResponse{
-			Key:   entry.Key,
-			Value: entry.Value,
-		})
-	}
-	writeJSON(w, http.StatusOK, resp)
-}
-
-// HandleGetUserSetting handles GET /admin/users/{id}/settings/{key}.
-func (h *AdminHandler) HandleGetUserSetting(w http.ResponseWriter, r *http.Request) {
-	userID, ok := parseAdminUserIDParam(w, r)
-	if !ok {
-		return
-	}
-	key := strings.TrimSpace(chi.URLParam(r, "key"))
-	if key == "" {
-		writeError(w, http.StatusBadRequest, "bad_request", "Setting key is required")
-		return
-	}
-	if !keyUsesUserScope(key) {
-		writeError(w, http.StatusBadRequest, "bad_request", fmt.Sprintf("%s is not a %s setting", key, scopeUser))
-		return
-	}
-	store, ok := h.adminUserStore(w, r, userID)
-	if !ok {
-		return
-	}
-	value, err := store.GetSetting(r.Context(), key)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to load setting")
-		return
-	}
-	if value == "" {
-		entries, err := store.ListSettings(r.Context())
-		if err != nil {
-			writeError(w, http.StatusInternalServerError, "internal_error", "Failed to load setting")
-			return
-		}
-		found := false
-		for _, entry := range entries {
-			if entry.Key == key {
-				found = true
-				break
-			}
-		}
-		if !found {
-			writeError(w, http.StatusNotFound, "not_found", "Setting not found")
-			return
-		}
-	}
-	writeJSON(w, http.StatusOK, adminSettingResponse{Key: key, Value: value})
-}
-
-// HandleUpdateUserSetting handles PUT /admin/users/{id}/settings/{key}.
-func (h *AdminHandler) HandleUpdateUserSetting(w http.ResponseWriter, r *http.Request) {
-	userID, ok := parseAdminUserIDParam(w, r)
-	if !ok {
-		return
-	}
-	key := strings.TrimSpace(chi.URLParam(r, "key"))
-	if key == "" {
-		writeError(w, http.StatusBadRequest, "bad_request", "Setting key is required")
-		return
-	}
-	if !keyUsesUserScope(key) {
-		writeError(w, http.StatusBadRequest, "bad_request", fmt.Sprintf("%s is not a %s setting", key, scopeUser))
-		return
-	}
-	var req updateSettingRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "bad_request", "Invalid request body")
-		return
-	}
-	if err := validateRegisteredSetting(key, req.Value, scopeUser); err != nil {
-		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
-		return
-	}
-	store, ok := h.adminUserStore(w, r, userID)
-	if !ok {
-		return
-	}
-	if err := store.SetSetting(r.Context(), key, req.Value); err != nil {
-		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to update setting")
-		return
-	}
-	writeJSON(w, http.StatusOK, adminSettingResponse{Key: key, Value: req.Value})
-}
-
-// HandleDeleteUserSetting handles DELETE /admin/users/{id}/settings/{key}.
-func (h *AdminHandler) HandleDeleteUserSetting(w http.ResponseWriter, r *http.Request) {
-	userID, ok := parseAdminUserIDParam(w, r)
-	if !ok {
-		return
-	}
-	key := strings.TrimSpace(chi.URLParam(r, "key"))
-	if key == "" {
-		writeError(w, http.StatusBadRequest, "bad_request", "Setting key is required")
-		return
-	}
-	if !keyUsesUserScope(key) {
-		writeError(w, http.StatusBadRequest, "bad_request", fmt.Sprintf("%s is not a %s setting", key, scopeUser))
-		return
-	}
-	store, ok := h.adminUserStore(w, r, userID)
-	if !ok {
-		return
-	}
-	if err := store.DeleteSetting(r.Context(), key); err != nil {
-		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to delete setting")
-		return
-	}
-	w.WriteHeader(http.StatusNoContent)
-}
-
-// HandleListUserDeviceSettings handles GET /admin/users/{id}/device-settings.
-func (h *AdminHandler) HandleListUserDeviceSettings(w http.ResponseWriter, r *http.Request) {
-	userID, ok := parseAdminUserIDParam(w, r)
-	if !ok {
-		return
-	}
-	store, ok := h.adminUserStore(w, r, userID)
-	if !ok {
-		return
-	}
-	entries, err := store.ListAllDeviceSettings(r.Context())
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to list device settings")
-		return
-	}
-	profileNames, err := listProfileNamesByID(r.Context(), store)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to list profiles")
-		return
-	}
-	writeJSON(w, http.StatusOK, buildAdminDeviceSettingsResponse(userID, profileNames, entries))
-}
-
-// HandleListUserDeviceSettingsByKey handles GET /admin/users/{id}/device-settings/{key}.
-func (h *AdminHandler) HandleListUserDeviceSettingsByKey(w http.ResponseWriter, r *http.Request) {
-	userID, ok := parseAdminUserIDParam(w, r)
-	if !ok {
-		return
-	}
-	key := strings.TrimSpace(chi.URLParam(r, "key"))
-	if key == "" {
-		writeError(w, http.StatusBadRequest, "bad_request", "Setting key is required")
-		return
-	}
-	store, ok := h.adminUserStore(w, r, userID)
-	if !ok {
-		return
-	}
-	entries, err := store.ListDeviceSettings(r.Context(), key)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to list device settings")
-		return
-	}
-	profileNames, err := listProfileNamesByID(r.Context(), store)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to list profiles")
-		return
-	}
-	writeJSON(w, http.StatusOK, buildAdminDeviceSettingsResponse(userID, profileNames, entries))
-}
-
-// HandleUpdateUserDeviceSetting handles PUT /admin/users/{id}/profiles/{profile_id}/device-settings/{key}/{device_id}.
-func (h *AdminHandler) HandleUpdateUserDeviceSetting(w http.ResponseWriter, r *http.Request) {
-	userID, ok := parseAdminUserIDParam(w, r)
-	if !ok {
-		return
-	}
-	profileID := strings.TrimSpace(chi.URLParam(r, "profile_id"))
-	key := strings.TrimSpace(chi.URLParam(r, "key"))
-	deviceID := strings.TrimSpace(chi.URLParam(r, "device_id"))
-	if profileID == "" {
-		writeError(w, http.StatusBadRequest, "bad_request", "Profile id is required")
-		return
-	}
-	if key == "" {
-		writeError(w, http.StatusBadRequest, "bad_request", "Setting key is required")
-		return
-	}
-	if deviceID == "" {
-		writeError(w, http.StatusBadRequest, "bad_request", "Device id is required")
-		return
-	}
-	var req updateSettingRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "bad_request", "Invalid request body")
-		return
-	}
-	if err := validateRegisteredSetting(key, req.Value, scopeDevice); err != nil {
-		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
-		return
-	}
-	store, ok := h.adminUserStore(w, r, userID)
-	if !ok {
-		return
-	}
-	if !adminProfileExists(w, r, store, profileID) {
-		return
-	}
-	existing, err := store.GetDeviceSetting(r.Context(), profileID, deviceID, key)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to load device setting")
-		return
-	}
-	entry := userstore.DeviceSettingEntry{
-		ProfileID: profileID,
-		DeviceID:  deviceID,
-		Key:       key,
-		Value:     req.Value,
-	}
-	if existing != nil {
-		entry.DeviceName = existing.DeviceName
-		entry.DevicePlatform = existing.DevicePlatform
-	} else if registered, err := registeredDeviceForProfile(r.Context(), store, profileID, deviceID); err != nil {
-		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to load device")
-		return
-	} else if registered != nil {
-		entry.DeviceName = registered.DeviceName
-		entry.DevicePlatform = registered.DevicePlatform
-	}
-	if err := store.SetDeviceSetting(r.Context(), entry); err != nil {
-		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to update device setting")
-		return
-	}
-	writeJSON(w, http.StatusOK, adminSettingResponse{Key: key, Value: req.Value})
-}
-
-// HandleDeleteUserDeviceSetting handles DELETE /admin/users/{id}/profiles/{profile_id}/device-settings/{key}/{device_id}.
-func (h *AdminHandler) HandleDeleteUserDeviceSetting(w http.ResponseWriter, r *http.Request) {
-	userID, ok := parseAdminUserIDParam(w, r)
-	if !ok {
-		return
-	}
-	profileID := strings.TrimSpace(chi.URLParam(r, "profile_id"))
-	key := strings.TrimSpace(chi.URLParam(r, "key"))
-	deviceID := strings.TrimSpace(chi.URLParam(r, "device_id"))
-	if profileID == "" {
-		writeError(w, http.StatusBadRequest, "bad_request", "Profile id is required")
-		return
-	}
-	if key == "" {
-		writeError(w, http.StatusBadRequest, "bad_request", "Setting key is required")
-		return
-	}
-	if deviceID == "" {
-		writeError(w, http.StatusBadRequest, "bad_request", "Device id is required")
-		return
-	}
-	store, ok := h.adminUserStore(w, r, userID)
-	if !ok {
-		return
-	}
-	if !adminProfileExists(w, r, store, profileID) {
-		return
-	}
-	if err := store.DeleteDeviceSetting(r.Context(), profileID, deviceID, key); err != nil {
-		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to delete device setting")
-		return
-	}
-	w.WriteHeader(http.StatusNoContent)
-}
-
-// HandleDeleteAllUserDeviceSettings handles DELETE /admin/users/{id}/profiles/{profile_id}/devices/{device_id}/settings.
-func (h *AdminHandler) HandleDeleteAllUserDeviceSettings(w http.ResponseWriter, r *http.Request) {
-	userID, ok := parseAdminUserIDParam(w, r)
-	if !ok {
-		return
-	}
-	profileID := strings.TrimSpace(chi.URLParam(r, "profile_id"))
-	deviceID := strings.TrimSpace(chi.URLParam(r, "device_id"))
-	if profileID == "" {
-		writeError(w, http.StatusBadRequest, "bad_request", "Profile id is required")
-		return
-	}
-	if deviceID == "" {
-		writeError(w, http.StatusBadRequest, "bad_request", "Device id is required")
-		return
-	}
-	store, ok := h.adminUserStore(w, r, userID)
-	if !ok {
-		return
-	}
-	if !adminProfileExists(w, r, store, profileID) {
-		return
-	}
-	if err := store.DeleteAllDeviceSettings(r.Context(), profileID, deviceID); err != nil {
-		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to delete device settings")
-		return
-	}
-	w.WriteHeader(http.StatusNoContent)
-}
-
-// HandleDeleteUserDeviceSettingsByKey handles DELETE /admin/users/{id}/device-settings/{key}.
-func (h *AdminHandler) HandleDeleteUserDeviceSettingsByKey(w http.ResponseWriter, r *http.Request) {
-	userID, ok := parseAdminUserIDParam(w, r)
-	if !ok {
-		return
-	}
-	key := strings.TrimSpace(chi.URLParam(r, "key"))
-	if key == "" {
-		writeError(w, http.StatusBadRequest, "bad_request", "Setting key is required")
-		return
-	}
-	store, ok := h.adminUserStore(w, r, userID)
-	if !ok {
-		return
-	}
-	if err := store.DeleteDeviceSettingsByKey(r.Context(), key); err != nil {
-		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to delete device settings")
-		return
-	}
-	w.WriteHeader(http.StatusNoContent)
-}
-
 // HandleListDevices handles GET /admin/devices.
 func (h *AdminHandler) HandleListDevices(w http.ResponseWriter, r *http.Request) {
 	if h.userRepo == nil || h.storeProv == nil {
@@ -1731,6 +1438,10 @@ func (h *AdminHandler) HandleListDevices(w http.ResponseWriter, r *http.Request)
 			if err != nil {
 				return fmt.Errorf("list device settings: %w", err)
 			}
+			canonicalValues, err := store.ListAllSettingValues(gctx)
+			if err != nil {
+				return fmt.Errorf("list canonical setting values: %w", err)
+			}
 			devices, err := listRegisteredDevices(gctx, store)
 			if err != nil {
 				return fmt.Errorf("list devices: %w", err)
@@ -1748,6 +1459,7 @@ func (h *AdminHandler) HandleListDevices(w http.ResponseWriter, r *http.Request)
 				user.Username,
 				user.Email,
 				entries,
+				canonicalValues,
 				devices,
 				profileNames,
 			)
@@ -1814,6 +1526,11 @@ func (h *AdminHandler) HandleGetDevice(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to load device")
 		return
 	}
+	canonicalValues, err := store.ListAllSettingValues(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to load device")
+		return
+	}
 	registeredDevices, err := listRegisteredDevices(r.Context(), store)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to load device")
@@ -1837,11 +1554,18 @@ func (h *AdminHandler) HandleGetDevice(w http.ResponseWriter, r *http.Request) {
 			deviceRegistrations = append(deviceRegistrations, entry)
 		}
 	}
+	deviceCanonicalValues := make([]userstore.SettingValue, 0)
+	for _, value := range canonicalValues {
+		if value.Scope == settingscontract.ScopeProfileDevice && value.DeviceID == deviceID {
+			deviceCanonicalValues = append(deviceCanonicalValues, value)
+		}
+	}
 	summaries := buildAdminDeviceSummaries(
 		user.ID,
 		user.Username,
 		user.Email,
 		deviceEntries,
+		deviceCanonicalValues,
 		deviceRegistrations,
 		profileNames,
 	)
@@ -1874,25 +1598,6 @@ func listRegisteredDevices(ctx context.Context, store userstore.UserStore) ([]us
 	return registry.ListDevices(ctx)
 }
 
-func registeredDeviceForProfile(
-	ctx context.Context,
-	store userstore.UserStore,
-	profileID string,
-	deviceID string,
-) (*userstore.DeviceEntry, error) {
-	devices, err := listRegisteredDevices(ctx, store)
-	if err != nil {
-		return nil, err
-	}
-	for _, device := range devices {
-		if device.ProfileID == profileID && device.DeviceID == deviceID {
-			matched := device
-			return &matched, nil
-		}
-	}
-	return nil, nil
-}
-
 func buildAdminDeviceSettingsResponse(userID int, profileNames map[string]string, entries []userstore.DeviceSettingEntry) adminDeviceSettingsListResponse {
 	resp := adminDeviceSettingsListResponse{
 		Settings: make([]adminDeviceSettingResponse, 0, len(entries)),
@@ -1918,6 +1623,7 @@ func buildAdminDeviceSummaries(
 	username string,
 	email string,
 	entries []userstore.DeviceSettingEntry,
+	canonicalValues []userstore.SettingValue,
 	registeredDevices []userstore.DeviceEntry,
 	profileNames map[string]string,
 ) []adminDeviceSummaryResponse {
@@ -2019,12 +1725,36 @@ func buildAdminDeviceSummaries(
 		if current == nil {
 			continue
 		}
-		if profileID != "" && entry.Key != "" {
-			current.keys[profileID+":"+entry.Key] = struct{}{}
+		key := canonicalAdminDeviceSettingKey(entry.Key)
+		if profileID != "" && key != "" {
+			current.keys[profileID+":"+key] = struct{}{}
 		}
 		profile := ensureProfile(current, profileID, entry.UpdatedAt)
-		if profile != nil && entry.Key != "" {
-			profile.keys[entry.Key] = struct{}{}
+		if profile != nil && key != "" {
+			profile.keys[key] = struct{}{}
+		}
+	}
+
+	// Canonical profile_device rows are the authoritative overrides after the
+	// settings cutover. Merge them by (profile,key) with the still-mounted
+	// legacy rows so a mirrored value counts once while a canonical-only write
+	// remains visible to fleet management.
+	for _, value := range canonicalValues {
+		if value.Scope != settingscontract.ScopeProfileDevice {
+			continue
+		}
+		deviceID := strings.TrimSpace(value.DeviceID)
+		profileID := strings.TrimSpace(value.ProfileID)
+		current := ensureDevice(deviceID, "", "", value.UpdatedAt)
+		if current == nil {
+			continue
+		}
+		if profileID != "" && value.Key != "" {
+			current.keys[profileID+":"+value.Key] = struct{}{}
+		}
+		profile := ensureProfile(current, profileID, value.UpdatedAt)
+		if profile != nil && value.Key != "" {
+			profile.keys[value.Key] = struct{}{}
 		}
 	}
 
@@ -2055,6 +1785,13 @@ func buildAdminDeviceSummaries(
 		devices = append(devices, current.device)
 	}
 	return devices
+}
+
+// canonicalAdminDeviceSettingKey uses the migration's rename table so fleet
+// counts describe logical overrides and every legacy/canonical pair counts
+// once, including pre-cutover appearance rows left in the legacy table.
+func canonicalAdminDeviceSettingKey(key string) string {
+	return settingsmigrate.CanonicalKey(strings.TrimSpace(key))
 }
 
 func listProfileNamesByID(ctx context.Context, store userstore.UserStore) (map[string]string, error) {
@@ -2149,6 +1886,346 @@ type updateSettingRequest struct {
 	Value string `json:"value"`
 }
 
+type updateSettingsRequest struct {
+	Values map[string]string `json:"values"`
+}
+
+type updateSettingsResponse struct {
+	Values              map[string]string `json:"values"`
+	RestartRequired     bool              `json:"restart_required"`
+	RestartRequiredKeys []string          `json:"restart_required_keys,omitempty"`
+}
+
+func (h *AdminHandler) normalizeBatchSetting(ctx context.Context, key, value string) (string, string, error) {
+	if strings.HasPrefix(key, "ratelimit.") {
+		return "", "bad_request", fmt.Errorf("%s is managed by /admin/rate-limits/config", key)
+	}
+	normalized, err := config.NormalizeAdminSetting(key, value)
+	if err != nil {
+		return "", "bad_request", err
+	}
+
+	switch key {
+	case markers.SettingMode, markers.SettingLazyPlayback:
+		normalized, err = markers.NormalizeSetting(key, normalized)
+	case clientip.SettingTrustedProxies:
+		normalized, err = clientip.NormalizeCIDRList(normalized)
+		if err != nil {
+			err = fmt.Errorf("clientip.trusted_proxies must be a comma-separated list of CIDRs: %w", err)
+		}
+	case "ai.asr_base_url":
+		if llm.IsChatOnlyGateway(normalized) {
+			err = errors.New("this endpoint cannot produce timestamped transcriptions; use a Whisper-compatible transcription endpoint")
+		}
+	case diagnostics.KeyUploadsEnabled:
+		if normalized == "true" {
+			if err = h.validateDiagnosticsUploadsEnabled(ctx); err != nil {
+				return "", "storage_unavailable", err
+			}
+		}
+	case diagnostics.KeyMaxBundleBytes,
+		diagnostics.KeyMaxUncompressedBytes,
+		diagnostics.KeyMaxReportsPerUserDay,
+		diagnostics.KeyRetentionDays,
+		diagnostics.KeyMaxBytesPerUser:
+		var numericValue int64
+		numericValue, err = normalizeDiagnosticsNumericSettingValue(key, normalized)
+		if err == nil {
+			normalized = strconv.FormatInt(numericValue, 10)
+		}
+	case diagnostics.KeyConsentNoticeVersion:
+		var n int
+		n, err = strconv.Atoi(normalized)
+		if err == nil && n < 1 {
+			err = fmt.Errorf("%s must be an integer greater than 0", key)
+		}
+		if err == nil {
+			normalized = strconv.Itoa(n)
+		}
+	case notifications.SettingPushRelayURL,
+		notifications.SettingPushRelayDeploymentID,
+		notifications.SettingPushRelayAPIKey,
+		notifications.SettingPushRelayExpiresAt,
+		notifications.SettingPushRelayKeyPrefix,
+		notifications.SettingPushRelayReregister:
+		err = fmt.Errorf("%s is managed by the push relay registration flow", key)
+	case catalog.SearchSettingMeilisearchIndex:
+		if normalized == "" {
+			err = fmt.Errorf("%s is required", key)
+		}
+	case catalog.SearchSettingMeilisearchIndexTypes:
+		var itemTypes []string
+		itemTypes, err = catalog.NormalizeCatalogSearchIndexTypesValue(normalized)
+		if err == nil {
+			normalized = catalog.FormatCatalogSearchIndexTypesValue(itemTypes)
+		}
+	case catalog.SearchSettingMeilisearchEmbedder:
+		normalized, err = catalog.NormalizeCatalogSearchEmbedderName(normalized)
+	}
+	if err != nil {
+		return "", "bad_request", err
+	}
+	return normalized, "", nil
+}
+
+func validateProspectiveAdminSettings(values map[string]string, redisBootstrapAvailable bool) error {
+	if err := config.ValidateAdminSettingsWithCapabilities(values, config.AdminSettingsCapabilities{
+		RedisBootstrapAvailable: redisBootstrapAvailable,
+	}); err != nil {
+		return err
+	}
+	if _, err := catalog.CatalogSearchSettingsFromMap(values); err != nil {
+		return err
+	}
+	return validateProspectiveDiagnosticsSettings(values)
+}
+
+var adminSettingDependencyGroups = [][]string{
+	{"auth.access_token_expiry", "auth.refresh_token_expiry"},
+	{"playback.watched_threshold", "playback.min_resume_threshold"},
+	{"s3.public_endpoint", "s3.public_bucket"},
+	{"s3.public_access_key", "s3.public_secret_key"},
+	{"s3.private_endpoint", "s3.private_bucket"},
+	{"s3.private_access_key", "s3.private_secret_key"},
+	{"s3.public_url_auth", "s3.public_read_endpoint", "s3.public_token_secret"},
+	{"email.enabled", "email.smtp_host", "email.from_address"},
+	{"watchsync.trakt.client_id", "watchsync.trakt.client_secret"},
+	{"watchsync.simkl.client_id", "watchsync.simkl.client_secret"},
+	{"ratelimit.backend", "redis.url"},
+	{"download.max_per_period", "download.period_duration"},
+	{"matcher.enable_tv_series_root_queue", "matcher.enable_tv_series_group_queue"},
+	{"ai.max_concurrent_jobs", "subtitle_ai.max_concurrent_jobs"},
+	{
+		diagnostics.KeyMaxBundleBytes,
+		diagnostics.KeyMaxUncompressedBytes,
+		diagnostics.KeyMaxReportsPerUserDay,
+		diagnostics.KeyRetentionDays,
+		diagnostics.KeyMaxBytesPerUser,
+	},
+}
+
+// adminSettingsValidationSnapshot validates exactly the requested changes and
+// the current values they depend on. The legacy single-key endpoint predates
+// cross-field validation, so any relationship (or catalog value) can already
+// be invalid in storage. Untouched legacy state must not poison an unrelated
+// batch, while touching any member pulls the complete dependency group into the
+// snapshot so a new or still-invalid relationship is rejected.
+func adminSettingsValidationSnapshot(
+	prospective map[string]string,
+	changed map[string]string,
+) map[string]string {
+	snapshot := config.EffectiveAdminSettings(nil)
+	effectiveProspective := config.EffectiveAdminSettings(prospective)
+	for key, value := range changed {
+		snapshot[key] = value
+	}
+	for _, group := range adminSettingDependencyGroups {
+		touched := false
+		for _, key := range group {
+			if _, ok := changed[key]; ok {
+				touched = true
+				break
+			}
+		}
+		if !touched {
+			continue
+		}
+		for _, key := range group {
+			snapshot[key] = effectiveProspective[key]
+		}
+	}
+
+	// Operational S3 values are legacy fallbacks shared by the public and
+	// private configurations. When one changes, validate the canonical values
+	// that LoadFromDB will actually consume, including unchanged legacy peers.
+	legacyS3Changed := false
+	for key := range changed {
+		if strings.HasPrefix(key, "s3.operational_") {
+			legacyS3Changed = true
+			break
+		}
+	}
+	if legacyS3Changed {
+		//nolint:goconst // Keep the complete canonical validation set readable as a contract.
+		for _, key := range []string{
+			"s3.public_endpoint",
+			"s3.public_read_endpoint",
+			"s3.public_region",
+			"s3.public_path_style",
+			"s3.public_bucket",
+			"s3.public_key_prefix",
+			"s3.public_access_key",
+			"s3.public_secret_key",
+			"s3.public_url_auth",
+			"s3.public_token_secret",
+			"s3.public_token_param",
+			"s3.public_token_ttl",
+			"s3.private_endpoint",
+			"s3.private_region",
+			"s3.private_path_style",
+			"s3.private_bucket",
+			"s3.private_key_prefix",
+			"s3.private_access_key",
+			"s3.private_secret_key",
+		} {
+			snapshot[key] = effectiveProspective[key]
+		}
+	}
+	return snapshot
+}
+
+// activeAdminSettings overlays values owned by the process environment onto a
+// stored snapshot. Updates never persist these values, but cross-field
+// validation and effective-value comparisons must use the same configuration
+// the runtime is actually consuming.
+func (h *AdminHandler) activeAdminSettings(stored map[string]string) map[string]string {
+	active := make(map[string]string, len(stored)+len(h.BootstrapSensitiveValues))
+	for key, value := range stored {
+		active[key] = value
+	}
+	for key, value := range h.BootstrapSensitiveValues {
+		if h.BootstrapSensitiveConfigured[key] && value != "" {
+			active[key] = value
+		}
+	}
+	return active
+}
+
+func (h *AdminHandler) effectiveAdminSettings(stored map[string]string) map[string]string {
+	return config.EffectiveAdminSettings(h.activeAdminSettings(stored))
+}
+
+func shouldPersistAdminSetting(stored map[string]string, key, normalized string, effectiveChanged bool) bool {
+	current, exists := stored[key]
+	if exists {
+		return current != normalized
+	}
+	// Do not create a row merely because a client resubmitted an untouched
+	// runtime default. Non-default values still need a row, while clearing an
+	// already-absent override is a storage no-op.
+	return normalized != "" && effectiveChanged
+}
+
+// HandleUpdateSettings handles PUT /admin/settings. Every requested value is
+// normalized and validated with the prospective values it depends on before
+// SetMany performs one transaction, so a multi-field save is all-or-nothing.
+func (h *AdminHandler) HandleUpdateSettings(w http.ResponseWriter, r *http.Request) {
+	if h.SettingsRepo == nil {
+		writeError(w, http.StatusInternalServerError, "internal_error", "Settings store not configured")
+		return
+	}
+
+	var req updateSettingsRequest
+	decoder := json.NewDecoder(io.LimitReader(r.Body, 1<<20))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", "Invalid request body")
+		return
+	}
+	if len(req.Values) == 0 {
+		writeError(w, http.StatusBadRequest, "bad_request", "At least one setting is required")
+		return
+	}
+	if len(req.Values) > 250 {
+		writeError(w, http.StatusBadRequest, "bad_request", "A settings update may contain at most 250 values")
+		return
+	}
+
+	keys := make([]string, 0, len(req.Values))
+	for key := range req.Values {
+		if strings.TrimSpace(key) == "" {
+			writeError(w, http.StatusBadRequest, "bad_request", "Setting key is required")
+			return
+		}
+		if h.BootstrapSensitiveConfigured[key] {
+			writeError(w, http.StatusBadRequest, "managed_by_environment", key+" is managed by an environment variable")
+			return
+		}
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+
+	normalized := make(map[string]string, len(req.Values))
+	for _, key := range keys {
+		value, code, err := h.normalizeBatchSetting(r.Context(), key, req.Values[key])
+		if err != nil {
+			writeError(w, http.StatusBadRequest, code, err.Error())
+			return
+		}
+		normalized[key] = value
+	}
+
+	var (
+		after            map[string]string
+		effectiveChanges map[string]bool
+		validationErr    error
+	)
+	err := updateServerSettingsAtomically(r.Context(), h.SettingsRepo,
+		func(stored map[string]string) (map[string]string, error) {
+			prospective := maps.Clone(stored)
+			for key, value := range normalized {
+				prospective[key] = value
+			}
+			activeProspective := h.activeAdminSettings(prospective)
+			validationSnapshot := adminSettingsValidationSnapshot(activeProspective, normalized)
+			if err := validateProspectiveAdminSettings(validationSnapshot, h.RedisBootstrapAvailable); err != nil {
+				validationErr = err
+				return nil, err
+			}
+			before := h.effectiveAdminSettings(stored)
+			after = h.effectiveAdminSettings(prospective)
+			writes := make(map[string]string, len(normalized))
+			effectiveChanges = make(map[string]bool, len(normalized))
+			for key, value := range normalized {
+				effectiveChanged := before[key] != after[key]
+				if shouldPersistAdminSetting(stored, key, value, effectiveChanged) {
+					writes[key] = value
+				}
+				if effectiveChanged {
+					effectiveChanges[key] = true
+				}
+			}
+			return writes, nil
+		})
+	if validationErr != nil {
+		writeError(w, http.StatusBadRequest, "invalid_settings", validationErr.Error())
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to update settings")
+		return
+	}
+
+	responseValues := make(map[string]string, len(normalized))
+	restartKeys := make([]string, 0, len(normalized))
+	for _, key := range keys {
+		if !sensitiveSettingKeys[key] {
+			responseValues[key] = after[key]
+		}
+		if !effectiveChanges[key] {
+			continue
+		}
+		if h.EventBus != nil {
+			_ = h.EventBus.Publish(r.Context(), cache.ChannelAdmin,
+				cache.Event{Type: cache.EventSettingsChanged, Payload: key})
+		}
+		if h.OnServerSettingUpdated != nil {
+			h.OnServerSettingUpdated(r.Context(), key, after[key])
+		}
+		if config.RestartRequired(key) {
+			restartKeys = append(restartKeys, key)
+		}
+	}
+	if len(restartKeys) > 0 {
+		h.markServerRestartRequired("server_settings")
+	}
+	writeJSON(w, http.StatusOK, updateSettingsResponse{
+		Values:              responseValues,
+		RestartRequired:     len(restartKeys) > 0,
+		RestartRequiredKeys: restartKeys,
+	})
+}
+
 // HandleUpdateSetting handles PUT /admin/settings/{key}.
 func (h *AdminHandler) HandleUpdateSetting(w http.ResponseWriter, r *http.Request) {
 	if h.SettingsRepo == nil {
@@ -2161,11 +2238,25 @@ func (h *AdminHandler) HandleUpdateSetting(w http.ResponseWriter, r *http.Reques
 		writeError(w, http.StatusBadRequest, "bad_request", "Setting key is required")
 		return
 	}
+	if h.BootstrapSensitiveConfigured[key] {
+		writeError(w, http.StatusBadRequest, "managed_by_environment", key+" is managed by an environment variable")
+		return
+	}
+	if strings.HasPrefix(key, "ratelimit.") {
+		writeError(w, http.StatusBadRequest, "bad_request", key+" is managed by /admin/rate-limits/config")
+		return
+	}
 
 	var req updateSettingRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "bad_request", "Invalid request body")
 		return
+	}
+	if normalized, err := config.NormalizeAdminSetting(key, req.Value); err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
+		return
+	} else {
+		req.Value = normalized
 	}
 
 	switch key {
@@ -2184,7 +2275,10 @@ func (h *AdminHandler) HandleUpdateSetting(w http.ResponseWriter, r *http.Reques
 			return
 		}
 		req.Value = normalized
+	case "ai.base_url", "ai.chat_model", "ai.asr_model":
+		req.Value = strings.TrimSpace(req.Value)
 	case "ai.asr_base_url":
+		req.Value = strings.TrimSpace(req.Value)
 		if llm.IsChatOnlyGateway(req.Value) {
 			writeError(w, http.StatusBadRequest, "bad_request",
 				"This endpoint cannot produce timestamped transcriptions (chat-only gateway). "+
@@ -2215,6 +2309,38 @@ func (h *AdminHandler) HandleUpdateSetting(w http.ResponseWriter, r *http.Reques
 			return
 		}
 		req.Value = strconv.FormatBool(enabled)
+	case diagnostics.KeyUploadsEnabled:
+		enabled, err := strconv.ParseBool(strings.TrimSpace(req.Value))
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "bad_request", diagnostics.KeyUploadsEnabled+" must be true or false")
+			return
+		}
+		req.Value = strconv.FormatBool(enabled)
+		if enabled {
+			if err := h.validateDiagnosticsUploadsEnabled(r.Context()); err != nil {
+				writeError(w, http.StatusBadRequest, "storage_unavailable", err.Error())
+				return
+			}
+		}
+	case diagnostics.KeyMaxBundleBytes,
+		diagnostics.KeyMaxUncompressedBytes,
+		diagnostics.KeyMaxReportsPerUserDay,
+		diagnostics.KeyRetentionDays,
+		diagnostics.KeyMaxBytesPerUser:
+		normalized, err := h.normalizeDiagnosticsNumericSetting(r.Context(), key, req.Value)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "bad_request", err.Error())
+			return
+		}
+		req.Value = normalized
+	case diagnostics.KeyConsentNoticeVersion:
+		n, err := strconv.Atoi(strings.TrimSpace(req.Value))
+		if err != nil || n < 1 {
+			writeError(w, http.StatusBadRequest, "bad_request",
+				diagnostics.KeyConsentNoticeVersion+" must be an integer greater than 0")
+			return
+		}
+		req.Value = strconv.Itoa(n)
 	case policy.SettingDecisionLogScopeSampleRate:
 		n, err := strconv.Atoi(strings.TrimSpace(req.Value))
 		if err != nil || n <= 0 {
@@ -2243,10 +2369,11 @@ func (h *AdminHandler) HandleUpdateSetting(w http.ResponseWriter, r *http.Reques
 				"subtitle_ai.transcribe_quota_period must be day, week, or month")
 			return
 		}
-	case notifications.SettingApplePushDeliveryEnabled:
+	case notifications.SettingApplePushDeliveryEnabled,
+		notifications.SettingAndroidPushDeliveryEnabled:
 		enabled, err := strconv.ParseBool(strings.TrimSpace(req.Value))
 		if err != nil {
-			writeError(w, http.StatusBadRequest, "bad_request", "notifications.apple_push_delivery_enabled must be true or false")
+			writeError(w, http.StatusBadRequest, "bad_request", key+" must be true or false")
 			return
 		}
 		req.Value = strconv.FormatBool(enabled)
@@ -2360,19 +2487,56 @@ func (h *AdminHandler) HandleUpdateSetting(w http.ResponseWriter, r *http.Reques
 		req.Value = strconv.FormatBool(enabled)
 	}
 
-	if err := h.SettingsRepo.Set(r.Context(), key, req.Value); err != nil {
+	var (
+		after            map[string]string
+		effectiveChanged bool
+		validationErr    error
+	)
+	err := updateServerSettingsAtomically(r.Context(), h.SettingsRepo,
+		func(stored map[string]string) (map[string]string, error) {
+			prospective := maps.Clone(stored)
+			prospective[key] = req.Value
+			// This legacy route can only change one key, so enforcing every
+			// cross-field invariant would make paired settings impossible to
+			// establish or clear one write at a time. Per-key validation above
+			// remains strict; Redis transport is the one durable prerequisite
+			// that may not be broken by a single-key write.
+			if key == "redis.url" {
+				if err := config.ValidateRedisRateLimitTransport(
+					h.activeAdminSettings(prospective),
+					h.RedisBootstrapAvailable,
+				); err != nil {
+					validationErr = err
+					return nil, err
+				}
+			}
+
+			before := h.effectiveAdminSettings(stored)
+			after = h.effectiveAdminSettings(prospective)
+			effectiveChanged = before[key] != after[key]
+			if shouldPersistAdminSetting(stored, key, req.Value, effectiveChanged) {
+				return map[string]string{key: req.Value}, nil
+			}
+			return nil, nil
+		})
+	if validationErr != nil {
+		writeError(w, http.StatusBadRequest, "invalid_settings", validationErr.Error())
+		return
+	}
+	if err != nil {
 		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to update setting")
 		return
 	}
-
-	if h.EventBus != nil {
-		_ = h.EventBus.Publish(r.Context(), cache.ChannelAdmin,
-			cache.Event{Type: cache.EventSettingsChanged, Payload: key})
+	if effectiveChanged {
+		if h.EventBus != nil {
+			_ = h.EventBus.Publish(r.Context(), cache.ChannelAdmin,
+				cache.Event{Type: cache.EventSettingsChanged, Payload: key})
+		}
+		if h.OnServerSettingUpdated != nil {
+			h.OnServerSettingUpdated(r.Context(), key, after[key])
+		}
 	}
-	if h.OnServerSettingUpdated != nil {
-		h.OnServerSettingUpdated(r.Context(), key, req.Value)
-	}
-	restartRequired := config.RestartRequired(key)
+	restartRequired := effectiveChanged && config.RestartRequired(key)
 	if restartRequired {
 		h.markServerRestartRequired("server_settings")
 	}
@@ -2380,5 +2544,166 @@ func (h *AdminHandler) HandleUpdateSetting(w http.ResponseWriter, r *http.Reques
 		writeJSON(w, http.StatusOK, adminSettingResponse{Key: key, RestartRequired: restartRequired})
 		return
 	}
-	writeJSON(w, http.StatusOK, adminSettingResponse{Key: key, Value: req.Value, RestartRequired: restartRequired})
+	writeJSON(w, http.StatusOK, adminSettingResponse{Key: key, Value: after[key], RestartRequired: restartRequired})
+}
+
+func (h *AdminHandler) validateDiagnosticsUploadsEnabled(ctx context.Context) error {
+	if h.DiagnosticsStore == nil || strings.TrimSpace(h.DiagnosticsStore.Bucket()) == "" {
+		return errors.New("diagnostics uploads require configured private object storage")
+	}
+	const probeKey = "diagnostics/.probe"
+	if err := h.DiagnosticsStore.PutStream(
+		ctx,
+		h.DiagnosticsStore.Bucket(),
+		probeKey,
+		strings.NewReader("ok"),
+		"application/octet-stream",
+	); err != nil {
+		return fmt.Errorf("diagnostics storage probe write failed: %w", err)
+	}
+	if err := h.DiagnosticsStore.DeleteObject(ctx, h.DiagnosticsStore.Bucket(), probeKey); err != nil {
+		return fmt.Errorf("diagnostics storage probe delete failed: %w", err)
+	}
+	return nil
+}
+
+func (h *AdminHandler) normalizeDiagnosticsNumericSetting(ctx context.Context, key, raw string) (string, error) {
+	value, err := normalizeDiagnosticsNumericSettingValue(key, raw)
+	if err != nil {
+		return "", err
+	}
+
+	settings := diagnostics.DefaultSettings()
+	if h.SettingsRepo != nil {
+		loaded, loadErr := diagnostics.LoadSettings(ctx, h.SettingsRepo)
+		if loadErr != nil {
+			return "", fmt.Errorf("load diagnostics settings: %w", loadErr)
+		}
+		settings = loaded
+	}
+
+	switch key {
+	case diagnostics.KeyMaxBundleBytes:
+		if value > settings.MaxUncompressedBytes {
+			return "", fmt.Errorf("%s must not exceed %s (%d bytes)", key, diagnostics.KeyMaxUncompressedBytes, settings.MaxUncompressedBytes)
+		}
+		// A single bundle can never exceed the per-user byte cap, or every upload
+		// at this size would fail quota; keep the two bounds consistent.
+		if value > settings.MaxBytesPerUser {
+			return "", fmt.Errorf("%s must not exceed %s (%d bytes)", key, diagnostics.KeyMaxBytesPerUser, settings.MaxBytesPerUser)
+		}
+	case diagnostics.KeyMaxUncompressedBytes:
+		if value < settings.MaxBundleBytes {
+			return "", fmt.Errorf("%s must be at least %s (%d bytes)", key, diagnostics.KeyMaxBundleBytes, settings.MaxBundleBytes)
+		}
+	case diagnostics.KeyMaxReportsPerUserDay, diagnostics.KeyRetentionDays:
+		// These settings have only independent bounds, which were checked above.
+	case diagnostics.KeyMaxBytesPerUser:
+		// The per-user cap must leave room for at least one max-size bundle, or
+		// /diagnostics/status would advertise a bundle size InsertReceiving always
+		// rejects as quota_exceeded.
+		if value < settings.MaxBundleBytes {
+			return "", fmt.Errorf("%s must be at least %s (%d bytes)", key, diagnostics.KeyMaxBundleBytes, settings.MaxBundleBytes)
+		}
+	default:
+		return "", fmt.Errorf("unsupported diagnostics numeric setting %s", key)
+	}
+
+	return strconv.FormatInt(value, 10), nil
+}
+
+const (
+	diagnosticsMiB = int64(1024 * 1024)
+	diagnosticsGiB = 1024 * diagnosticsMiB
+)
+
+func normalizeDiagnosticsNumericSettingValue(key, raw string) (int64, error) {
+	value, err := strconv.ParseInt(strings.TrimSpace(raw), 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("%s must be an integer", key)
+	}
+
+	switch key {
+	case diagnostics.KeyMaxBundleBytes:
+		if value < diagnosticsMiB || value > 256*diagnosticsMiB {
+			return 0, fmt.Errorf(
+				"%s must be between 1 MiB (%d bytes) and 256 MiB (%d bytes)",
+				key,
+				diagnosticsMiB,
+				256*diagnosticsMiB,
+			)
+		}
+	case diagnostics.KeyMaxUncompressedBytes:
+		if value < diagnosticsMiB || value > diagnosticsGiB {
+			return 0, fmt.Errorf(
+				"%s must be between 1 MiB (%d bytes) and 1 GiB (%d bytes)",
+				key,
+				diagnosticsMiB,
+				diagnosticsGiB,
+			)
+		}
+	case diagnostics.KeyMaxReportsPerUserDay:
+		if value < 1 || value > 1000 {
+			return 0, fmt.Errorf("%s must be between 1 and 1000", key)
+		}
+	case diagnostics.KeyRetentionDays:
+		if value < 1 || value > 365 {
+			return 0, fmt.Errorf("%s must be between 1 and 365", key)
+		}
+	case diagnostics.KeyMaxBytesPerUser:
+		if value < 10*diagnosticsMiB || value > 10*diagnosticsGiB {
+			return 0, fmt.Errorf(
+				"%s must be between 10 MiB (%d bytes) and 10 GiB (%d bytes)",
+				key,
+				10*diagnosticsMiB,
+				10*diagnosticsGiB,
+			)
+		}
+	default:
+		return 0, fmt.Errorf("unsupported diagnostics numeric setting %s", key)
+	}
+	return value, nil
+}
+
+func validateProspectiveDiagnosticsSettings(values map[string]string) error {
+	settings := diagnostics.DefaultSettings()
+	targets := []struct {
+		key    string
+		assign func(int64)
+	}{
+		{diagnostics.KeyMaxBundleBytes, func(value int64) { settings.MaxBundleBytes = value }},
+		{diagnostics.KeyMaxUncompressedBytes, func(value int64) { settings.MaxUncompressedBytes = value }},
+		{diagnostics.KeyMaxReportsPerUserDay, func(value int64) { settings.MaxReportsPerUserDay = int(value) }},
+		{diagnostics.KeyRetentionDays, func(value int64) { settings.RetentionDays = int(value) }},
+		{diagnostics.KeyMaxBytesPerUser, func(value int64) { settings.MaxBytesPerUser = value }},
+	}
+	for _, target := range targets {
+		raw := values[target.key]
+		if raw == "" {
+			continue
+		}
+		value, err := normalizeDiagnosticsNumericSettingValue(target.key, raw)
+		if err != nil {
+			return err
+		}
+		target.assign(value)
+	}
+
+	if settings.MaxBundleBytes > settings.MaxUncompressedBytes {
+		return fmt.Errorf(
+			"%s must not exceed %s (%d bytes)",
+			diagnostics.KeyMaxBundleBytes,
+			diagnostics.KeyMaxUncompressedBytes,
+			settings.MaxUncompressedBytes,
+		)
+	}
+	if settings.MaxBundleBytes > settings.MaxBytesPerUser {
+		return fmt.Errorf(
+			"%s must not exceed %s (%d bytes)",
+			diagnostics.KeyMaxBundleBytes,
+			diagnostics.KeyMaxBytesPerUser,
+			settings.MaxBytesPerUser,
+		)
+	}
+	return nil
 }

@@ -25,6 +25,8 @@ func buildLiveSessionSync(s *playback.Session, reportingNode string) worker.Sess
 		ClientIP:             s.ClientIP,
 		ClientName:           s.ClientName,
 		ClientVersion:        s.ClientVersion,
+		ClientBuild:          s.ClientBuild,
+		ClientChannel:        s.ClientChannel,
 		ClientUserAgent:      s.ClientUserAgent,
 		AudioTrackIndex:      s.AudioTrackIndex,
 		TranscodeAudio:       s.TranscodeAudio,
@@ -40,5 +42,6 @@ func buildLiveSessionSync(s *playback.Session, reportingNode string) worker.Sess
 		PositionSeconds:      s.Position,
 		IsPaused:             s.IsPaused,
 		HasWebSocket:         s.HasWebSocket,
+		IsJellyfinCompat:     s.IsJellyfinCompat,
 	}
 }

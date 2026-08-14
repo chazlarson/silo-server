@@ -58,6 +58,13 @@ type AuthProvider interface {
 	LookupAccount(ctx context.Context, cfg ServerConfig, conn Connection) (ProviderAccount, error)
 }
 
+// authoritativeRefreshProvider marks providers whose refreshed credentials are
+// a complete replacement rather than a patch. The unexported method keeps this
+// contract internal to watchsync until all providers can share it.
+type authoritativeRefreshProvider interface {
+	authoritativeRefreshProvider()
+}
+
 // APIKeyAuthProvider is implemented by providers that authenticate via a
 // user-supplied API key rather than an OAuth device flow. The key itself is
 // stored in Connection.AccessToken; LookupAccount and RefreshToken (no-op)
@@ -100,6 +107,12 @@ type WatchedExporter interface {
 	ExportHistory(ctx context.Context, cfg ServerConfig, conn Connection, plays []LocalPlay) (ExportResult, error)
 }
 
+// singleBatchWatchedExporter bounds one synchronization run to one provider
+// batch. This is used for plugin RPCs with independent per-call deadlines.
+type singleBatchWatchedExporter interface {
+	ExportBatchSize() int
+}
+
 type UnwatchedExporter interface {
 	RemoveHistory(ctx context.Context, cfg ServerConfig, conn Connection, plays []LocalPlay) (ExportResult, error)
 }
@@ -112,6 +125,9 @@ type FavoriteImportBatch struct {
 	Rows           []RemoteFavorite
 	UpdatedCursors map[string]string
 	Warnings       []string
+	// Incremental means absent remote items are not deletions. The zero value is
+	// an authoritative snapshot, preserving existing built-in provider behavior.
+	Incremental bool
 }
 
 type FavoriteBatchImporter interface {
@@ -175,6 +191,9 @@ type Connection struct {
 	AccessToken                  string
 	RefreshToken                 string
 	TokenExpiresAt               *time.Time
+	TokenType                    string
+	Scopes                       []string
+	SecretAttributes             map[string]string
 	ImportWatchedEnabled         bool
 	ImportProgressEnabled        bool
 	ExportWatchedEnabled         bool
@@ -278,6 +297,19 @@ func AsRateLimited(err error) (RateLimitedError, bool) {
 	return rle, ok
 }
 
+type retryableProviderError struct {
+	message string
+}
+
+func (e retryableProviderError) Error() string {
+	return e.message
+}
+
+func isRetryableProviderError(err error) bool {
+	var retryable retryableProviderError
+	return errors.As(err, &retryable)
+}
+
 type DeviceAuthSession struct {
 	ID              string     `json:"id"`
 	Provider        string     `json:"provider"`
@@ -291,10 +323,24 @@ type DeviceAuthSession struct {
 	CompletedAt     *time.Time `json:"completed_at,omitempty"`
 }
 
+// deviceAuthorizationPendingError carries an authoritative replacement for a
+// device challenge that must be persisted before the next poll. It remains an
+// error so the existing HTTP contract continues to report an incomplete flow.
+type deviceAuthorizationPendingError struct {
+	session DeviceAuthSession
+}
+
+func (deviceAuthorizationPendingError) Error() string {
+	return "watch sync plugin device authorization is pending"
+}
+
 type TokenSet struct {
-	AccessToken    string
-	RefreshToken   string
-	TokenExpiresAt *time.Time
+	AccessToken      string
+	RefreshToken     string
+	TokenExpiresAt   *time.Time
+	TokenType        string
+	Scopes           []string
+	SecretAttributes map[string]string
 }
 
 type ProviderAccount struct {
@@ -345,20 +391,23 @@ type RemoteProgress struct {
 type RemoteFavorite struct {
 	Provider        string
 	ProviderItemKey string
-	Kind            string
-	Title           string
-	Year            int
-	IMDbID          string
-	TMDBID          string
-	TVDBID          string
-	SeriesTitle     string
-	SeriesYear      int
-	SeriesIMDbID    string
-	SeriesTMDBID    string
-	SeriesTVDBID    string
-	SeasonNumber    int
-	EpisodeNumber   int
-	FavoritedAt     time.Time
+	// Removed is an explicit provider tombstone used by incremental list syncs.
+	// Tombstones are resolved through ProviderItemKey and do not require media.
+	Removed       bool
+	Kind          string
+	Title         string
+	Year          int
+	IMDbID        string
+	TMDBID        string
+	TVDBID        string
+	SeriesTitle   string
+	SeriesYear    int
+	SeriesIMDbID  string
+	SeriesTMDBID  string
+	SeriesTVDBID  string
+	SeasonNumber  int
+	EpisodeNumber int
+	FavoritedAt   time.Time
 }
 
 type RemotePlay struct {
@@ -449,6 +498,15 @@ type LocalListEvent struct {
 	Items     []LocalFavorite
 }
 
+const (
+	historyExportStatusPending             = "pending"
+	historyExportStatusFailed              = "failed"
+	historyExportStatusSent                = "sent"
+	historyExportStatusNotFound            = "not_found"
+	historyExportStatusRemotePresent       = "remote_present"
+	historyExportStatusSatisfiedByScrobble = "satisfied_by_scrobble"
+)
+
 type HistoryExport struct {
 	ID              string
 	ConnectionID    string
@@ -490,27 +548,28 @@ type ListItemState struct {
 }
 
 type ScrobbleSession struct {
-	PlaybackSessionID string
-	ConnectionID      string
-	MediaItemID       string
-	ProviderItemKey   string
-	Kind              string
-	IMDbID            string
-	TMDBID            string
-	TVDBID            string
-	SeriesIMDbID      string
-	SeriesTMDBID      string
-	SeriesTVDBID      string
-	SeasonNumber      int
-	EpisodeNumber     int
-	HistoryID         string
-	StartedAt         time.Time
-	LastProgress      float64
-	DurationSeconds   float64
-	Completed         bool
-	LastAction        string
-	StopSentAt        *time.Time
-	LastError         string
+	PlaybackSessionID   string
+	ConnectionID        string
+	MediaItemID         string
+	ProviderItemKey     string
+	Kind                string
+	IMDbID              string
+	TMDBID              string
+	TVDBID              string
+	SeriesIMDbID        string
+	SeriesTMDBID        string
+	SeriesTVDBID        string
+	SeasonNumber        int
+	EpisodeNumber       int
+	HistoryID           string
+	StartedAt           time.Time
+	LastProgress        float64
+	DurationSeconds     float64
+	Completed           bool
+	LastAction          string
+	StopSentAt          *time.Time
+	HistoryReconciledAt *time.Time
+	LastError           string
 }
 
 type ExportResult struct {

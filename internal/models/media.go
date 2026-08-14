@@ -5,6 +5,12 @@ import (
 	"time"
 )
 
+const (
+	mediaBaseTypeAudiobook = "audiobook"
+	mediaBaseTypePodcast   = "podcast"
+	mediaCodecMJPEG        = "mjpeg"
+)
+
 // MediaFolder represents a row in the media_folders table.
 type MediaFolder struct {
 	ID                       int
@@ -153,31 +159,175 @@ func (f *MediaFile) PrimaryDVProfile() int {
 	return f.VideoTracks[0].DVProfile
 }
 
+// AudioOnlyProbeFacts is the compact probe shape needed to distinguish known
+// audio media from incomplete video probes and legacy attached cover art.
+type AudioOnlyProbeFacts struct {
+	BaseType               string
+	CodecVideo             string
+	CodecAudio             string
+	HasVideoTracks         bool
+	HasAudioTracks         bool
+	HasNonImageVideoTracks bool
+}
+
+func isImageVideoCodec(codec string) bool {
+	switch strings.ToLower(strings.TrimSpace(codec)) {
+	case mediaCodecMJPEG, "jpeg", "png", "webp", "gif", "bmp":
+		return true
+	default:
+		return false
+	}
+}
+
+// HasLegacyAttachedPictureVideo reports the stale shape in which every video
+// track on known audio media is embedded cover art.
+func (f AudioOnlyProbeFacts) HasLegacyAttachedPictureVideo() bool {
+	knownAudioType := f.BaseType == mediaBaseTypeAudiobook || f.BaseType == mediaBaseTypePodcast
+	hasAudio := f.HasAudioTracks || strings.TrimSpace(f.CodecAudio) != ""
+	if !knownAudioType || !hasAudio {
+		return false
+	}
+	if !f.HasVideoTracks {
+		return isImageVideoCodec(f.CodecVideo)
+	}
+	if f.HasNonImageVideoTracks {
+		return false
+	}
+	return strings.TrimSpace(f.CodecVideo) == "" || isImageVideoCodec(f.CodecVideo)
+}
+
+// IsAudioOnly reports whether these facts contain positive evidence for known
+// audio media with no playable video stream.
+func (f AudioOnlyProbeFacts) IsAudioOnly() bool {
+	knownAudioType := f.BaseType == mediaBaseTypeAudiobook || f.BaseType == mediaBaseTypePodcast
+	hasAudio := f.HasAudioTracks || strings.TrimSpace(f.CodecAudio) != ""
+	return (knownAudioType && hasAudio && !f.HasVideoTracks && strings.TrimSpace(f.CodecVideo) == "") || f.HasLegacyAttachedPictureVideo()
+}
+
+// AudioOnlyProbeFacts returns the compact stream evidence for this media file.
+func (f *MediaFile) AudioOnlyProbeFacts() AudioOnlyProbeFacts {
+	if f == nil {
+		return AudioOnlyProbeFacts{}
+	}
+	facts := AudioOnlyProbeFacts{
+		BaseType:       f.BaseType,
+		CodecVideo:     f.CodecVideo,
+		CodecAudio:     f.CodecAudio,
+		HasVideoTracks: len(f.VideoTracks) > 0,
+		HasAudioTracks: len(f.AudioTracks) > 0,
+	}
+	for _, track := range f.VideoTracks {
+		if !isImageVideoCodec(track.Codec) {
+			facts.HasNonImageVideoTracks = true
+			break
+		}
+	}
+	return facts
+}
+
+// HasLegacyAttachedPictureVideo reports the stale catalog shape produced when
+// older probes recorded embedded cover art as a video track. BaseType and
+// audio evidence keep genuine MJPEG video from being normalized away.
+func (f *MediaFile) HasLegacyAttachedPictureVideo() bool {
+	return f.AudioOnlyProbeFacts().HasLegacyAttachedPictureVideo()
+}
+
+// IsAudioOnly reports whether a probed file carries no playable video stream —
+// audiobooks and podcasts, as opposed to a video file whose probe is incomplete.
+// It also normalizes legacy audiobook/podcast cover-art rows until a repair
+// probe removes their stale image-only video metadata.
+func (f *MediaFile) IsAudioOnly() bool {
+	return f.AudioOnlyProbeFacts().IsAudioOnly()
+}
+
+// NormalizeVideoBitDepth returns an explicit probe value when available and
+// otherwise derives the bit depth from stable ffprobe fields. FFprobe commonly
+// omits bits_per_raw_sample for HEVC even though the pixel format and profile
+// are conclusive (for example yuv420p10le / Main 10).
+func NormalizeVideoBitDepth(explicit int, pixelFormat, profile string) int {
+	if explicit > 0 {
+		return explicit
+	}
+
+	pixelFormat = strings.ToLower(strings.TrimSpace(pixelFormat))
+	for _, candidate := range []struct {
+		markers []string
+		depth   int
+	}{
+		{markers: []string{"p016", "p16", "gray16", "16le", "16be"}, depth: 16},
+		{markers: []string{"p014", "p14", "gray14", "14le", "14be"}, depth: 14},
+		{markers: []string{"p012", "p12", "gray12", "12le", "12be"}, depth: 12},
+		{markers: []string{"p010", "p10", "gray10", "10le", "10be"}, depth: 10},
+		{markers: []string{"p009", "p9", "gray9", "9le", "9be"}, depth: 9},
+	} {
+		for _, marker := range candidate.markers {
+			if strings.Contains(pixelFormat, marker) {
+				return candidate.depth
+			}
+		}
+	}
+
+	profile = strings.ToLower(strings.TrimSpace(profile))
+	for _, marker := range []string{"main 12", "main12", "12-bit", "12 bit"} {
+		if strings.Contains(profile, marker) {
+			return 12
+		}
+	}
+	for _, marker := range []string{"main 10", "main10", "10-bit", "10 bit"} {
+		if strings.Contains(profile, marker) {
+			return 10
+		}
+	}
+
+	switch pixelFormat {
+	case "yuv420p", "yuv422p", "yuv444p", "yuvj420p", "yuvj422p", "yuvj444p", "nv12", "nv21", "rgb24", "bgr24":
+		return 8
+	}
+	return 0
+}
+
 // VideoTrack represents a probed video stream stored as JSONB.
 type VideoTrack struct {
-	Title           string `json:"title,omitempty"`
-	Codec           string `json:"codec,omitempty"`
-	DolbyVision     string `json:"dolby_vision,omitempty"`
-	DVProfile       int    `json:"dv_profile,omitempty"`
-	DVBLCompatID    int    `json:"dv_bl_compat_id,omitempty"`
-	DVELPresent     bool   `json:"dv_el_present,omitempty"`
-	HDR10Plus       bool   `json:"hdr10_plus,omitempty"`
-	Profile         string `json:"profile,omitempty"`
-	Level           int    `json:"level,omitempty"`
-	Width           int    `json:"width,omitempty"`
-	Height          int    `json:"height,omitempty"`
-	AspectRatio     string `json:"aspect_ratio,omitempty"`
-	Interlaced      bool   `json:"interlaced"`
-	FrameRate       string `json:"frame_rate,omitempty"`
-	Bitrate         int    `json:"bitrate,omitempty"`
-	VideoRange      string `json:"video_range,omitempty"`
-	VideoRangeType  string `json:"video_range_type,omitempty"`
-	ColorPrimaries  string `json:"color_primaries,omitempty"`
-	ColorSpace      string `json:"color_space,omitempty"`
-	ColorTransfer   string `json:"color_transfer,omitempty"`
-	BitDepth        int    `json:"bit_depth,omitempty"`
-	PixelFormat     string `json:"pixel_format,omitempty"`
-	ReferenceFrames int    `json:"reference_frames,omitempty"`
+	Title              string `json:"title,omitempty"`
+	Codec              string `json:"codec,omitempty"`
+	DolbyVision        string `json:"dolby_vision,omitempty"`
+	DVProfile          int    `json:"dv_profile,omitempty"`
+	DVLevel            int    `json:"dv_level,omitempty"`
+	DVBLCompatID       int    `json:"dv_bl_compat_id,omitempty"`
+	DVELPresent        bool   `json:"dv_el_present,omitempty"`
+	DVEnhancementLayer string `json:"dv_enhancement_layer,omitempty"` // none, mel, fel, unknown
+	HDR10Plus          bool   `json:"hdr10_plus,omitempty"`
+	Profile            string `json:"profile,omitempty"`
+	Level              int    `json:"level,omitempty"`
+	Width              int    `json:"width,omitempty"`
+	Height             int    `json:"height,omitempty"`
+	AspectRatio        string `json:"aspect_ratio,omitempty"`
+	Interlaced         bool   `json:"interlaced"`
+	FrameRate          string `json:"frame_rate,omitempty"`
+	Bitrate            int    `json:"bitrate,omitempty"`
+	VideoRange         string `json:"video_range,omitempty"`
+	VideoRangeType     string `json:"video_range_type,omitempty"`
+	ColorRange         string `json:"color_range,omitempty"`
+	ColorPrimaries     string `json:"color_primaries,omitempty"`
+	ColorSpace         string `json:"color_space,omitempty"`
+	ColorTransfer      string `json:"color_transfer,omitempty"`
+	BitDepth           int    `json:"bit_depth,omitempty"`
+	PixelFormat        string `json:"pixel_format,omitempty"`
+	ReferenceFrames    int    `json:"reference_frames,omitempty"`
+	// MultiplePPS records whether an H.264 stream redefines the same
+	// pic_parameter_set_id in-band with more than one distinct content. Such
+	// streams cannot be safely stream-copied into an avc1/fMP4 HLS segment:
+	// the avcC declares a single parameter set, so strict decoders
+	// (VideoToolbox on Safari/Chrome-macOS) desync on the mid-GOP switches.
+	//
+	// This is a runtime-only field: it is computed at playback start by a
+	// bitstream scan and held in memory, never serialized to the database
+	// (`json:"-"`). nil means "not analyzed in this process yet".
+	MultiplePPS *bool `json:"-"`
+	// VideoCopyUnsafe is set when conflicting PPS data is detected or when the
+	// safety scan cannot establish that video stream-copy is safe. It is
+	// runtime-only so transient scan failures are retried on a later request.
+	VideoCopyUnsafe bool `json:"-"`
 }
 
 // AudioTrack represents a probed audio stream stored as JSONB.
@@ -368,6 +518,15 @@ type MediaItem struct {
 	CreatedAt                    time.Time
 	UpdatedAt                    time.Time
 	AddedAt                      *time.Time // populated by browse queries (MIN(mil.first_seen_at))
+}
+
+// MediaItemAlias is a provider-confirmed searchable title for a media item.
+type MediaItemAlias struct {
+	ContentID string
+	Title     string
+	Language  string
+	Kind      string
+	Provider  string
 }
 
 // Season represents a row in the seasons table.

@@ -15,13 +15,21 @@ Join the community on [Discord](https://discord.gg/4RxuUQAEnW). If Silo is usefu
 
 ## Deploy with Docker (recommended)
 
-The easiest way to run Silo is with Docker Compose. The default stack assumes you do not already have PostgreSQL and Redis available, so it bundles PostgreSQL, Redis, FFmpeg, and the application for a one-command start.
+The easiest way to run Silo is with Docker Compose 2.24 or newer. The default stack assumes you do
+not already have PostgreSQL and Redis available, so it bundles PostgreSQL, Redis, FFmpeg, and the
+application for a one-command start.
 
 1. **Create a `.env` file**
 
    ```sh
    cp .env.example .env
+   printf '\nPOSTGRES_PASSWORD=%s\nSECRET_KEY=%s\n' \
+     "$(openssl rand -hex 24)" "$(openssl rand -base64 48)" >> .env
    ```
+
+   This replaces the development database password from `.env.example` and creates the key Silo
+   uses to encrypt stored credentials. Back up `.env` separately from PostgreSQL; losing
+   `SECRET_KEY` makes those credentials unrecoverable.
 
 2. **Set your media path**
 
@@ -42,6 +50,21 @@ The easiest way to run Silo is with Docker Compose. The default stack assumes yo
    This starts PostgreSQL, Redis, and the integrated Silo server. The app is available at `http://localhost:8090`. Jellyfin-compatible app support is disabled until an administrator enables it in onboarding or admin settings.
 
    If you already have PostgreSQL and Redis available, omit those bundled service examples from compose and point Silo at your existing `DATABASE_URL` and `REDIS_URL` instead.
+
+   ### Optional Intel/AMD VA-API or Intel Quick Sync
+
+   The default stack is CPU-only so it starts on hosts without `/dev/dri`. On a Linux host with
+   `/dev/dri`, enable the device overlay:
+
+   ```sh
+   docker compose -f docker-compose.yml -f docker-compose.vaapi.yml up -d
+   ```
+
+   To make that the default for this installation, set:
+
+   ```dotenv
+   COMPOSE_FILE=docker-compose.yml:docker-compose.vaapi.yml
+   ```
 
    ### Optional NVIDIA/NVENC
 
@@ -78,32 +101,55 @@ By default, data is stored under `/opt/silo`:
 
 - `/opt/silo/postgres`
 - `/opt/silo/redis`
+- `/opt/silo/plugins`
+- `/opt/silo/compat`
 - `/opt/silo/transcode`
 - `/opt/silo/catalog-seeds`
 
+The optional `search` profile also stores its index under `/opt/silo/meilisearch`.
+
 Media is mounted into the container at `/mnt/media` from the host path you set in `MEDIA_ROOT`.
 
-### Optional Profiles
+### Optional Search Profile
 
-The main compose file is integrated-first. These profiles exist for operators testing distributed mode or mirroring a split deployment shape. Most single-host installs should stay on the default integrated service, because it already includes proxying and transcoding.
+PostgreSQL full-text search works without any optional services. Meilisearch is available when you
+want its search provider:
 
 | Profile | Command | Description |
 |---|---|---|
 | default | `docker compose up -d` | Integrated server plus bundled PostgreSQL and Redis |
-| `proxy` | `docker compose --profile proxy up -d` | Start a standalone proxy service for distributed-mode testing |
-| `transcode` | `docker compose --profile transcode up -d` | Start a standalone transcode service for distributed-mode testing |
+| `search` | `docker compose --profile search up -d` | Add the optional Meilisearch service |
 
-You can enable both optional examples together:
+Before starting the `search` profile, set `MEILI_MASTER_KEY` in `.env` to the output of
+`openssl rand -hex 32`. After Silo starts, choose Meilisearch under **Admin > Settings > Search**,
+set the URL to `http://meilisearch:7700`, enter the same key as the API key, test the connection,
+and save. Restart Silo, then rebuild the catalog search index from the same page. Silo continues
+to use PostgreSQL full-text search until you select Meilisearch.
 
-```sh
-docker compose --profile proxy --profile transcode up -d
-```
+### Distributed Examples
 
-If you are splitting workers across multiple hosts, use the separate remote worker example instead of trying to stretch the main compose file across machines.
+The main Compose file includes commented proxy and transcode service examples. Most single-host
+installs should leave them commented because the integrated service already includes proxying and
+transcoding.
 
-### Advanced Remote Node Example
+Multi-host operators can use those examples as a starting point for a dedicated worker Compose
+file connected to the deployment's shared PostgreSQL and Redis services.
 
-For a dedicated remote transcode worker, use [docker-compose.remote-transcode.yml](docker-compose.remote-transcode.yml). That file is intended for a separate worker host that connects back to an existing Silo deployment using shared PostgreSQL and Redis.
+Proxy nodes serve source downloads from the same absolute media paths used by direct playback.
+Prepared-download work can also run on transcode nodes. Each selected transcode node retains its
+result on node-local storage and exposes it only through Silo's authenticated internal artifact API;
+the paired proxy relays those bytes, so no shared artifact mount is required. Dedicated transcode
+nodes default to retaining prepared downloads in a protected directory inside the transcode volume
+captured at process startup. `download.artifact_dir` overrides that location for both dedicated
+transcode nodes and the integrated/API-local fallback, so mount the configured path on every process
+that prepares downloads. Changing either artifact-path setting requires a restart. Downloads with a
+configured server-wide or per-user bandwidth limit remain API-local so those aggregate limits stay exact.
+Clients discover distributed delivery through `proxy_delivery` on the download capability response.
+When it is true, they may opt into `GET` or `HEAD /api/v1/downloads/{id}/file-proxy` and
+`/api/v1/direct-download-proxy`; those routes may return a temporary redirect to a proxy node. The
+established `/file` and `/direct-download` routes keep serving bytes directly with their existing
+status-code contract; for a node-local prepared artifact, the API itself performs the authenticated
+relay on that fallback route.
 
 ### Deployment Notes
 
@@ -116,7 +162,10 @@ helper and cutover guide in [docs/continuum-to-silo-docker-migration.md](docs/co
 
 ## Configuration
 
-Silo requires only a `DATABASE_URL` when running from source or against external infrastructure. In the default Docker Compose path, the stack wires the database and Redis URLs for you. All other settings — libraries, metadata providers, transcoding, users — are managed through the admin UI after first launch.
+Silo requires `DATABASE_URL` and `SECRET_KEY` when running from source or against external
+infrastructure. In the default Docker Compose path, the stack wires the database and Redis URLs
+for you. All other settings — libraries, metadata providers, transcoding, users — are managed
+through the admin UI after first launch.
 
 ### Server Modes
 
@@ -125,7 +174,7 @@ Silo requires only a `DATABASE_URL` when running from source or against external
 | `integrated` | Full server: API + frontend + scanner + transcode (default) |
 | `api` | API server only, no local transcoding |
 | `proxy` | Stream proxy node that connects to the shared deployment database and Redis |
-| `transcode` | HLS transcode worker node that connects to the shared deployment database and Redis |
+| `transcode` | HLS and prepared-download worker node that connects to the shared deployment database and Redis |
 
 ### PostgreSQL Auto-Tuning
 
@@ -183,23 +232,25 @@ move fully to a custom `postgresql.conf`.
 
 If you prefer running Silo without Docker:
 
-1. **Install prerequisites**: Go 1.24+, Bun 1.0+, PostgreSQL 18+, and FFmpeg.
+1. **Install prerequisites**: Go 1.26.4+, Node.js 22+, pnpm 10.32.1, PostgreSQL 18 with pgvector, Redis, and FFmpeg.
 
-2. **Start PostgreSQL and Redis** (skip if you already have them running)
+2. **Configure the source process**
+
+   ```sh
+   cp .env.example .env
+   printf '\nSECRET_KEY=%s\nDATABASE_URL=%s\nREDIS_URL=%s\n' \
+     "$(openssl rand -base64 48)" \
+     'postgres://silo:silo@localhost:5432/silo?sslmode=disable' \
+     'redis://localhost:6379' >> .env
+   ```
+
+   Change the URLs when you use existing services instead of the bundled development defaults.
+
+3. **Start PostgreSQL and Redis** (skip if you already have them running)
 
    ```sh
    docker compose up -d postgres redis
    ```
-
-   The main compose file still expects `MEDIA_ROOT` to be set even if you only want the bundled PostgreSQL and Redis services, so set that in `.env` first.
-
-3. **Configure the database connection**
-
-   ```sh
-   cp .env.example .env
-   ```
-
-   Edit `.env` and set `DATABASE_URL` to point to your PostgreSQL instance.
 
 4. **Build and run**
 
@@ -211,6 +262,10 @@ If you prefer running Silo without Docker:
    The server starts at `http://localhost:8080` by default. All other settings are configured through the admin UI.
 
 ## Reporting Issues
+
+Client implementers can use the [Canonical Settings API guide](docs/settings-api.md)
+for contract discovery, contextual headers, remote scopes, effective reads, and
+the admin projection.
 
 If you are reporting a bug, install problem, or performance issue, start with the admin workflow and reproduction steps, not Claude/Codex analysis.
 

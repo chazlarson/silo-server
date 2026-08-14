@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"golang.org/x/sync/singleflight"
 	"google.golang.org/protobuf/proto"
@@ -36,6 +37,7 @@ type pluginClient interface {
 	EventConsumer(capabilityID string) (*pluginhost.EventConsumerClient, error)
 	AuthProvider(capabilityID string) (*pluginhost.AuthProviderClient, error)
 	HTTPRoutes(capabilityID string) (*pluginhost.HTTPRoutesClient, error)
+	WatchSyncProvider(capabilityID string) (*pluginhost.WatchSyncProviderClient, error)
 }
 
 type Host interface {
@@ -58,6 +60,13 @@ type serviceInstallationStore interface {
 type serviceConfigStore interface {
 	ListGlobalConfigs(ctx context.Context, installationID int) ([]*RuntimeConfig, error)
 	PutGlobalConfig(ctx context.Context, installationID int, key string, value map[string]any) error
+	CompareAndSwapGlobalConfig(
+		ctx context.Context,
+		installationID int,
+		key string,
+		value map[string]any,
+		expectedUpdatedAt *time.Time,
+	) (bool, error)
 }
 
 type Service struct {
@@ -96,7 +105,7 @@ type Service struct {
 func (s *Service) SetEventDispatcher(d *EventDispatcher) { s.dispatcher = d }
 
 // AddLifecycleHook registers a callback invoked after plugin install, enable,
-// disable, uninstall, or preload lifecycle changes.
+// disable, uninstall, preload, or runtime-configuration changes.
 func (s *Service) AddLifecycleHook(hook func(context.Context)) {
 	if s == nil || hook == nil {
 		return
@@ -462,6 +471,12 @@ func (s *Service) PreloadEnabled(ctx context.Context) error {
 		if installation == nil {
 			continue
 		}
+		// Builtin installations have no archive or binary; skip them explicitly
+		// instead of leaning on the tolerated ErrArchiveNotFound branch below
+		// (any other load error here is fatal to startup).
+		if installation.IsBuiltin() {
+			continue
+		}
 		if _, err := s.ensureLoadedInstallation(ctx, installation); err != nil {
 			if errors.Is(err, ErrArchiveNotFound) {
 				slog.WarnContext(ctx,
@@ -632,6 +647,18 @@ func (s *Service) ScanSourceClientByPluginID(
 		return nil, fmt.Errorf("scan source plugin %q is disabled", pluginID)
 	}
 	return s.ScanSourceClient(ctx, matches[0].ID, capabilityID)
+}
+
+func (s *Service) WatchSyncProviderClient(
+	ctx context.Context,
+	installationID int,
+	capabilityID string,
+) (*pluginhost.WatchSyncProviderClient, error) {
+	client, err := s.ensureClient(ctx, installationID)
+	if err != nil {
+		return nil, err
+	}
+	return client.WatchSyncProvider(capabilityID)
 }
 
 func (s *Service) EventConsumerClient(
@@ -806,6 +833,15 @@ func (s *Service) loadInstallation(ctx context.Context, installationID int, requ
 	if requireEnabled && !installation.Enabled {
 		return nil, ErrInstallationDisabled
 	}
+	// requireEnabled marks paths that intend to launch or serve the plugin
+	// (start, manifest routes/assets, gRPC clients, HTTP proxy). The reserved
+	// builtin row has no binary behind it and must never reach those paths;
+	// not-found gives the proxy and API a clean 4xx. Reads with
+	// requireEnabled=false (IsInstallationEnabled for the metadata chain,
+	// generic listings) still see the row.
+	if requireEnabled && installation.IsBuiltin() {
+		return nil, ErrInstallationNotFound
+	}
 	return installation, nil
 }
 
@@ -867,6 +903,17 @@ func (s *Service) IsInstallationEnabled(ctx context.Context, installationID int)
 		return false, err
 	}
 	return installation.Enabled, nil
+}
+
+// InstallationKind returns the installation's kind ("plugin" or "builtin") from
+// the same in-memory cache IsInstallationEnabled reads, so metadata chain
+// resolution can identify builtin rows without a per-capability DB query.
+func (s *Service) InstallationKind(ctx context.Context, installationID int) (string, error) {
+	installation, err := s.loadInstallation(ctx, installationID, false)
+	if err != nil {
+		return "", err
+	}
+	return installation.Kind, nil
 }
 
 func (s *Service) ensureLoadedInstallation(

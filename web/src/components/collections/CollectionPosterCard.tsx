@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useImageLoaded } from "@/hooks/useImageLoaded";
 import { Pin, PinOff, User } from "lucide-react";
 import type { LibraryTabCollection } from "@/api/types";
 import { useToggleSidebarPin } from "@/hooks/queries/sidebarPins";
@@ -7,13 +7,11 @@ import {
   buildLibraryCollectionCatalogHref,
   buildUserCollectionCatalogHref,
 } from "@/pages/catalogSearchParams";
+import { useUICustomization } from "@/hooks/useUICustomization";
 
 // Shared poster card for both the per-library Collections tab and the
 // aggregated "Server collections" section on the home Collections tab. Library
 // (admin) collections get a sidebar-pin affordance; user collections do not.
-export const COLLECTION_POSTER_GRID_CLASSES =
-  "grid grid-cols-3 sm:grid-cols-4 md:grid-cols-5 lg:grid-cols-7 xl:grid-cols-8 gap-3";
-
 export function CollectionPosterCard({
   collection,
   kind,
@@ -23,15 +21,16 @@ export function CollectionPosterCard({
   kind: "regular" | "user_collections";
   libraryId: number;
 }) {
-  const [loaded, setLoaded] = useState(false);
+  const { loaded, onLoad } = useImageLoaded(collection.poster_url);
   const navigate = useViewTransitionNavigate();
-  const { togglePin, isPinned } = useToggleSidebarPin();
+  const { togglePin, isPinned, canToggle } = useToggleSidebarPin();
   const pinned = isPinned(libraryId, "collection", collection.id);
+  const { cardPresentation } = useUICustomization();
 
   const isUserCollection = kind === "user_collections";
   const href = isUserCollection
     ? buildUserCollectionCatalogHref(collection.id, collection.title)
-    : buildLibraryCollectionCatalogHref(collection.id, collection.title);
+    : buildLibraryCollectionCatalogHref(collection.id, collection.title, libraryId);
 
   return (
     <div className="group/card relative w-full text-left">
@@ -45,7 +44,7 @@ export function CollectionPosterCard({
                 loaded ? "opacity-100" : "opacity-0"
               }`}
               loading="lazy"
-              onLoad={() => setLoaded(true)}
+              onLoad={onLoad}
             />
           ) : (
             <div className="text-muted-foreground flex h-full w-full flex-col items-center justify-center gap-1 p-3 text-center text-sm">
@@ -57,13 +56,17 @@ export function CollectionPosterCard({
             {collection.item_count}
           </span>
         </div>
-        <div className="px-0.5 pt-2.5">
-          <div className="truncate text-[13px] font-semibold">{collection.title}</div>
-          {isUserCollection && <div className="text-muted-foreground text-xs">User collection</div>}
-        </div>
+        {cardPresentation.caption !== "artwork" ? (
+          <div className="px-0.5 pt-2.5">
+            <div className="truncate text-[13px] font-semibold">{collection.title}</div>
+            {cardPresentation.caption === "title_metadata" && isUserCollection ? (
+              <div className="text-muted-foreground text-xs">User collection</div>
+            ) : null}
+          </div>
+        ) : null}
       </button>
       {/* Pin to sidebar button — only for library collections */}
-      {!isUserCollection && (
+      {!isUserCollection && canToggle && (
         <button
           type="button"
           onClick={(e) => {

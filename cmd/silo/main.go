@@ -19,6 +19,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -50,6 +51,7 @@ import (
 	"github.com/Silo-Server/silo-server/internal/clientip"
 	"github.com/Silo-Server/silo-server/internal/config"
 	"github.com/Silo-Server/silo-server/internal/database"
+	"github.com/Silo-Server/silo-server/internal/diagnostics"
 	"github.com/Silo-Server/silo-server/internal/downloads"
 	"github.com/Silo-Server/silo-server/internal/ebooks"
 	evt "github.com/Silo-Server/silo-server/internal/events"
@@ -67,6 +69,11 @@ import (
 	"github.com/Silo-Server/silo-server/internal/markers"
 	"github.com/Silo-Server/silo-server/internal/mdblist"
 	"github.com/Silo-Server/silo-server/internal/metadata"
+
+	// Built-in metadata providers self-register into the metadata package's
+	// builtin registry on import; buildProviders resolves their seeded chain
+	// entries in-process (no gRPC).
+	_ "github.com/Silo-Server/silo-server/internal/metadata/nfo"
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/nodeconfig"
 	"github.com/Silo-Server/silo-server/internal/nodepool"
@@ -89,6 +96,7 @@ import (
 	"github.com/Silo-Server/silo-server/internal/secret"
 	"github.com/Silo-Server/silo-server/internal/sections"
 	"github.com/Silo-Server/silo-server/internal/server"
+	"github.com/Silo-Server/silo-server/internal/settingscontract"
 	"github.com/Silo-Server/silo-server/internal/subtitles"
 	"github.com/Silo-Server/silo-server/internal/taskmanager"
 	taskrepository "github.com/Silo-Server/silo-server/internal/taskmanager/repository"
@@ -188,6 +196,9 @@ func configureOperationalLogging(
 ) (opslog.Writer, *opslog.Repo, *partman.Manager) {
 	if err := opslog.SeedDefaults(ctx, settingsRepo); err != nil {
 		log.Fatalf("seed opslog defaults: %v", err)
+	}
+	if err := diagnostics.SeedDefaults(ctx, settingsRepo); err != nil {
+		log.Fatalf("seed diagnostics defaults: %v", err)
 	}
 	opsPM := partman.NewManager(pool, "operational_logs", partman.Daily, 3)
 	if err := opsPM.EnsureFuturePartitions(ctx); err != nil {
@@ -298,6 +309,16 @@ func maybeApplyPostgresTuning(ctx context.Context, pool *pgxpool.Pool, appMaxCon
 // still reads via the read-path pass-through, so a backfill error must never
 // block boot. The sensitive-settings pass runs first so the arr
 // resolve-then-encrypt pass sees consistent referenced settings.
+// librarySettingsCleaner wires the per-user canonical settings cleanup the
+// library delete job runs, or nil when the user store is unavailable — the
+// executor treats a nil cleaner as "skip".
+func librarySettingsCleaner(pool *pgxpool.Pool, stores userstore.UserStoreProvider) adminjob.LibrarySettingsCleaner {
+	if pool == nil || stores == nil {
+		return nil
+	}
+	return userstore.NewSettingValuesCleaner(auth.NewUserRepository(pool), stores)
+}
+
 func runCredentialBackfills(ctx context.Context, pool *pgxpool.Pool, cipher *secret.Cipher, settings *catalog.EncryptedSettingsRepo) {
 	settingsN, err := settings.BackfillSensitiveSettings(ctx)
 	if err != nil {
@@ -318,9 +339,14 @@ func runCredentialBackfills(ctx context.Context, pool *pgxpool.Pool, cipher *sec
 	if err != nil {
 		slog.ErrorContext(ctx, "secret backfill: arr api keys", "component", "app", "error", err)
 	}
-	if total := settingsN + columnsN + historyServersN + arrN; total > 0 {
+	pluginConfigsN, err := plugins.NewRuntimeConfigStore(pool, cipher).BackfillEncryptedConfigs(ctx)
+	if err != nil {
+		slog.ErrorContext(ctx, "secret backfill: plugin runtime configs", "component", "app", "error", err)
+	}
+	if total := settingsN + columnsN + historyServersN + arrN + pluginConfigsN; total > 0 {
 		slog.InfoContext(ctx, "secret backfill: encrypted plaintext credentials at rest", "component", "app",
-			"settings", settingsN, "columns", columnsN, "history_session_servers", historyServersN, "arr_keys", arrN, "total", total)
+			"settings", settingsN, "columns", columnsN, "history_session_servers", historyServersN,
+			"arr_keys", arrN, "plugin_configs", pluginConfigsN, "total", total)
 	}
 }
 
@@ -377,9 +403,29 @@ func main() {
 	envFile := flag.String("env", ".env", "path to .env bootstrap file")
 	migrateOnly := flag.Bool("migrate-only", false, "apply database migrations and exit")
 	migrateStatus := flag.Bool("migrate-status", false, "show database migration status and exit")
+	migrateDownTo := flag.Int64("migrate-down-to", -1,
+		"roll back every migration newer than this version and exit (the version to KEEP)")
 	flag.Parse()
 
 	ctx := context.Background()
+
+	// Step 0: Validate the embedded settings contract before anything can
+	// depend on it. A malformed or self-inconsistent manifest is a build defect,
+	// not a runtime condition, so failing here — loudly, before the first
+	// request — is the whole point: the alternative is shipping an image whose
+	// contract disagrees with the clients that vendored it.
+	contract, err := settingscontract.Load()
+	if err != nil {
+		log.Fatalf("settings contract: %v", err)
+	}
+	contractETag, err := settingscontract.ETag()
+	if err != nil {
+		log.Fatalf("settings contract: %v", err)
+	}
+	slog.Info("settings contract loaded",
+		"revision", contract.Revision,
+		"definitions", len(contract.Definitions),
+		"etag", contractETag)
 
 	// Step 1: Bootstrap from .env
 	bc, err := config.LoadBootstrap(*envFile)
@@ -427,6 +473,21 @@ func main() {
 			}
 			fmt.Printf("%-8s %8d %-25s %s\n", status.State, status.Version, appliedAt, source)
 		}
+		return
+	}
+
+	if *migrateDownTo >= 0 {
+		// Deliberately its own flag rather than a mode of --migrate-only: this
+		// discards data, and several of the migrations it reverses are Go ones
+		// the goose CLI cannot reach, so it is the only way to undo them
+		// short of restoring a backup.
+		migCtx, migCancel := database.MigrationContext(ctx)
+		migErr := database.MigrateDownTo(migCtx, pool, migrations.FS, "sql", *migrateDownTo)
+		migCancel()
+		if migErr != nil {
+			log.Fatalf("failed to roll back migrations: %v", migErr)
+		}
+		slog.Info("database migrations rolled back", "kept_through_version", *migrateDownTo)
 		return
 	}
 
@@ -657,14 +718,27 @@ func main() {
 		var handler http.Handler
 		if mode == "proxy" {
 			srv := proxy.NewServer(watcher, tracker)
+			srv.SetRemoteArtifactMissReporter(downloads.NewArtifactManager(
+				downloads.NewArtifactRepository(pool),
+				downloads.NewRepository(pool),
+				nil,
+				downloads.NewPlaybackPreparer(),
+				nodeID,
+				watcher.Config,
+				nil,
+			))
 			handler = srv.Handler()
 		} else {
 			srv := transcodenode.NewServer(watcher, tracker)
+			srv.SetInputPathAuthorizer(transcodenode.NewMediaRootAuthorizer(catalog.NewFolderRepository(pool)))
 			srv.SetFFmpegLogSink(playback.NewSlogFFmpegLogSink(slog.Default(), nodeID))
 			// Read jellycompat reconstruction recipes central wrote at transcode
 			// start, so this node can rebuild a Jellyfin transcode after its own
 			// restart (the node hop token is recipe-less). Shares the offload Redis.
 			srv.SetRecipeStore(noderecipe.NewStore(redisClient, 0))
+			// Reclaim orphaned transcode dirs at boot and hourly thereafter, bound
+			// to appCtx so it stops on shutdown.
+			srv.StartOrphanSweeper(appCtx)
 			handler = srv.Handler()
 		}
 
@@ -709,6 +783,14 @@ func main() {
 		bootstrapSensitiveConfigured["redis.url"] = true
 		bootstrapSensitiveValues["redis.url"] = bc.RedisURL
 	}
+	if rawTrustedProxies := strings.TrimSpace(os.Getenv(clientip.EnvTrustedProxies)); rawTrustedProxies != "" {
+		normalizedTrustedProxies, normalizeErr := clientip.NormalizeCIDRList(rawTrustedProxies)
+		if normalizeErr != nil {
+			log.Fatalf("invalid %s: %v", clientip.EnvTrustedProxies, normalizeErr)
+		}
+		bootstrapSensitiveConfigured[clientip.SettingTrustedProxies] = true
+		bootstrapSensitiveValues[clientip.SettingTrustedProxies] = normalizedTrustedProxies
+	}
 
 	// Shared Redis client for components needing raw Redis beyond the event
 	// bus (websocket handshake tickets, session listing). Nil on Redis-less
@@ -724,6 +806,9 @@ func main() {
 	// OnServerSettingUpdated closure, which only runs on admin requests after
 	// startup completes.
 	var ipResolver *clientip.Resolver
+	normalizedBootstrapRedisURL, bootstrapRedisURLErr := config.NormalizeRedisURL(bc.RedisURL)
+	redisBootstrapAvailable := (normalizedBootstrapRedisURL != "" && bootstrapRedisURLErr == nil) ||
+		(strings.TrimSpace(cfg.Redis.SentinelMaster) != "" && len(cfg.Redis.SentinelAddresses) > 0)
 
 	deps := api.Dependencies{
 		Config:                       cfg,
@@ -731,6 +816,7 @@ func main() {
 		OnConfigChange:               configWatcher.OnChange,
 		BootstrapSensitiveConfigured: bootstrapSensitiveConfigured,
 		BootstrapSensitiveValues:     bootstrapSensitiveValues,
+		RedisBootstrapAvailable:      redisBootstrapAvailable,
 		AppContext:                   appCtx,
 		DB:                           pool,
 		SecretCipher:                 dataCipher,
@@ -818,8 +904,10 @@ func main() {
 		)
 	}
 	var watchProviderService *watchsync.Service
+	var watchProviderRegistry *watchsync.Registry
+	var watchProviderRepo *watchsync.PostgresRepository
 	if deps.DB != nil {
-		watchProviderRegistry := watchsync.NewRegistry()
+		watchProviderRegistry = watchsync.NewRegistry()
 		if err := watchProviderRegistry.Register(trakt.NewProvider(nil, "")); err != nil {
 			log.Fatalf("register watch provider: %v", err)
 		}
@@ -829,10 +917,8 @@ func main() {
 		if err := watchProviderRegistry.Register(watchmdblist.NewProvider(nil, "")); err != nil {
 			log.Fatalf("register watch provider: %v", err)
 		}
-		watchProviderService = watchsync.NewService(
-			watchsync.NewPostgresRepository(deps.DB, deps.SecretCipher),
-			watchProviderRegistry,
-		)
+		watchProviderRepo = watchsync.NewPostgresRepository(deps.DB, deps.SecretCipher)
+		watchProviderService = watchsync.NewService(watchProviderRepo, watchProviderRegistry)
 		deps.WatchProviderService = watchProviderService
 	}
 
@@ -844,8 +930,14 @@ func main() {
 		proxyPool := nodepool.NewProxyPool()
 		transcodePool := nodepool.NewTranscodePool()
 
-		proxyNodes, _ := nodeRepo.ListEnabled(context.Background(), nodepool.NodeTypeProxy)
-		transcodeNodes, _ := nodeRepo.ListEnabled(context.Background(), nodepool.NodeTypeTranscode)
+		proxyNodes, err := nodeRepo.ListEnabled(appCtx, nodepool.NodeTypeProxy)
+		if err != nil {
+			log.Fatalf("load enabled proxy nodes: %v", err)
+		}
+		transcodeNodes, err := nodeRepo.ListEnabled(appCtx, nodepool.NodeTypeTranscode)
+		if err != nil {
+			log.Fatalf("load enabled transcode nodes: %v", err)
+		}
 		proxyPool.SetNodes(proxyNodes)
 		transcodePool.SetNodes(transcodeNodes)
 
@@ -898,8 +990,9 @@ func main() {
 			s.SetWorkers(updated.Scanner.Workers)
 		})
 		s.SetLiteraryWorkLinker(literaryWorkService)
+		s.SetEbookEnrichmentQueue(ebooks.NewEnrichmentQueue(deps.DB))
 		deps.Scanner = s
-		deps.ProbeEnsurer = scanner.NewPlaybackProbeEnsurer(fileRepo, ffprobePath, 10*time.Second)
+		deps.ProbeEnsurer = scanner.NewPlaybackProbeEnsurer(fileRepo, ffprobePath, cfg.Playback.FFmpegPath, 10*time.Second)
 		slog.Info("scanner initialized")
 	}
 
@@ -935,7 +1028,7 @@ func main() {
 		pluginCacheDir := resolvePluginCacheDir()
 		repositoryStore := plugins.NewRepositoryStore(deps.DB)
 		installationStore := plugins.NewInstallationStore(deps.DB)
-		runtimeConfigStore := plugins.NewRuntimeConfigStore(deps.DB)
+		runtimeConfigStore := plugins.NewRuntimeConfigStore(deps.DB, deps.SecretCipher)
 		catalogService := plugins.NewCatalogService(repositoryStore, plugins.CatalogServiceOptions{
 			SiloAPIVersion: plugins.DefaultSiloAPIVersion,
 		})
@@ -996,6 +1089,11 @@ func main() {
 					}
 					out := make([]pluginhost.InstalledPluginRecord, 0, len(installations))
 					for _, installation := range installations {
+						// The reserved builtin row is not a plugin; keep it out
+						// of the host's installed-plugin listing.
+						if installation.IsBuiltin() {
+							continue
+						}
 						capabilities, err := installationStore.ListCapabilities(ctx, installation.ID)
 						if err != nil {
 							return nil, err
@@ -1038,6 +1136,15 @@ func main() {
 			installer,
 			plugins.NewHostAdapter(pluginHost),
 		)
+		if watchProviderRegistry != nil {
+			reloadWatchProviders := func(ctx context.Context) {
+				if err := reloadWatchSyncPluginProviders(ctx, watchProviderRegistry, installationStore, pluginService, watchProviderRepo); err != nil {
+					slog.WarnContext(ctx, "failed to reload watch sync plugin providers", "component", "app", "error", err)
+				}
+			}
+			pluginService.AddLifecycleHook(reloadWatchProviders)
+			reloadWatchProviders(appCtx)
+		}
 		if deps.MarkerRegistry != nil && deps.MarkerProviderConfig != nil {
 			markerPluginResolver := markers.NewPluginResolverAdapter(pluginService)
 			pluginService.AddLifecycleHook(func(ctx context.Context) {
@@ -1145,6 +1252,17 @@ func main() {
 	var mangaEnricher *manga.Enricher
 	if needsWorkers && deps.DB != nil && deps.FileRepo != nil {
 		chainRepo := metadata.NewChainRepository(deps.DB)
+		// Make every existing library chain aware of the built-in providers
+		// before serving: materialize legacy content_level='' chains per level,
+		// then append registered builtins disabled (idempotent; also the repair
+		// path after a stale chain-editor save drops a builtin row). Runs before
+		// the metadata service exists, so no chain cache to invalidate here.
+		syncCtx, syncCancel := context.WithTimeout(appCtx, 30*time.Second)
+		syncErr := metadata.SyncBuiltinProviderChains(syncCtx, chainRepo)
+		syncCancel()
+		if syncErr != nil {
+			log.Fatalf("sync builtin provider chains: %v", syncErr)
+		}
 		skippedRootRepo = metadata.NewSkippedRootRepository(deps.DB)
 		itemRepo = catalog.NewItemRepository(deps.DB).WithActiveSearchProvider(activeCatalogSearchProvider)
 		episodeRepo = catalog.NewEpisodeRepository(deps.DB)
@@ -1182,6 +1300,35 @@ func main() {
 		deps.MovieMatchQueueRepo = movieQueueRepo
 		deps.SeriesRootMatchQueueRepo = seriesQueueRepo
 		matchQueueCoordinator = metadata.NewMatchQueueCoordinator(movieQueueRepo, seriesQueueRepo)
+		backgroundInit = append(backgroundInit, func(ctx context.Context) {
+			if err := matchQueueCoordinator.WakeForChangedInputs(ctx); err != nil {
+				slog.WarnContext(ctx, "refresh metadata match queue inputs at startup failed", "component", "app", "error", err)
+			}
+		})
+		if pluginService != nil {
+			matchInputChanged := make(chan struct{}, 1)
+			go func() {
+				for {
+					select {
+					case <-appCtx.Done():
+						return
+					case <-matchInputChanged:
+						if err := matchQueueCoordinator.WakeForChangedInputs(appCtx); err != nil {
+							slog.WarnContext(appCtx, "wake metadata matches after plugin lifecycle change failed", "component", "app", "error", err)
+						}
+					}
+				}
+			}()
+			pluginService.AddLifecycleHook(func(context.Context) {
+				// Queue fingerprint reconciliation may touch thousands of parked
+				// rows. Coalesce lifecycle bursts and keep plugin admin requests
+				// independent of that background database work.
+				select {
+				case matchInputChanged <- struct{}{}:
+				default:
+				}
+			})
+		}
 		rootClaimRepo = catalog.NewRootClaimRepository(deps.DB)
 		groupClaimRepo = catalog.NewGroupClaimRepository(deps.DB)
 		pluginResolver := metadata.NewPluginResolverAdapter(pluginService)
@@ -1252,6 +1399,7 @@ func main() {
 		// admin image applies can succeed even if automatic metadata caching is off.
 		if deps.S3Public != nil {
 			imageCacher := imagecache.New(deps.S3Public)
+			imageCacher.SetArtworkRevisionTracker(catalog.NewArtworkRevisionTracker(deps.DB))
 			metadataService.SetImageCacher(imageCacher)
 			imageCacheJobs := metadata.NewImageCacheJobRepository(deps.DB)
 			metadataService.SetImageCacheJobEnqueuer(imageCacheJobs)
@@ -1268,6 +1416,11 @@ func main() {
 					People:              personRepo,
 				},
 			)
+			// Local file:// artwork (NFO sidecars): confine reads to the owning
+			// library's roots and sweep stale hashed local/ prefixes on re-cache.
+			// The processor host must mount the libraries, like the metadata worker.
+			metadataImageCacheProcessor.SetLibraryRootResolver(deps.FolderRepo)
+			metadataImageCacheProcessor.SetImagePrefixDeleter(deps.S3Public)
 			metadataService.SetAutoCacheImages(cfg.Metadata.CacheImages)
 			metadataImageCacheProcessor.SetEnabled(cfg.Metadata.CacheImages)
 			configWatcher.OnChange(func(_, updated *config.Config) {
@@ -1550,6 +1703,7 @@ func main() {
 
 	// Step 6: Create playback session manager and wire into dependencies.
 	sessionMgr := playback.NewSessionManager(6, 2) // defaults from plan: max_streams=6, max_transcodes=2
+	var compatTerminalRecoveryReady <-chan struct{}
 	if userStoreProvider != nil {
 		deps.UserStoreProvider = userStoreProvider
 	}
@@ -1561,6 +1715,13 @@ func main() {
 			WithWatchState(watchstate.NewService(userStoreProvider).WithStableIdentityResolver(historyIdentity)).
 			WithUserStoreProvider(userStoreProvider)
 		backgroundInit = append(backgroundInit, func(ctx context.Context) {
+			if compatTerminalRecoveryReady != nil {
+				select {
+				case <-compatTerminalRecoveryReady:
+				case <-ctx.Done():
+					return
+				}
+			}
 			if err := watchProviderService.SweepOpenScrobbles(ctx); err != nil {
 				slog.WarnContext(ctx, "failed to sweep open watch provider scrobbles", "component", "app", "error", err)
 			}
@@ -1879,6 +2040,12 @@ func main() {
 			taskMgr.Register(tasks.NewScanLibrariesTask(deps.FolderRepo, deps.LibraryScanQueue, deps.EventBus))
 		}
 		taskMgr.Register(tasks.NewCleanupOrphanedMediaItemsTask(catalog.NewOrphanedProvisionalCleaner(deps.DB)))
+		taskMgr.Register(tasks.NewBackfillMediaItemAliasesTask(catalog.NewItemAliasRepository(deps.DB)))
+		if deps.S3Public != nil {
+			taskMgr.Register(tasks.NewCleanupArtworkRevisionsTask(
+				metadata.NewArtworkRevisionGarbageCollector(deps.DB, deps.S3Public),
+			))
+		}
 		catalogSearchIndexer := catalog.NewCatalogSearchIndexer(deps.DB, settingsRepo)
 		taskMgr.Register(tasks.NewSyncCatalogSearchIndexTask(catalogSearchIndexer))
 		taskMgr.Register(tasks.NewRebuildCatalogSearchIndexTask(catalogSearchIndexer))
@@ -1895,25 +2062,43 @@ func main() {
 		}
 		taskMgr.Register(tasks.NewActivityLogCleanupTask(deps.DB, settingsRepo, activityPM))
 		taskMgr.Register(tasks.NewOperationalLogCleanupTask(deps.DB, settingsRepo, opsPM))
+		var diagnosticsStore diagnostics.ObjectStore
+		if deps.S3Private != nil {
+			diagnosticsStore = diagnostics.NewS3ObjectStore(deps.S3Private)
+		}
+		taskMgr.Register(tasks.NewClientDiagnosticsCleanupTask(
+			diagnostics.NewPostgresRepository(deps.DB),
+			settingsRepo,
+			diagnosticsStore,
+		))
 		taskMgr.Register(tasks.NewPolicyDecisionLogCleanupTask(deps.DB, settingsRepo, policyPM))
 		if deps.FileRepo != nil {
 			// Download prepare-to-file pipeline (Phase 3): a durable, leased encode
 			// queue hosted on the task manager. Built here (before Start) and shared
 			// with the API via deps so the download service can enqueue jobs.
+			liveDownloadConfig := func() *config.Config {
+				if deps.LiveConfig != nil {
+					if c := deps.LiveConfig(); c != nil {
+						return c
+					}
+				}
+				return deps.Config
+			}
+			var downloadWorkPlanner nodepool.TranscodeWorkPlanner
+			if deps.NodePlanner != nil {
+				downloadWorkPlanner = deps.NodePlanner
+			}
+			preparer := downloads.NewNodeAwarePreparer(downloads.NewPlaybackPreparer(), downloadWorkPlanner, liveDownloadConfig)
+			if deps.NodeRepo != nil {
+				preparer.SetOriginLookup(deps.NodeRepo)
+			}
 			artifactMgr := downloads.NewArtifactManager(
 				downloads.NewArtifactRepository(deps.DB),
 				downloads.NewRepository(deps.DB),
 				deps.FileRepo,
-				downloads.NewPlaybackPreparer(),
+				preparer,
 				deps.NodeID,
-				func() *config.Config {
-					if deps.LiveConfig != nil {
-						if c := deps.LiveConfig(); c != nil {
-							return c
-						}
-					}
-					return deps.Config
-				},
+				liveDownloadConfig,
 				func(ctx context.Context, d *downloads.Download) {
 					if deps.EventsHub == nil {
 						return
@@ -1935,6 +2120,11 @@ func main() {
 			taskMgr.Register(tasks.NewSeedContentAvailabilityTask(notificationSystem))
 			taskMgr.Register(tasks.NewRebuildReleaseInterestTask(notificationSystem))
 			taskMgr.Register(tasks.NewNotificationsRetentionTask(notificationSystem))
+		}
+		if userStoreProvider != nil {
+			taskMgr.Register(tasks.NewSettingMutationsRetentionTask(userstore.NewSettingMutationSweeper(
+				auth.NewUserRepository(deps.DB), userStoreProvider,
+			)))
 		}
 		if matchWorker != nil {
 			taskMgr.Register(tasks.NewMatchMediaTask(matchWorker))
@@ -2046,6 +2236,7 @@ func main() {
 		}
 		if ebookEnricher != nil {
 			taskMgr.Register(tasks.NewSyncEbookMetadataTask(ebookEnricher))
+			taskMgr.Register(tasks.NewBackfillEbookMetadataTask(ebookEnricher))
 		}
 		if mangaEnricher != nil {
 			taskMgr.Register(tasks.NewSyncMangaMetadataTask(mangaEnricher))
@@ -2321,7 +2512,8 @@ func main() {
 			deps.S3Private,
 			itemRefreshExecutor,
 			libraryRefreshExecutor,
-			adminjob.NewLibraryDeleteExecutor(deps.FolderRepo, sectionRepo),
+			adminjob.NewLibraryDeleteExecutor(deps.FolderRepo, sectionRepo,
+				librarySettingsCleaner(deps.DB, userStoreProvider)),
 			adminjob.NewImageCacheCleanupExecutor(deps.S3Public),
 			templateBundleApplyExecutor,
 			deps.RealtimeHub,
@@ -2359,6 +2551,7 @@ func main() {
 	if (mode == "integrated" || mode == "api") && cfg.JellyfinCompat.Enabled && cfg.JellyfinCompat.Listen != "" {
 		compatDeps := jellycompat.Dependencies{
 			Config:           cfg,
+			AppContext:       appCtx,
 			LiveConfig:       configWatcher.Config,
 			DB:               deps.DB,
 			SecretCipher:     dataCipher,
@@ -2402,6 +2595,7 @@ func main() {
 			compatDeps.SeasonRepo = seasonRepo
 			compatDeps.EpisodeRepo = episodeRepo
 			compatDeps.ProviderIDRepo = providerIDRepo
+			compatDeps.StableIdentityResolver = watchstate.NewStableIdentityResolver(itemRepo, episodeRepo, providerIDRepo)
 			compatDeps.DetailSvc = detailSvc
 			compatDeps.FolderRepo = folderRepo
 			compatDeps.SessionMgr = sessionMgr
@@ -2409,6 +2603,9 @@ func main() {
 			compatDeps.WatchCompletionObserver = deps.WatchCompletionObserver
 			compatDeps.SettingsRepo = settingsRepo
 			compatDeps.PersonRepo = personRepo
+			if watchProviderService != nil {
+				compatDeps.WatchScrobbler = watchProviderService
+			}
 			compatSearchService := catalog.NewCatalogSearchService(
 				appCtx,
 				settingsRepo,
@@ -2488,7 +2685,7 @@ func main() {
 
 		compat := jellycompat.NewServerWithDependencies(compatDeps)
 		compatServer = compat
-		compat.StartBackgroundTasks(context.Background())
+		compatTerminalRecoveryReady = compat.StartBackgroundTasks(context.Background())
 		compatSrv = compat.HTTPServer()
 		compatSrv.ReadTimeout = 30 * time.Second
 		compatSrv.WriteTimeout = 0
@@ -2784,6 +2981,12 @@ func reloadPluginImageResolvers(
 		if installation == nil {
 			continue
 		}
+		// Builtin installations resolve in-process metadata providers only;
+		// registering them here would claim their capability id as a gRPC
+		// image-resolver scheme with no binary behind it.
+		if installation.IsBuiltin() {
+			continue
+		}
 		capabilities, err := store.ListCapabilities(ctx, installation.ID)
 		if err != nil {
 			return fmt.Errorf("list image resolver capabilities for installation %d: %w", installation.ID, err)
@@ -2920,9 +3123,97 @@ func metadataInt(value any) int {
 	}
 }
 
+var watchSyncPluginReloadMu sync.Mutex
+
 type markerPluginCapabilityStore interface {
 	ListEnabled(ctx context.Context) ([]*plugins.Installation, error)
 	ListCapabilities(ctx context.Context, installationID int) ([]*plugins.Capability, error)
+}
+
+func reloadWatchSyncPluginProviders(
+	ctx context.Context,
+	registry *watchsync.Registry,
+	store markerPluginCapabilityStore,
+	service *plugins.Service,
+	repository watchsync.PluginCredentialRepository,
+) error {
+	if registry == nil {
+		return nil
+	}
+	watchSyncPluginReloadMu.Lock()
+	defer watchSyncPluginReloadMu.Unlock()
+
+	var providers []watchsync.Provider
+	if store == nil || service == nil {
+		return registry.ReplacePluginProviders(providers)
+	}
+	installations, err := store.ListEnabled(ctx)
+	if err != nil {
+		return fmt.Errorf("list enabled watch sync plugin installations: %w", err)
+	}
+	sort.Slice(installations, func(i, j int) bool {
+		if installations[i] == nil {
+			return false
+		}
+		if installations[j] == nil {
+			return true
+		}
+		return installations[i].ID < installations[j].ID
+	})
+	for _, installation := range installations {
+		if installation == nil || installation.IsBuiltin() {
+			continue
+		}
+		capabilities, err := store.ListCapabilities(ctx, installation.ID)
+		if err != nil {
+			slog.WarnContext(ctx, "skip watch sync plugin with unreadable capabilities",
+				"component", "app",
+				"installation_id", installation.ID,
+				"error", err,
+			)
+			continue
+		}
+		for _, capability := range capabilities {
+			if capability == nil || capability.Type != sdkcapability.WatchSyncProvider {
+				continue
+			}
+			descriptor, err := plugins.DecodeCapability(capability)
+			if err != nil {
+				slog.WarnContext(ctx, "skip invalid watch sync plugin capability",
+					"component", "app",
+					"installation_id", installation.ID,
+					"capability_id", capability.ID,
+					"error", err,
+				)
+				continue
+			}
+			provider, err := watchsync.NewPluginProvider(watchsync.PluginProviderOptions{
+				InstallationID: installation.ID,
+				ProviderKey:    fmt.Sprintf("plugin:%d:%s", installation.ID, capability.ID),
+				CapabilityID:   capability.ID,
+				DisplayName:    descriptor.GetDisplayName(),
+				Descriptor:     descriptor.GetWatchSyncProvider(),
+				ResolveClient: func(callCtx context.Context, installationID int, capabilityID string) (watchsync.WatchSyncPluginClient, error) {
+					return service.WatchSyncProviderClient(callCtx, installationID, capabilityID)
+				},
+				ResolveConfig: func(callCtx context.Context, installationID int) (*pluginv1.WatchSyncProviderConfig, error) {
+					return service.WatchSyncProviderConfig(callCtx, installationID)
+				},
+				Repository: repository,
+			})
+			if err != nil {
+				slog.WarnContext(ctx, "skip unsupported watch sync plugin capability",
+					"component", "app",
+					"installation_id", installation.ID,
+					"capability_id", capability.ID,
+					"error", err,
+				)
+				continue
+			}
+			providers = append(providers, provider)
+		}
+	}
+	return registry.ReplacePluginProviders(providers)
 }
 
 type markerPluginRuntimeConfigStore interface {
@@ -2968,6 +3259,11 @@ func reloadMarkerPluginProviders(
 	nextPriority := 1000
 	for _, installation := range installations {
 		if installation == nil {
+			continue
+		}
+		// Builtin installations expose no marker providers; defense in depth
+		// alongside the capability-type filter below.
+		if installation.IsBuiltin() {
 			continue
 		}
 		capabilities, err := store.ListCapabilities(ctx, installation.ID)
@@ -3135,15 +3431,29 @@ type scopeEntitlementResolver struct {
 }
 
 func (r scopeEntitlementResolver) MaxPlaybackQuality(ctx context.Context, userID int, profileID string) (string, error) {
-	scope, err := r.resolver.Resolve(ctx, access.ResolveInput{
-		UserID:              userID,
-		ProfileID:           profileID,
-		SkipPINVerification: true,
-	})
+	scope, err := r.resolveScope(ctx, userID, profileID)
 	if err != nil {
 		return "", err
 	}
 	return scope.MaxPlaybackQuality, nil
+}
+
+// MaxContentRating implements mediarequests.ContentRatingResolver so request
+// discovery honors the profile's parental rating ceiling.
+func (r scopeEntitlementResolver) MaxContentRating(ctx context.Context, userID int, profileID string) (string, error) {
+	scope, err := r.resolveScope(ctx, userID, profileID)
+	if err != nil {
+		return "", err
+	}
+	return scope.MaxContentRating, nil
+}
+
+func (r scopeEntitlementResolver) resolveScope(ctx context.Context, userID int, profileID string) (access.Scope, error) {
+	return r.resolver.Resolve(ctx, access.ResolveInput{
+		UserID:              userID,
+		ProfileID:           profileID,
+		SkipPINVerification: true,
+	})
 }
 
 // audiobooksSettingsAdapter bridges catalog.ServerSettingsRepo (which

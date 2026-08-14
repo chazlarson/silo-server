@@ -32,7 +32,7 @@ func (s *Scanner) ScanPodcastFolder(ctx context.Context, folder *models.MediaFol
 
 	var attempted int
 	var succeeded int
-	var failures []error
+	var failures scanFailures
 	reconcileRoots := make([]string, 0, len(folder.Paths))
 	seenPaths := make(map[string]bool)
 	for _, root := range folder.Paths {
@@ -43,7 +43,7 @@ func (s *Scanner) ScanPodcastFolder(ctx context.Context, folder *models.MediaFol
 		if err != nil {
 			slog.WarnContext(ctx, "podcast scan: read root failed", "component", "scanner", "root", root, "error", err)
 			attempted++
-			failures = append(failures, fmt.Errorf("read root %s: %w", root, err))
+			failures.addf("read root %s: %w", root, err)
 			continue
 		}
 		reconcileRoots = append(reconcileRoots, root)
@@ -71,7 +71,7 @@ func (s *Scanner) ScanPodcastFolder(ctx context.Context, folder *models.MediaFol
 					"path", subPath,
 					"error", err,
 				)
-				failures = append(failures, fmt.Errorf("%s: %w", subPath, err))
+				failures.addf("%s: %w", subPath, err)
 				// Continue with siblings — one bad show should not stop the scan.
 				continue
 			}
@@ -81,10 +81,10 @@ func (s *Scanner) ScanPodcastFolder(ctx context.Context, folder *models.MediaFol
 			succeeded++
 		}
 	}
-	if attempted > 0 && succeeded == 0 && len(failures) > 0 {
-		return fmt.Errorf("podcast scan failed for every attempted folder_id=%d: %w", folder.ID, errors.Join(failures...))
+	if attempted > 0 && succeeded == 0 && failures.len() > 0 {
+		return fmt.Errorf("podcast scan failed for every attempted folder_id=%d: %w", folder.ID, failures.join())
 	}
-	if err := s.reconcilePodcastMissingFiles(ctx, folder, reconcileRoots, seenPaths, len(seenPaths) > 0); err != nil {
+	if err := s.reconcilePodcastMissingFiles(ctx, folder, reconcileRoots, seenPaths); err != nil {
 		slog.WarnContext(ctx, "podcast scan: missing-file reconcile failed", "component", "scanner", "folder_id", folder.ID, "error", err)
 	}
 	return nil
@@ -93,7 +93,7 @@ func (s *Scanner) ScanPodcastFolder(ctx context.Context, folder *models.MediaFol
 func (s *Scanner) reconcilePodcastShow(ctx context.Context, folder *models.MediaFolder, folderPath string) ([]string, error) {
 	parsed, err := parsePodcastShow(ctx, s.ffprobePath, folderPath)
 	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
+		if errors.Is(err, errFolderHasNoMedia) {
 			return nil, nil
 		}
 		return nil, fmt.Errorf("parse podcast show %s: %w", folderPath, err)
@@ -217,35 +217,19 @@ func applyPodcastShowMetadata(item *models.MediaItem, show *parsedPodcastShow) b
 	return changed
 }
 
-func (s *Scanner) reconcilePodcastMissingFiles(ctx context.Context, folder *models.MediaFolder, roots []string, seenPaths map[string]bool, sawFiles bool) error {
+func (s *Scanner) reconcilePodcastMissingFiles(ctx context.Context, folder *models.MediaFolder, roots []string, seenPaths map[string]bool) error {
 	if s.fileRepo == nil || s.libraryRepo == nil || len(roots) == 0 {
 		return nil
 	}
 
-	if !sawFiles {
-		existingCount := 0
-		for _, root := range roots {
-			existing, err := s.fileRepo.GetByFolderAndPathPrefix(ctx, folder.ID, root)
-			if err != nil {
-				return fmt.Errorf("listing existing podcast files for %q: %w", root, err)
-			}
-			existingCount += len(existing)
-		}
-		if existingCount > 0 {
-			var guard ebookCleanupGuardRepo
-			if s.folderRepo != nil {
-				guard = s.folderRepo
-			}
-			allowed, err := ebookEmptyCleanupAllowed(ctx, guard, folder.ID, true)
-			if err != nil {
-				return err
-			}
-			if !allowed {
-				slog.WarnContext(ctx, "podcast scan: walk saw zero files but the database has files under the scanned roots; skipping reconciliation until cleanup is confirmed", "component", "scanner",
-					"folder_id", folder.ID, "existing_files", existingCount)
-				return nil
-			}
-		}
+	confirmedCleanup, blockAll, err := s.emptyCleanupDecision(
+		ctx, folder, roots, seenPaths, true, "podcast",
+	)
+	if err != nil {
+		return err
+	}
+	if blockAll {
+		return nil
 	}
 
 	now := time.Now().UTC()
@@ -270,25 +254,12 @@ func (s *Scanner) reconcilePodcastMissingFiles(ctx context.Context, folder *mode
 		}
 	}
 
-	if s.emptyTrashAfterScan {
-		trashed, err := s.fileRepo.DeleteMissingByFolder(ctx, folder.ID, s.fileRemovalGrace)
-		if err != nil {
-			return fmt.Errorf("emptying trash for folder %d: %w", folder.ID, err)
-		}
-		if trashed > 0 {
-			slog.InfoContext(ctx, "podcast scan: emptied trash", "component", "scanner", "folder_id", folder.ID, "deleted", trashed)
-		}
+	trashed, removedMemberships, deletedItems, err := s.sweepMissingAndReconcile(ctx, folder, confirmedCleanup)
+	if trashed > 0 {
+		slog.InfoContext(ctx, "podcast scan: emptied trash", "component", "scanner", "folder_id", folder.ID, "deleted", trashed)
 	}
-
-	removedMemberships, deletedItems, orphanedImageDirs, err := s.reconcileLibraryMemberships(ctx, folder.ID)
 	if err != nil {
-		return fmt.Errorf("reconciling library membership for folder %d: %w", folder.ID, err)
-	}
-	if s.s3Client != nil && len(orphanedImageDirs) > 0 {
-		bucket := s.s3Client.Bucket()
-		for _, dir := range orphanedImageDirs {
-			_, _ = s.s3Client.DeletePrefix(ctx, bucket, dir)
-		}
+		return err
 	}
 	if missing > 0 || removedMemberships > 0 || deletedItems > 0 {
 		slog.InfoContext(ctx, "podcast scan: reconciled missing files", "component", "scanner",

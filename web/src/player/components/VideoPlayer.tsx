@@ -14,18 +14,16 @@ import { useKeyboardShortcuts } from "../hooks/useKeyboardShortcuts";
 import { useRemuxSeeking } from "../hooks/useRemuxSeeking";
 import { useSubtitleTracks } from "../hooks/useSubtitleTracks";
 import { useASSSubtitles } from "../hooks/useASSSubtitles";
-import { isBitmapCodec } from "../utils/subtitleCodecs";
 import { useSubtitleAppearance } from "../hooks/useSubtitleAppearance";
 import { useSubtitleLayout } from "../hooks/useSubtitleLayout";
 import { computeSubtitleFontSize } from "@/lib/subtitleAppearance";
 import { useNextEpisode } from "../hooks/useNextEpisode";
 import { MARKER_KINDS, useMarkerEditor } from "../hooks/useMarkerEditor";
-import { COMPATIBILITY_QUALITY_ID, useTranscodeQuality } from "../hooks/useTranscodeQuality";
 import { useWatchTogetherPlaybackSync } from "../hooks/useWatchTogetherPlaybackSync";
 import type { WatchTogetherRoomConnectionResult } from "../hooks/useWatchTogetherRoomConnection";
 import { getPersistedVolume, persistVolume } from "./VolumeControl";
 import { usePlayerConfig } from "../context/PlayerConfigContext";
-import { deriveDisplayedPlaybackState } from "../playback-info";
+import { qualityOptionsFromPlanV3 } from "../playback-info";
 import { preconnectToStreamOrigin } from "../stream-url";
 import { WatchTogetherPanel } from "./WatchTogetherPanel";
 import type {
@@ -34,6 +32,7 @@ import type {
 } from "../realtime-protocol";
 import { resolvePendingSeekTime } from "../utils/pendingSeek";
 import { resolveVersionAudioLanguage } from "../utils/effectiveAudioLanguage";
+import { HlsStartupGuard } from "../utils/hlsStartupGuard";
 import { normalizeSubtitleMode } from "../utils/subtitleMode";
 import type {
   PlaybackExitState,
@@ -41,10 +40,8 @@ import type {
   PlayerPictureInPictureChange,
   PlayerPlaybackStateChange,
   PlayerPlaybackTransport,
-  PlaybackSessionPlaybackInfo,
   PlayerAudioTrack,
   PlayerChapter,
-  PlayMethod,
   PlayerFileVersion,
   PlayerSubtitleInfo,
   PlayerSubtitleTrackSignature,
@@ -54,7 +51,14 @@ import type {
   SeriesContext,
   SubtitleMode,
 } from "../types";
-import { toMediaTime, toPlayerTime } from "../utils/mediaTimeline";
+import type { FailureV3, PlanV3, SubtitleInventoryItemV3 } from "../protocol-v3";
+import {
+  mediaDurationSeconds,
+  subtitleStartPositionSeconds,
+  toMediaTime,
+  toPlayerTime,
+} from "../utils/mediaTimeline";
+import { pendingServerSubtitleSelection } from "../utils/playableSubtitles";
 import {
   copyWatchTogetherInvite,
   endWatchTogetherRoom,
@@ -73,8 +77,22 @@ interface VideoPlayerProps {
   title: string;
   year?: number;
   streamUrl: string;
-  playMethod: PlayMethod;
-  playbackInfo: PlaybackSessionPlaybackInfo | null;
+  /**
+   * The server's plan for this session. Everything about *how* the media plays —
+   * the transport, the timeline, the codecs, the quality menu — is read from
+   * here rather than derived locally.
+   */
+  plan: PlanV3;
+  /** Bumped on every adopted plan; stream-reload effects key on it. */
+  planRevision: number;
+  /** Whether a newly adopted transport should begin playing immediately. */
+  shouldAutoPlay?: boolean;
+  /** True while a replan is in flight, so the quality menu can show progress. */
+  replanning?: boolean;
+  /** Server-described replan error, if the last replan was refused. */
+  replanError?: string | null;
+  /** Title for the replan error, used when surfacing the refusal as a toast. */
+  replanErrorTitle?: string | null;
   sessionId: string;
   selectedVersion?: PlayerFileVersion;
   versions?: PlayerFileVersion[];
@@ -83,6 +101,14 @@ interface VideoPlayerProps {
   onSwitchVersion?: (fileId: number, currentPosition: number) => void;
   subtitleUrls: PlayerSubtitleInfo[];
   initialPosition: number;
+  /** `quality_change` replan for a label taken from `plan.available_qualities`. */
+  onQualitySelect?: (label: string, currentPosition: number) => void;
+  /** `track_change` replan for a subtitle the server has to render. */
+  onSubtitleTrackChange?: (combinedIndex: number | null, currentPosition: number) => void;
+  /** `failure_recovery` replan after the client could not play the plan. */
+  onPlanFailure?: (failure: FailureV3, currentPosition: number) => void;
+  /** `seek_reanchor` replan when a seek target falls outside the seekable window. */
+  onReanchorSeek?: (positionSeconds: number) => void;
   preferredSubtitleLanguage?: string | null;
   preferredSubtitleTrackSignature?: PlayerSubtitleTrackSignature | null;
   subtitleMode?: SubtitleMode;
@@ -101,12 +127,15 @@ interface VideoPlayerProps {
   duration?: number;
   seriesContext?: SeriesContext;
   onNavigateEpisode?: (contentId: string) => void;
-  qualityPreference?: string | null;
-  onRefreshSubtitles?: () => void;
+  /** The session's current quality preference, as the server normalized it. */
+  qualityPreference: string;
+  onRefreshSubtitles?: (currentPosition: number) => void;
+  /** Folds a realtime-delivered inventory entry in at the server's ordinal. */
+  onApplySubtitleTrack?: (track: SubtitleInventoryItemV3) => void;
   audioTracks?: PlayerAudioTrack[];
   activeAudioIndex?: number;
   onAudioSelect?: (index: number, currentPosition: number) => void;
-  onSubtitleChanged?: (index: number | null) => void;
+  onSubtitleChanged?: (index: number | null, inventoryTrack?: SubtitleInventoryItemV3) => void;
   onExit: (state?: PlaybackExitState) => void | Promise<void>;
   onMinimize?: (state?: PlaybackExitState) => void | Promise<void>;
   onEnded?: () => void;
@@ -163,8 +192,12 @@ export function VideoPlayer({
   title,
   year,
   streamUrl,
-  playMethod,
-  playbackInfo: _playbackInfo,
+  plan,
+  planRevision,
+  shouldAutoPlay = true,
+  replanning = false,
+  replanError = null,
+  replanErrorTitle = null,
   sessionId,
   selectedVersion,
   versions = [],
@@ -173,6 +206,10 @@ export function VideoPlayer({
   onSwitchVersion,
   subtitleUrls,
   initialPosition,
+  onQualitySelect,
+  onSubtitleTrackChange,
+  onPlanFailure,
+  onReanchorSeek,
   preferredSubtitleLanguage,
   preferredSubtitleTrackSignature,
   subtitleMode,
@@ -192,6 +229,7 @@ export function VideoPlayer({
   onNavigateEpisode,
   qualityPreference,
   onRefreshSubtitles,
+  onApplySubtitleTrack,
   audioTracks = [],
   activeAudioIndex = 0,
   onAudioSelect,
@@ -218,9 +256,12 @@ export function VideoPlayer({
   const containerRef = useRef<HTMLDivElement>(null);
   const isMountedRef = useRef(true);
   const hlsRef = useRef<HlsType | null>(null);
+  const hlsStartupGuardRef = useRef<HlsStartupGuard | null>(null);
   const mediaRecoveryAttemptsRef = useRef(0);
   const lastRecoveryRef = useRef(0);
-  const streamOriginRef = useRef(0);
+  const reportedPlanFailureKeyRef = useRef<string | null>(null);
+  const transportFailedForPlanRevisionRef = useRef<number | null>(null);
+  const timelineOffsetRef = useRef(0);
   const subtitleFetchAnchorRef = useRef(initialPosition);
   const backendDurationRef = useRef(propDuration ?? 0);
   const autoEnterPictureInPictureAttemptedRef = useRef(false);
@@ -259,7 +300,9 @@ export function VideoPlayer({
   const [muted, setMuted] = useState(() => getPersistedVolume().muted);
 
   // Subtitles
-  const [activeSubtitleIndex, setActiveSubtitleIndex] = useState<number | null>(null);
+  const [activeSubtitleIndex, setActiveSubtitleIndex] = useState<number | null>(
+    () => plan.selected_tracks.subtitle?.index ?? null,
+  );
   const lastSubtitleIndexRef = useRef<number | null>(null);
   const subtitleSelectionWasManualRef = useRef(false);
   // Per-session subtitle delay in ms. Positive = show later. Reset when the
@@ -279,6 +322,11 @@ export function VideoPlayer({
     label: string;
   } | null>(null);
   const [liveCues, setLiveCues] = useState<ParsedCue[]>([]);
+  const [pendingTranslationHandoff, setPendingTranslationHandoff] = useState<{
+    language: string;
+    planRevision: number;
+    existingTrackIndexes: number[];
+  } | null>(null);
   const [translationBuffering, setTranslationBuffering] = useState(false);
   const translationPauseRef = useRef(false);
   const translationResumeTimerRef = useRef<number | null>(null);
@@ -289,9 +337,6 @@ export function VideoPlayer({
   // The subtitle selection active before a translation hijacked it, so a failed
   // translation can restore it instead of leaving subtitles off.
   const preTranslationSubtitleIndexRef = useRef<number | null>(null);
-  // The persisted downloaded-subtitle id to switch to once a completed
-  // translation's track lands in the refreshed list.
-  const pendingTranslatedSubtitleIdRef = useRef<number | null>(null);
 
   // Drop any live translation when the media changes so a stale track from the
   // previous file never lingers.
@@ -302,11 +347,11 @@ export function VideoPlayer({
       window.clearTimeout(translationResumeTimerRef.current);
       translationResumeTimerRef.current = null;
     }
+    setPendingTranslationHandoff(null);
     setLiveTranslation(null);
     setLiveCues([]);
     setTranslationBuffering(false);
     translationPauseRef.current = false;
-    pendingTranslatedSubtitleIdRef.current = null;
   }, [activeFileId]);
 
   // Merge the live track into the track list the player + menu see.
@@ -326,36 +371,84 @@ export function VideoPlayer({
     ];
   }, [subtitleUrls, liveTranslation]);
 
-  // -- Transcode quality switching --
-  // Remux also uses HLS (codec copy) via the transcode pipeline.
-  const transcodeQuality = useTranscodeQuality({
-    sessionId,
-    selectedVersion,
-    versions,
-    playMethod,
-    initialPosition,
-    qualityPreference,
-  });
-
-  // Derive effective stream URL and play method.
-  // Both transcode and remux go through HLS, so treat them as "transcode" for the player.
-  const effectiveStreamUrl =
-    playMethod === "transcode" || playMethod === "remux"
-      ? (transcodeQuality.transcodeStreamUrl ?? "")
-      : (transcodeQuality.transcodeStreamUrl ?? streamUrl);
-  const effectivePlayMethod: PlayMethod =
-    playMethod === "transcode" || playMethod === "remux" || transcodeQuality.transcodeStreamUrl
-      ? "transcode"
-      : playMethod;
-  const backendDuration = transcodeQuality.durationSeconds ?? propDuration ?? 0;
-  backendDurationRef.current = backendDuration;
-  const effectiveInitialPosition = transcodeQuality.transcodeStreamUrl
-    ? transcodeQuality.playerStartSeconds
-    : initialPosition;
-  const canSeekAnywhere = transcodeQuality.canSeekAnywhere;
-  const activeQualityId = transcodeQuality.activeQualityId;
-  const switchQuality = transcodeQuality.switchQuality;
+  // -- Plan-derived transport --
+  // The plan names its own protocol and timeline; nothing here is inferred from
+  // codec strings or from what the engine reports.
+  const isHlsStream = plan.stream.protocol === "hls";
+  const effectiveStreamUrl = streamUrl;
   const isPlayerReady = effectiveStreamUrl !== "";
+  const reportCurrentPlanFailure = useCallback(
+    (failure: FailureV3): boolean => {
+      if (!onPlanFailure) return false;
+      const failureKey = `${sessionId}:${plan.plan_attempt_key}`;
+      if (reportedPlanFailureKeyRef.current === failureKey) return true;
+      reportedPlanFailureKeyRef.current = failureKey;
+      transportFailedForPlanRevisionRef.current = planRevision;
+      setError(null);
+      onPlanFailure(failure, currentTimeRef.current);
+      return true;
+    },
+    [onPlanFailure, plan.plan_attempt_key, planRevision, sessionId],
+  );
+
+  useEffect(() => {
+    transportFailedForPlanRevisionRef.current = null;
+  }, [planRevision]);
+
+  const failHlsStartup = useCallback(() => {
+    console.error("[hls.js] Playback startup timed out or exhausted recovery attempts");
+
+    const activeHls = hlsRef.current;
+    hlsRef.current = null;
+    activeHls?.destroy();
+
+    const video = videoRef.current;
+    if (video) {
+      video.removeAttribute("src");
+      video.load();
+    }
+    if (
+      !reportCurrentPlanFailure({
+        classification: "startup_timeout",
+        message: "HLS playback exhausted its startup recovery budget.",
+      })
+    ) {
+      setError("Playback failed. The media could not be loaded.");
+    }
+  }, [reportCurrentPlanFailure]);
+
+  useEffect(() => {
+    if (!isHlsStream || !isPlayerReady) return;
+
+    const guard = new HlsStartupGuard(failHlsStartup);
+    hlsStartupGuardRef.current = guard;
+
+    return () => {
+      guard.dispose();
+      if (hlsStartupGuardRef.current === guard) {
+        hlsStartupGuardRef.current = null;
+      }
+    };
+  }, [failHlsStartup, isHlsStream, isPlayerReady, planRevision]);
+
+  // The media's full runtime, from the plan and nowhere else: on an HLS copy
+  // remux the engine reports only the length produced so far, so substituting it
+  // would make the scrubber grow while the viewer watches.
+  const backendDuration = plan.source.duration_seconds ?? propDuration ?? 0;
+  backendDurationRef.current = backendDuration;
+  const effectiveInitialPosition = plan.timeline.player_start_seconds;
+  const canSeekAnywhere = plan.timeline.can_seek_anywhere;
+  // The menu is the plan's; which entry is lit is the session's own preference,
+  // since `auto` is a valid preference that names no rung.
+  const activeQualityId = qualityPreference;
+  const qualityOptions = useMemo(() => qualityOptionsFromPlanV3(plan), [plan]);
+
+  // The file the server actually planned against, which is not necessarily the
+  // one that was asked for — a fallback to an alternate version shows up here.
+  const effectiveVersion = useMemo(
+    () => versions.find((v) => v.file_id === plan.effective_media_file_id) ?? selectedVersion,
+    [plan.effective_media_file_id, selectedVersion, versions],
+  );
 
   // Any stream restart (transcode restart on seek, quality/audio switch,
   // turning off bitmap burn-in) reloads the <video> element, which can orphan
@@ -364,17 +457,17 @@ export function VideoPlayer({
   // useSubtitleTracks rebuilds its track against the new element; the rebuild
   // carries loaded cues and window coverage over, so it costs no refetch.
   const [subtitleStreamGeneration, setSubtitleStreamGeneration] = useState(0);
-  const lastSubtitleStreamUrlRef = useRef<string | null>(null);
+  const lastSubtitlePlanRevisionRef = useRef<number | null>(null);
   useEffect(() => {
-    if (!effectiveStreamUrl) return;
+    if (!isPlayerReady) return;
     const changed =
-      lastSubtitleStreamUrlRef.current !== null &&
-      lastSubtitleStreamUrlRef.current !== effectiveStreamUrl;
-    lastSubtitleStreamUrlRef.current = effectiveStreamUrl;
+      lastSubtitlePlanRevisionRef.current !== null &&
+      lastSubtitlePlanRevisionRef.current !== planRevision;
+    lastSubtitlePlanRevisionRef.current = planRevision;
     if (changed) {
       setSubtitleStreamGeneration((generation) => generation + 1);
     }
-  }, [effectiveStreamUrl]);
+  }, [isPlayerReady, planRevision]);
 
   const isFirefoxBrowser =
     typeof navigator !== "undefined" &&
@@ -403,7 +496,7 @@ export function VideoPlayer({
     roomConnection: watchTogether,
     sessionId,
     videoRef,
-    streamOriginRef,
+    streamOriginRef: timelineOffsetRef,
   });
   const roomPlaybackActive = !!watchTogetherRoomId && !watchTogether.closedReason;
   const roomSyncWaiting = watchTogether.room?.playback_state === "waiting";
@@ -438,28 +531,20 @@ export function VideoPlayer({
       resetLeaveState();
     }
   }, [displayMode, resetLeaveState, sessionId]);
-  const displayedPlaybackState = deriveDisplayedPlaybackState({
-    playMethod,
-    playbackInfo: _playbackInfo,
-    selectedVersion: transcodeQuality.effectiveVersion,
-    transcodeStreamUrl: transcodeQuality.transcodeStreamUrl,
-    activeQualityId: transcodeQuality.activeQualityId,
-  });
-  const isCopyOriginalHLS =
-    transcodeQuality.transcodeStreamUrl != null &&
-    activeQualityId === "original" &&
-    displayedPlaybackState.playMethod === "remux";
+
+  // A codec-copy remux delivered over HLS. Firefox is the only engine that
+  // stalls on these, and the plan names the route outright.
+  const isCopyOriginalHLS = plan.delivery === "server_remux_hls";
 
   // Keep the player-local clock mapped onto the canonical media timeline.
-  const streamOriginSeconds =
-    effectivePlayMethod === "transcode" ? transcodeQuality.streamOriginSeconds : 0;
-  streamOriginRef.current = streamOriginSeconds;
+  const timelineOffsetSeconds = plan.timeline.timeline_offset_seconds;
+  timelineOffsetRef.current = timelineOffsetSeconds;
 
   // Media-time position playback is heading to, for consumers that need a
   // position before the element has media loaded (when currentTime still
   // reads 0): an in-flight seek target, else the session's start position.
   subtitleFetchAnchorRef.current =
-    pendingSeekTime ?? toMediaTime(effectiveInitialPosition, streamOriginSeconds);
+    pendingSeekTime ?? toMediaTime(effectiveInitialPosition, timelineOffsetSeconds);
 
   useEffect(() => {
     if (backendDuration > 0) {
@@ -511,21 +596,24 @@ export function VideoPlayer({
 
   useEffect(() => {
     setPendingSeekTime(null);
-  }, [effectiveStreamUrl]);
+  }, [planRevision]);
 
+  // Firefox stalls on codec-copy remuxes it nominally accepts. Both fallbacks
+  // report an honest classification and let the server pick the next route —
+  // the client no longer names a "compatibility" rung of its own.
   useEffect(() => {
     if (
       !isFirefoxBrowser ||
       !isCopyOriginalHLS ||
       !isPlayerReady ||
-      transcodeQuality.isTranscoding ||
+      replanning ||
       !awaitingFirstFrame ||
       error
     ) {
       return;
     }
 
-    const fallbackKey = `${sessionId}:${effectiveStreamUrl}:${activeQualityId}`;
+    const fallbackKey = `${sessionId}:${plan.plan_attempt_key}`;
     if (compatibilityFallbackKeyRef.current === fallbackKey) {
       return;
     }
@@ -540,35 +628,31 @@ export function VideoPlayer({
         message: "Firefox stalled on the original stream. Retrying with encoded video.",
         tone: "info",
       });
-      switchQuality(COMPATIBILITY_QUALITY_ID, currentTimeRef.current, true);
+      reportCurrentPlanFailure({
+        classification: "startup_timeout",
+        message: "Firefox produced no frames from the copy remux before the startup deadline.",
+      });
     }, FIREFOX_COMPATIBILITY_FALLBACK_DELAY_MS);
 
     return () => clearTimeout(timer);
   }, [
-    activeQualityId,
     awaitingFirstFrame,
-    effectiveStreamUrl,
     error,
     isCopyOriginalHLS,
     isFirefoxBrowser,
     isPlayerReady,
+    reportCurrentPlanFailure,
+    plan.plan_attempt_key,
+    replanning,
     sessionId,
-    switchQuality,
-    transcodeQuality.isTranscoding,
   ]);
 
   useEffect(() => {
-    if (
-      !isFirefoxBrowser ||
-      !error ||
-      !isCopyOriginalHLS ||
-      !isPlayerReady ||
-      transcodeQuality.isTranscoding
-    ) {
+    if (!isFirefoxBrowser || !error || !isCopyOriginalHLS || !isPlayerReady || replanning) {
       return;
     }
 
-    const fallbackKey = `${sessionId}:${effectiveStreamUrl}:${activeQualityId}`;
+    const fallbackKey = `${sessionId}:${plan.plan_attempt_key}`;
     if (compatibilityFallbackKeyRef.current === fallbackKey) {
       return;
     }
@@ -580,69 +664,70 @@ export function VideoPlayer({
       message: "Firefox rejected the original stream. Retrying with encoded video.",
       tone: "warning",
     });
-    switchQuality(COMPATIBILITY_QUALITY_ID, currentTimeRef.current, true);
+    reportCurrentPlanFailure({
+      classification: "decoder_error",
+      message: "Firefox rejected the copy remux.",
+    });
   }, [
-    activeQualityId,
-    effectiveStreamUrl,
     error,
     isCopyOriginalHLS,
     isFirefoxBrowser,
     isPlayerReady,
+    reportCurrentPlanFailure,
+    plan.plan_attempt_key,
+    replanning,
     sessionId,
-    switchQuality,
-    transcodeQuality.isTranscoding,
   ]);
 
-  // Promote fatal transcode errors to the player-level error state.
-  // When transcode start fails (e.g. 4K blocked with no alternate file),
-  // transcodeStreamUrl stays null, isPlayerReady stays false, and the
-  // loading overlay covers the screen forever. Surface the error here
-  // so the error overlay with "Go Back" appears instead.
+  // A failed recovery leaves no transport behind. Surface the refusal for the
+  // same plan revision and re-arm its failure key so a later media error can
+  // retry a transiently failed recovery request.
   useEffect(() => {
-    if (transcodeQuality.error && !isPlayerReady && !transcodeQuality.isTranscoding) {
-      setError(transcodeQuality.error);
+    if (!replanError || replanning) return;
+
+    const failureKey = `${sessionId}:${plan.plan_attempt_key}`;
+    if (reportedPlanFailureKeyRef.current === failureKey) {
+      reportedPlanFailureKeyRef.current = null;
     }
-  }, [transcodeQuality.error, isPlayerReady, transcodeQuality.isTranscoding]);
+    if (transportFailedForPlanRevisionRef.current === planRevision || !isPlayerReady) {
+      setError(replanError);
+    }
+  }, [isPlayerReady, plan.plan_attempt_key, planRevision, replanError, replanning, sessionId]);
 
   // -- Remux seeking (callback-based) --
-  // With remux now using HLS, this only handles direct play seeking.
-  const { handleSeek } = useRemuxSeeking(
-    videoRef,
-    effectivePlayMethod,
-    effectiveStreamUrl,
-    effectiveInitialPosition,
-  );
+  // Only the progressive/direct routes take this path; HLS seeking is handled
+  // against the plan's timeline below.
+  const { handleSeek } = useRemuxSeeking(videoRef);
 
   const performPlayerSeek = useCallback(
     (seconds: number) => {
-      if (effectivePlayMethod !== "transcode") {
-        handleSeek(seconds);
-        return;
-      }
-
       const video = videoRef.current;
       if (!video) return;
 
       setPendingSeekTime(seconds);
       setCurrentTime(seconds);
 
-      const nativeSeconds = toPlayerTime(seconds, streamOriginRef.current);
+      const nativeSeconds = toPlayerTime(seconds, timelineOffsetRef.current);
       if (canSeekAnywhere) {
-        video.currentTime = nativeSeconds;
+        if (isHlsStream) video.currentTime = nativeSeconds;
+        else handleSeek(nativeSeconds);
         return;
       }
 
       const seekable = video.seekable;
       for (let i = 0; i < seekable.length; i++) {
         if (nativeSeconds >= seekable.start(i) && nativeSeconds <= seekable.end(i)) {
-          video.currentTime = nativeSeconds;
+          if (isHlsStream) video.currentTime = nativeSeconds;
+          else handleSeek(nativeSeconds);
           return;
         }
       }
 
-      switchQuality(activeQualityId, seconds, true);
+      // Outside the server-anchored window: this is a timeline operation, not
+      // a failure, so it asks for a reanchor rather than reporting a failure.
+      onReanchorSeek?.(seconds);
     },
-    [activeQualityId, canSeekAnywhere, effectivePlayMethod, handleSeek, switchQuality],
+    [canSeekAnywhere, handleSeek, isHlsStream, onReanchorSeek],
   );
 
   const handlePlayerSeek = useCallback(
@@ -694,23 +779,22 @@ export function VideoPlayer({
   // before dispatching the seek request.
   const handleKeyboardSeek = useCallback(
     (seconds: number) => {
-      handlePlayerSeek(toMediaTime(seconds, streamOriginRef.current));
+      handlePlayerSeek(toMediaTime(seconds, timelineOffsetRef.current));
     },
     [handlePlayerSeek],
   );
 
   // -- Watch progress reporting --
-  const flushWatchProgress = useWatchProgress(sessionId, videoRef, streamOriginRef);
+  const flushWatchProgress = useWatchProgress(sessionId, videoRef, timelineOffsetRef);
 
   const buildExitState = useCallback((): PlaybackExitState => {
     const video = videoRef.current;
-    const positionSeconds = toMediaTime(video?.currentTime ?? currentTime, streamOriginRef.current);
-    const durationSeconds =
-      duration > 0
-        ? duration
-        : backendDurationRef.current > 0
-          ? backendDurationRef.current
-          : undefined;
+    const positionSeconds = toMediaTime(
+      video?.currentTime ?? currentTime,
+      timelineOffsetRef.current,
+    );
+    // positionSeconds is media time, so the runtime paired with it must be too.
+    const durationSeconds = mediaDurationSeconds(backendDurationRef.current, duration);
 
     return {
       positionSeconds,
@@ -853,24 +937,56 @@ export function VideoPlayer({
   }, [activeSubtitleIndex, onSubtitleChanged]);
 
   const handleSubtitleSelect = useCallback(
-    (index: number | null) => {
+    (index: number | null, inventoryTrack?: SubtitleInventoryItemV3) => {
       subtitleSelectionWasManualRef.current = true;
       setActiveSubtitleIndex(index);
       // The in-progress live translation track is synthetic (a sentinel index
       // that exists only in memory); never persist it as the saved preference or
       // we'd store a nonexistent track and lose the real selection.
       if (index === LIVE_SUBTITLE_INDEX) return;
-      onSubtitleChanged?.(index);
+      onSubtitleChanged?.(index, inventoryTrack);
     },
     [onSubtitleChanged],
   );
 
+  useEffect(() => {
+    if (!pendingTranslationHandoff || replanning) return;
+
+    const refreshSettled =
+      planRevision !== pendingTranslationHandoff.planRevision || replanError !== null;
+    if (!refreshSettled) return;
+
+    const normalizedLanguage = pendingTranslationHandoff.language.trim().toLowerCase();
+    const track = subtitleUrls.find(
+      (candidate) =>
+        candidate.source === "downloaded" &&
+        candidate.language.trim().toLowerCase() === normalizedLanguage &&
+        !pendingTranslationHandoff.existingTrackIndexes.includes(candidate.index),
+    );
+    setPendingTranslationHandoff(null);
+    if (!track) return;
+
+    handleSubtitleSelect(track.index);
+    setLiveTranslation(null);
+    setLiveCues([]);
+  }, [
+    handleSubtitleSelect,
+    pendingTranslationHandoff,
+    planRevision,
+    replanError,
+    replanning,
+    subtitleUrls,
+  ]);
+
   // The media-time playhead, sent with a translate request so the server starts
   // where the viewer is watching.
-  const getSubtitleStartPosition = useCallback(
-    () => toMediaTime(videoRef.current?.currentTime ?? 0, streamOriginRef.current ?? 0),
-    [],
-  );
+  const getSubtitleStartPosition = useCallback(() => {
+    return subtitleStartPositionSeconds(
+      videoRef.current?.readyState ?? 0,
+      currentTimeRef.current,
+      subtitleFetchAnchorRef.current,
+    );
+  }, []);
 
   const resumeFromTranslationPause = useCallback(() => {
     if (translationResumeTimerRef.current !== null) {
@@ -894,10 +1010,15 @@ export function VideoPlayer({
       switch (event.name) {
         case "subtitle_ready": {
           // Broadcast to every viewer of the file when a generated track is
-          // persisted. Refresh the list so it appears (the requesting session
-          // also auto-selects it via the completed handler below).
+          // persisted. The payload carries the server-assigned ordinal, so the
+          // track is folded in at that ordinal without a round trip; only a
+          // payload the server could not resolve falls back to a replan.
           if (event.payload.file_id === activeFileId) {
-            onRefreshSubtitles?.();
+            if (event.payload.track) {
+              onApplySubtitleTrack?.(event.payload.track);
+            } else {
+              onRefreshSubtitles?.(getSubtitleStartPosition());
+            }
           }
           break;
         }
@@ -912,7 +1033,6 @@ export function VideoPlayer({
             }
             return LIVE_SUBTITLE_INDEX;
           });
-          pendingTranslatedSubtitleIdRef.current = null;
           setLiveCues([]);
           setLiveTranslation({
             trackKey: event.payload.track_key,
@@ -945,12 +1065,30 @@ export function VideoPlayer({
         case "subtitle_translation_completed": {
           resumeFromTranslationPause();
           // Hand off from the ephemeral live track to the persisted downloaded
-          // track: refresh the list and let the effect below select it by id
-          // once it lands. Without a refresh callback we keep the live track
-          // (which already holds the full cue set) as a best-effort fallback.
-          if (onRefreshSubtitles) {
-            pendingTranslatedSubtitleIdRef.current = event.payload.subtitle_id;
-            onRefreshSubtitles();
+          // one. The payload names the ordinal the server assigned it, so the
+          // handoff is a fold-in plus a select — no ordinal is derived here.
+          // Without an entry the live track (which already holds the full cue
+          // set) stays on screen while a replan re-reads the inventory.
+          if (event.payload.track) {
+            const track = event.payload.track;
+            onApplySubtitleTrack?.(track);
+            setLiveTranslation(null);
+            setLiveCues([]);
+            handleSubtitleSelect(track.combined_index, track);
+          } else {
+            const language = event.payload.language.trim().toLowerCase();
+            setPendingTranslationHandoff({
+              language: event.payload.language,
+              planRevision,
+              existingTrackIndexes: subtitleUrls
+                .filter(
+                  (track) =>
+                    track.source === "downloaded" &&
+                    track.language.trim().toLowerCase() === language,
+                )
+                .map((track) => track.index),
+            });
+            onRefreshSubtitles?.(getSubtitleStartPosition());
           }
           break;
         }
@@ -958,7 +1096,6 @@ export function VideoPlayer({
           resumeFromTranslationPause();
           setLiveTranslation(null);
           setLiveCues([]);
-          pendingTranslatedSubtitleIdRef.current = null;
           // Restore the selection the translation displaced rather than leaving
           // subtitles off.
           const restore = preTranslationSubtitleIndexRef.current;
@@ -974,23 +1111,18 @@ export function VideoPlayer({
           onRealtimeEvent?.(event);
       }
     },
-    [onRealtimeEvent, onRefreshSubtitles, activeFileId, resumeFromTranslationPause],
+    [
+      activeFileId,
+      getSubtitleStartPosition,
+      handleSubtitleSelect,
+      onApplySubtitleTrack,
+      onRealtimeEvent,
+      onRefreshSubtitles,
+      planRevision,
+      resumeFromTranslationPause,
+      subtitleUrls,
+    ],
   );
-
-  // Once a completed translation's persisted track lands in the refreshed list,
-  // switch to it (selecting by downloaded-subtitle id) and drop the live track,
-  // so the viewer ends up on the real saved subtitle rather than the synthetic
-  // one that would vanish on reload.
-  useEffect(() => {
-    const pendingId = pendingTranslatedSubtitleIdRef.current;
-    if (pendingId == null) return;
-    const match = subtitleUrls.find((t) => t.id === pendingId);
-    if (!match) return;
-    pendingTranslatedSubtitleIdRef.current = null;
-    setLiveTranslation(null);
-    setLiveCues([]);
-    handleSubtitleSelect(match.index);
-  }, [subtitleUrls, handleSubtitleSelect]);
 
   // Resume as soon as the first translated cues arrive. Playhead-first
   // translation means the cues covering the current position are delivered
@@ -1232,17 +1364,19 @@ export function VideoPlayer({
     watchTogetherSync.attachedSessionId,
   ]);
 
-  // Stabilize the dependency – only the bitrate matters for buffer sizing.
-  const selectedVersionBitrate = transcodeQuality.effectiveVersion?.bitrate ?? 0;
+  // Only the bitrate matters for buffer sizing, and the plan states what is
+  // actually being delivered rather than what the source file happens to hold.
+  const plannedBitrateKbps = plan.effective_recipe.bitrate_kbps ?? 0;
 
   // -- hls.js lifecycle --
   useEffect(() => {
     const video = videoRef.current;
-    if (!video || !isPlayerReady) return;
+    if (!video || !isPlayerReady || hlsStartupGuardRef.current?.hasFailed()) return;
 
     let hls: HlsType | null = null;
     let destroyed = false;
     let autoplayStarted = false;
+    let nativeHLSMetadataHandler: (() => void) | null = null;
 
     mediaRecoveryAttemptsRef.current = 0;
     setError(null);
@@ -1251,16 +1385,27 @@ export function VideoPlayer({
     const cleanupStartupListeners = () => {
       video.removeEventListener("loadeddata", attemptAutoplayWhenReady);
       video.removeEventListener("canplay", attemptAutoplayWhenReady);
+      video.removeEventListener("loadedmetadata", attemptAutoplayWhenReady);
+      if (nativeHLSMetadataHandler) {
+        video.removeEventListener("loadedmetadata", nativeHLSMetadataHandler);
+        nativeHLSMetadataHandler = null;
+      }
     };
 
     const attemptAutoplayWhenReady = () => {
-      if (destroyed || autoplayStarted) return;
+      if (destroyed || autoplayStarted || hlsStartupGuardRef.current?.hasFailed()) return;
       // HAVE_FUTURE_DATA means the browser has enough media to advance beyond
       // the current frame. Starting earlier can produce a visible first-frame
       // freeze where audio advances before video begins moving.
       if (video.readyState < HTMLMediaElement.HAVE_FUTURE_DATA) return;
       autoplayStarted = true;
       cleanupStartupListeners();
+      if (!shouldAutoPlay) {
+        hlsStartupGuardRef.current?.markPlaybackStarted();
+        setAwaitingFirstFrame(false);
+        setPlaying(false);
+        return;
+      }
       video.play().catch(() => setPlaying(false));
     };
 
@@ -1270,13 +1415,13 @@ export function VideoPlayer({
     async function init() {
       if (!video || destroyed) return;
 
-      if (effectivePlayMethod === "transcode") {
+      if (isHlsStream) {
         try {
           const Hls = await hlsPromise;
-          if (destroyed) return;
+          if (destroyed || hlsStartupGuardRef.current?.hasFailed()) return;
 
           if (Hls.isSupported()) {
-            const maxBufferLength = selectedVersionBitrate >= 25000 ? 60 : 120;
+            const maxBufferLength = plannedBitrateKbps >= 25000 ? 60 : 120;
             const retryingLoadPolicy = {
               maxTimeToFirstByteMs: 45000,
               maxLoadTimeMs: 45000,
@@ -1317,8 +1462,12 @@ export function VideoPlayer({
               lastRecoveryRef.current = now;
 
               if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
-                console.warn("[hls.js] Fatal network error, attempting recovery...");
-                hls?.startLoad();
+                if (hlsStartupGuardRef.current?.handleFatalNetworkError() ?? true) {
+                  console.warn("[hls.js] Fatal network error, attempting recovery...");
+                  hls?.startLoad();
+                } else {
+                  console.error("[hls.js] Fatal startup network error, giving up");
+                }
               } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
                 if (mediaRecoveryAttemptsRef.current === 0) {
                   console.warn("[hls.js] Fatal media error, attempting recovery...");
@@ -1329,14 +1478,28 @@ export function VideoPlayer({
                   hls?.recoverMediaError();
                 } else {
                   console.error("[hls.js] Fatal media error, giving up after 3 attempts");
-                  setError("Playback failed. Please try again.");
+                  if (
+                    !reportCurrentPlanFailure({
+                      classification: "decoder_error",
+                      message: "HLS media recovery failed after three attempts.",
+                    })
+                  ) {
+                    setError("Playback failed. Please try again.");
+                  }
                   hls?.destroy();
                   hlsRef.current = null;
                 }
                 mediaRecoveryAttemptsRef.current++;
               } else {
                 console.error("[hls.js] Unrecoverable error:", data);
-                setError("Playback failed. Please try again.");
+                if (
+                  !reportCurrentPlanFailure({
+                    classification: "decoder_error",
+                    message: `HLS reported an unrecoverable ${data.type} error.`,
+                  })
+                ) {
+                  setError("Playback failed. Please try again.");
+                }
                 hls?.destroy();
                 hlsRef.current = null;
               }
@@ -1357,18 +1520,38 @@ export function VideoPlayer({
             hlsRef.current = hls;
           } else if (video.canPlayType("application/vnd.apple.mpegurl")) {
             video.src = effectiveStreamUrl;
-            video.addEventListener("loadedmetadata", attemptAutoplayWhenReady, { once: true });
+            nativeHLSMetadataHandler = () => {
+              video.currentTime = effectiveInitialPosition;
+              attemptAutoplayWhenReady();
+            };
+            video.addEventListener("loadedmetadata", nativeHLSMetadataHandler, { once: true });
           } else {
-            setError("HLS playback is not supported in this browser.");
+            if (
+              !reportCurrentPlanFailure({
+                classification: "unsupported_transport",
+                message: "The browser rejected the planned HLS transport.",
+              })
+            ) {
+              setError("HLS playback is not supported in this browser.");
+            }
           }
-        } catch {
-          if (!destroyed) setError("Failed to load video player.");
+        } catch (error) {
+          if (
+            !destroyed &&
+            !reportCurrentPlanFailure({
+              classification: "player_initialization_error",
+              message:
+                error instanceof Error ? error.message : "Failed to initialize HLS playback.",
+            })
+          ) {
+            setError("Failed to load video player.");
+          }
         }
       } else {
         // Direct play — set video src directly.
         video.src = effectiveStreamUrl;
         video.currentTime = effectiveInitialPosition;
-        video.play().catch(() => setPlaying(false));
+        if (shouldAutoPlay) video.play().catch(() => setPlaying(false));
       }
     }
 
@@ -1389,12 +1572,17 @@ export function VideoPlayer({
         video.load();
       }
     };
+    // `planRevision` is the single signal that the transport changed: two plans
+    // can share a stream URL and still differ in protocol, timeline, or recipe.
   }, [
     effectiveStreamUrl,
-    effectivePlayMethod,
     effectiveInitialPosition,
+    isHlsStream,
     isPlayerReady,
-    selectedVersionBitrate,
+    planRevision,
+    plannedBitrateKbps,
+    reportCurrentPlanFailure,
+    shouldAutoPlay,
   ]);
 
   // -- Video event listeners --
@@ -1411,8 +1599,12 @@ export function VideoPlayer({
       }
       setBuffering(false);
     };
+    const markPlaybackStarted = () => {
+      hlsStartupGuardRef.current?.markPlaybackStarted();
+      setAwaitingFirstFrame(false);
+    };
     const onTimeUpdate = () => {
-      const nextTime = toMediaTime(video.currentTime, streamOriginRef.current);
+      const nextTime = toMediaTime(video.currentTime, timelineOffsetRef.current);
       const resolved = resolvePendingSeekTime(nextTime, pendingSeekTime);
       setCurrentTime(resolved.currentTime);
       if (resolved.pendingSeekTime !== pendingSeekTime) {
@@ -1421,13 +1613,13 @@ export function VideoPlayer({
       // timeupdate is the most reliable signal that frames are rendering.
       // Also clears any stale buffering state from HLS segment transitions
       // where `waiting` fired but `canplay`/`playing` never followed.
-      setAwaitingFirstFrame(false);
+      markPlaybackStarted();
       clearBuffering();
     };
     const onSeeked = () => {
       setPendingSeekTime(null);
-      setCurrentTime(toMediaTime(video.currentTime, streamOriginRef.current));
-      setAwaitingFirstFrame(false);
+      setCurrentTime(toMediaTime(video.currentTime, timelineOffsetRef.current));
+      markPlaybackStarted();
       clearBuffering();
       if (roomSyncWaiting && watchTogetherSync.attachedSessionId === sessionId) {
         watchTogetherSync.reportReady();
@@ -1435,9 +1627,9 @@ export function VideoPlayer({
     };
     const onDurationChange = () => {
       if (video.duration && isFinite(video.duration)) {
-        // For HLS EVENT playlists still being transcoded, the video element
-        // reports duration based on segments produced so far. Prefer the
-        // known total duration from metadata when available.
+        // For HLS EVENT playlists still being written, the element reports the
+        // length produced so far. The plan's source duration is the media's
+        // full runtime, so it wins whenever the engine reports something short.
         if (backendDurationRef.current && video.duration < backendDurationRef.current) return;
         setDuration(video.duration);
       }
@@ -1469,7 +1661,7 @@ export function VideoPlayer({
     };
     const onPlaying = () => {
       clearBuffering();
-      setAwaitingFirstFrame(false);
+      markPlaybackStarted();
     };
     const onStalled = () => {
       if (watchTogetherRoomActive && watchTogetherSync.attachedSessionId === sessionId) {
@@ -1478,7 +1670,10 @@ export function VideoPlayer({
     };
     const onError = () => {
       if (video.error) {
-        setError(`Playback error: ${video.error.message || "Unknown error"}`);
+        const message = video.error.message || "Unknown media element error";
+        if (!reportCurrentPlanFailure({ classification: "decoder_error", message })) {
+          setError(`Playback error: ${message}`);
+        }
       }
     };
     const onVideoEnded = () => {
@@ -1526,7 +1721,14 @@ export function VideoPlayer({
     // Listener behavior depends on pending seek reconciliation. Watch-together
     // deps are intentionally narrowed to the primitives the handlers read so
     // room snapshot churn doesn't re-subscribe every listener.
-  }, [pendingSeekTime, roomSyncWaiting, sessionId, watchTogetherRoomActive, watchTogetherSync]);
+  }, [
+    pendingSeekTime,
+    reportCurrentPlanFailure,
+    roomSyncWaiting,
+    sessionId,
+    watchTogetherRoomActive,
+    watchTogetherSync,
+  ]);
 
   // Apply persisted volume on mount (separate from listener effect).
   useEffect(() => {
@@ -1678,7 +1880,7 @@ export function VideoPlayer({
     videoRef,
     effectiveSubtitleTracks,
     activeSubtitleIndex,
-    streamOriginSeconds,
+    timelineOffsetSeconds,
     subtitleDelayMs,
     durationRef,
     subtitleFetchAnchorRef,
@@ -1693,62 +1895,82 @@ export function VideoPlayer({
     subtitleUrls,
     activeSubtitleIndex,
     isDetached,
-    streamOriginSeconds,
+    timelineOffsetSeconds,
     subtitleDelayMs,
   );
 
-  // -- Bitmap (PGS/DVD/DVB) subtitle burn-in --
-  // Bitmap tracks are composited into the video server-side (the "Plex
-  // route"): selecting one restarts the transcode with subtitle_burn_in at
-  // the current aligned position, reusing the same restart machinery as a
-  // quality/audio switch (including its loading state). No client-side
-  // renderer runs for these tracks — useSubtitleTracks skips bitmap codecs.
-  const externalSubtitleCount = useMemo(
-    () => subtitleUrls.filter((track) => track.source === "external").length,
-    [subtitleUrls],
-  );
+  // -- Authoritative subtitle track selection --
+  // Some tracks (bitmap PGS/DVD/DVB) cannot be delivered as a sidecar and are
+  // published `burn_in_only`: the server composites them into the video. The
+  // client does not decide that and does not translate ordinals for it — it
+  // asks for the track by the server's own combined ordinal and the plan comes
+  // back with `subtitle.mode === "burn_in"`.
   const activeSubtitleTrack =
     activeSubtitleIndex !== null
       ? (effectiveSubtitleTracks.find((track) => track.index === activeSubtitleIndex) ?? null)
       : null;
-  // ffmpeg's burn-in filters index subtitle streams only, so translate the
-  // session-wide track index (external tracks list first) into the embedded
-  // subtitle ordinal.
-  const burnInSubtitleOrdinal =
-    activeSubtitleTrack &&
-    activeSubtitleTrack.source === "embedded" &&
-    isBitmapCodec(activeSubtitleTrack.codec)
-      ? activeSubtitleTrack.index - externalSubtitleCount
-      : null;
-  const burnInSubtitleMediaFileId =
-    burnInSubtitleOrdinal != null ? activeSubtitleTrack?.media_file_id : undefined;
-  const setSubtitleBurnIn = transcodeQuality.setSubtitleBurnIn;
+  const requestedSubtitleTrackChangeRef = useRef<string | null>(null);
   useEffect(() => {
-    // Until the element has media loaded (an auto-selected bitmap preference
-    // at session start, or a stream restart), currentTime still reads 0
-    // rather than the resume/seek target — use the intended position instead,
-    // exactly like the subtitle window fetcher does.
-    const video = videoRef.current;
-    const position =
-      video && video.readyState > 0
-        ? currentTimeRef.current
-        : (subtitleFetchAnchorRef.current ?? 0);
-    setSubtitleBurnIn(burnInSubtitleOrdinal, position, burnInSubtitleMediaFileId);
-  }, [burnInSubtitleMediaFileId, burnInSubtitleOrdinal, setSubtitleBurnIn]);
-
-  // A failed burn-in restart rolls the transcode hook back to no bitmap
-  // subtitle. Mirror that rollback in the visible selection so the UI never
-  // claims an unavailable track is active, and selecting it again performs a
-  // real retry instead of being suppressed as an unchanged selection.
-  useEffect(() => {
-    if (
-      burnInSubtitleOrdinal != null &&
-      transcodeQuality.burnInSubtitleIndex == null &&
-      transcodeQuality.error
-    ) {
-      setActiveSubtitleIndex(null);
+    const desiredServerIndex = pendingServerSubtitleSelection(
+      plan.subtitle.mode,
+      plan.selected_tracks.subtitle?.index ?? null,
+      activeSubtitleIndex,
+      activeSubtitleTrack?.burn_in_only === true,
+    );
+    if (desiredServerIndex === undefined) {
+      requestedSubtitleTrackChangeRef.current = null;
+      return;
     }
-  }, [burnInSubtitleOrdinal, transcodeQuality.burnInSubtitleIndex, transcodeQuality.error]);
+
+    const requestKey = `${plan.plan_id}:${desiredServerIndex ?? "none"}`;
+    if (requestedSubtitleTrackChangeRef.current === requestKey) return;
+    requestedSubtitleTrackChangeRef.current = requestKey;
+
+    // Until the element has media loaded (an auto-selected bitmap preference at
+    // session start, or a stream reload), currentTime still reads 0 rather than
+    // the resume/seek target — use the intended position, as the subtitle
+    // window fetcher does.
+    const position = subtitleStartPositionSeconds(
+      videoRef.current?.readyState ?? 0,
+      currentTimeRef.current,
+      subtitleFetchAnchorRef.current,
+    );
+    onSubtitleTrackChange?.(desiredServerIndex, position);
+  }, [
+    activeSubtitleIndex,
+    activeSubtitleTrack?.burn_in_only,
+    onSubtitleTrackChange,
+    plan.plan_id,
+    plan.selected_tracks.subtitle?.index,
+    plan.subtitle.mode,
+  ]);
+
+  // A refused replan leaves the previous stream playing, so the selection has
+  // to roll back too: without this the menu would keep claiming a track is on
+  // that the server never rendered, and re-picking it would be suppressed as an
+  // unchanged selection instead of retrying. Pin the accepted selection just
+  // like a manual choice so auto-selection does not immediately request the
+  // rejected track again; a later user choice can still retry it explicitly.
+  // The rollback is silent otherwise: the refusal is only rendered inside the
+  // quality menu, which the user has no reason to open after picking a
+  // subtitle. Clearing the request ref keeps this to one toast per refusal.
+  useEffect(() => {
+    if (requestedSubtitleTrackChangeRef.current && replanError && !replanning) {
+      subtitleSelectionWasManualRef.current = true;
+      setActiveSubtitleIndex(plan.selected_tracks.subtitle?.index ?? null);
+      requestedSubtitleTrackChangeRef.current = null;
+      toast.error(replanErrorTitle ?? "That subtitle track can't be used", {
+        description: replanError,
+      });
+    }
+  }, [plan.selected_tracks.subtitle?.index, replanError, replanErrorTitle, replanning]);
+
+  // A refusal pin belongs only to the session that rejected the automatic
+  // selection. Clear it before the auto-selection effect evaluates a new
+  // session so the viewer's persisted subtitle mode applies to the next title.
+  useEffect(() => {
+    subtitleSelectionWasManualRef.current = false;
+  }, [sessionId]);
 
   // -- Auto-select subtitle track based on mode --
   useEffect(() => {
@@ -1801,11 +2023,8 @@ export function VideoPlayer({
     audioTracks,
     activeAudioIndex,
     selectedVersion,
+    sessionId,
   ]);
-
-  useEffect(() => {
-    subtitleSelectionWasManualRef.current = false;
-  }, [sessionId]);
 
   // -- Control callbacks --
   const handlePlayPause = useCallback(() => {
@@ -1962,11 +2181,12 @@ export function VideoPlayer({
     displayMode === "foreground",
   );
 
+  // The id is the plan's own quality label, handed back to the server verbatim.
   const handleQualitySelect = useCallback(
     (id: string) => {
-      switchQuality(id, currentTime);
+      onQualitySelect?.(id, currentTime);
     },
-    [currentTime, switchQuality],
+    [currentTime, onQualitySelect],
   );
 
   const handlePlayPauseRef = useRef(handlePlayPause);
@@ -2476,24 +2696,28 @@ export function VideoPlayer({
           onSubtitleDelayChange={setSubtitleDelayMs}
           mediaFileId={activeFileId ?? undefined}
           playerConfig={playerConfig}
-          onRefreshSubtitles={onRefreshSubtitles}
+          onRefreshSubtitles={
+            onRefreshSubtitles ? () => onRefreshSubtitles(getSubtitleStartPosition()) : undefined
+          }
           sessionId={sessionId}
           getSubtitleStartPosition={getSubtitleStartPosition}
           audioTracks={audioTracks}
           activeAudioIndex={activeAudioIndex}
           onAudioSelect={onAudioSelect}
-          qualityOptions={transcodeQuality.qualityOptions}
-          activeQualityId={transcodeQuality.activeQualityId}
-          isTranscoding={transcodeQuality.isTranscoding}
-          qualityError={transcodeQuality.error}
+          qualityOptions={qualityOptions}
+          activeQualityId={activeQualityId}
+          isTranscoding={replanning}
+          qualityError={replanError}
           onQualitySelect={handleQualitySelect}
           versions={
             versions.length > 1
               ? versions.map((v) => ({
                   fileId: v.file_id,
                   label: `${v.resolution} ${v.codec_video.toUpperCase()}${v.hdr ? " HDR" : ""}`,
-                  isCurrentSource: v.file_id === transcodeQuality.effectiveVersion?.file_id,
-                  isRequestedSource: v.file_id === selectedVersion?.file_id,
+                  // The server names the file it actually planned against; a
+                  // fallback to an alternate version shows up here.
+                  isCurrentSource: v.file_id === plan.effective_media_file_id,
+                  isRequestedSource: v.file_id === plan.requested_media_file_id,
                 }))
               : undefined
           }
@@ -2523,9 +2747,8 @@ export function VideoPlayer({
           videoRef={videoRef}
           containerRef={containerRef}
           streamUrl={effectiveStreamUrl}
-          playMethod={displayedPlaybackState.playMethod}
-          playbackInfo={displayedPlaybackState.playbackInfo}
-          currentSourceVersion={transcodeQuality.effectiveVersion ?? selectedVersion}
+          plan={plan}
+          currentSourceVersion={effectiveVersion}
           requestedVersion={selectedVersion}
           onClose={() => setShowPlaybackInfo(false)}
         />

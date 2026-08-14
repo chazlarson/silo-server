@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest";
 import type { AdminSession } from "@/api/types";
 import {
+  classifyActivityMethod,
+  compareActivityMethods,
+  isJellyfinSession,
   formatContainerDetail,
   formatDeliveredAudioSummary,
   formatDeliveredContainerSummary,
@@ -10,6 +13,8 @@ import {
   formatTranscodeModeSummary,
   formatVideoDetail,
   formatVideoSummary,
+  getSessionClientLabel,
+  getSessionClientLabelFull,
   normalizeContainerDecision,
   normalizeStreamDecision,
 } from "./adminActivityPresentation";
@@ -31,6 +36,15 @@ function makeSession(overrides: Partial<AdminSession> = {}): AdminSession {
     updated_at: overrides.updated_at ?? new Date().toISOString(),
     position_seconds: overrides.position_seconds ?? 300,
     is_paused: overrides.is_paused ?? false,
+    client_name: overrides.client_name,
+    client_version: overrides.client_version,
+    client_build: overrides.client_build,
+    client_channel: overrides.client_channel,
+    client_label: overrides.client_label,
+    client_label_full: overrides.client_label_full,
+    client_user_agent: overrides.client_user_agent,
+    effective_play_method: overrides.effective_play_method,
+    is_jellyfin_client: overrides.is_jellyfin_client,
     audio_track_index: overrides.audio_track_index ?? 0,
     transcode_audio: overrides.transcode_audio ?? true,
     stream_bitrate_kbps: overrides.stream_bitrate_kbps ?? 8000,
@@ -139,6 +153,137 @@ describe("adminActivityPresentation", () => {
     ).toBe("Audio SW");
   });
 
+  it("buckets activity sessions by the backend's per-stream decisions", () => {
+    // Only the audio stream re-encoded (video copied) → "audio".
+    expect(
+      classifyActivityMethod(
+        makeSession({
+          play_method: "remux",
+          video_decision: "remux",
+          audio_decision: "transcode",
+          transcode_audio: true,
+        }),
+      ),
+    ).toBe("audio");
+    // Same audio-only shape reported via the HLS path (play_method "transcode",
+    // video copied) still counts as an audio transcode, not video.
+    expect(
+      classifyActivityMethod(
+        makeSession({
+          play_method: "transcode",
+          video_decision: "remux",
+          audio_decision: "transcode",
+          transcode_audio: true,
+        }),
+      ),
+    ).toBe("audio");
+
+    // Full video transcode (with or without audio) stays in the "transcode" bucket.
+    expect(
+      classifyActivityMethod(
+        makeSession({
+          play_method: "transcode",
+          video_decision: "transcode",
+          audio_decision: "transcode",
+          transcode_audio: true,
+        }),
+      ),
+    ).toBe("transcode");
+
+    // Video-copy HLS repackage (play_method "transcode" but nothing re-encoded)
+    // must count as remux, NOT a video transcode.
+    expect(
+      classifyActivityMethod(
+        makeSession({
+          play_method: "transcode",
+          video_decision: "remux",
+          audio_decision: "remux",
+          transcode_audio: false,
+        }),
+      ),
+    ).toBe("remux");
+
+    // Direct play and plain remux keep their expected buckets.
+    expect(
+      classifyActivityMethod(
+        makeSession({
+          play_method: "direct",
+          video_decision: "direct",
+          audio_decision: "direct",
+          transcode_audio: false,
+        }),
+      ),
+    ).toBe("direct");
+    expect(
+      classifyActivityMethod(
+        makeSession({
+          play_method: "remux",
+          video_decision: "remux",
+          audio_decision: "remux",
+          transcode_audio: false,
+        }),
+      ),
+    ).toBe("remux");
+  });
+
+  it("prefers the server-computed effective_play_method when present", () => {
+    // The server already reduced the decisions; the local fallback must not
+    // second-guess it even when the raw fields disagree.
+    expect(
+      classifyActivityMethod(
+        makeSession({
+          effective_play_method: "remux",
+          play_method: "transcode",
+          video_decision: "transcode",
+          audio_decision: "transcode",
+        }),
+      ),
+    ).toBe("remux");
+  });
+
+  it("buckets rows with unknown stream state as unknown, not audio", () => {
+    // A legacy/stale row (unrecognized play_method, no decisions) with the
+    // transcode_audio flag set is not a known audio transcode.
+    expect(
+      classifyActivityMethod(
+        makeSession({
+          play_method: "",
+          video_decision: undefined,
+          audio_decision: undefined,
+          transcode_audio: true,
+        }),
+      ),
+    ).toBe("unknown");
+    expect(
+      classifyActivityMethod(
+        makeSession({
+          play_method: "hls",
+          video_decision: undefined,
+          audio_decision: undefined,
+          transcode_audio: true,
+        }),
+      ),
+    ).toBe("unknown");
+  });
+
+  it("orders activity buckets with audio after video transcode", () => {
+    const sorted = ["audio", "unknown", "transcode", "direct", "remux"].sort(
+      compareActivityMethods,
+    );
+    expect(sorted).toEqual(["direct", "remux", "transcode", "audio", "unknown"]);
+  });
+
+  it("tags Jellyfin-ecosystem clients for the JF pill", () => {
+    // The server identifies Jellyfin-ecosystem clients (it owns the token
+    // list) and emits is_jellyfin_client; the UI trusts only that field.
+    expect(isJellyfinSession(makeSession({ is_jellyfin_client: true }))).toBe(true);
+    expect(isJellyfinSession(makeSession({ is_jellyfin_client: false }))).toBe(false);
+    // Servers without the field (or no client metadata at all) → no pill,
+    // even when the client name looks like a Jellyfin client.
+    expect(isJellyfinSession(makeSession({ client_name: "Jellyfin Web" }))).toBe(false);
+    expect(isJellyfinSession(makeSession())).toBe(false);
+  });
+
   it("labels HLS copy-original sessions as container HLS with copied video", () => {
     const session = makeSession({
       play_method: "transcode",
@@ -154,5 +299,32 @@ describe("adminActivityPresentation", () => {
     expect(normalizeStreamDecision(session.audio_decision)).toBe("transcode");
     expect(formatDeliveredContainerSummary(session)).toBe("HLS");
     expect(formatVideoDetail(session)).toBe("Video stream copied");
+  });
+
+  it("prefers the server's exact client label in the full label", () => {
+    const session = makeSession({
+      client_name: "Silo Android TV",
+      client_version: "1.0.0",
+      client_build: "5",
+      client_label: "Silo Android TV 1.0.0",
+      client_label_full: "Silo Android TV 1.0.0 (build 5)",
+    });
+
+    expect(getSessionClientLabelFull(session)).toBe("Silo Android TV 1.0.0 (build 5)");
+    // The compact row label keeps its unchanged width.
+    expect(getSessionClientLabel(session)).toBe("Silo Android TV 1.0.0");
+  });
+
+  it("falls back to the compact label, then to name and version", () => {
+    expect(
+      getSessionClientLabelFull(
+        makeSession({ client_label: "Chrome 120", client_name: "Chrome", client_version: "120.0" }),
+      ),
+    ).toBe("Chrome 120");
+    expect(
+      getSessionClientLabelFull(makeSession({ client_name: "Silo iOS", client_version: "2.1.0" })),
+    ).toBe("Silo iOS 2.1.0");
+    expect(getSessionClientLabelFull(makeSession({ client_name: "Silo iOS" }))).toBe("Silo iOS");
+    expect(getSessionClientLabelFull(makeSession())).toBe("");
   });
 });

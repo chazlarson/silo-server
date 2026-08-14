@@ -94,8 +94,9 @@ type pluginInstallationUpdateRequest struct {
 }
 
 type pluginConfigRequest struct {
-	Key   string         `json:"key"`
-	Value map[string]any `json:"value"`
+	Key          string         `json:"key"`
+	Value        map[string]any `json:"value"`
+	ClearSecrets []string       `json:"clear_secrets,omitempty"`
 }
 
 type pluginAuthBindingRequest struct {
@@ -157,6 +158,7 @@ type pluginInstallationResponse struct {
 	Version            string                   `json:"version"`
 	InstallPath        string                   `json:"install_path"`
 	Enabled            bool                     `json:"enabled"`
+	Kind               string                   `json:"kind"`
 	UpdatePolicy       string                   `json:"update_policy"`
 	AvailableVersion   *string                  `json:"available_version,omitempty"`
 	SourceKind         string                   `json:"source_kind"`
@@ -291,8 +293,9 @@ type pluginAssetJSON struct {
 }
 
 type pluginConfigValueJSON struct {
-	Key   string         `json:"key"`
-	Value map[string]any `json:"value"`
+	Key               string         `json:"key"`
+	Value             map[string]any `json:"value"`
+	ConfiguredSecrets []string       `json:"configured_secrets,omitempty"`
 }
 
 type pluginAuthBindingJSON struct {
@@ -320,6 +323,11 @@ type pluginUserSettingsSummary struct {
 	UserConfigSchema []pluginConfigSchemaJSON `json:"user_config_schema"`
 	Routes           []pluginRouteJSON        `json:"routes"`
 	Assets           []pluginAssetJSON        `json:"assets"`
+	// Category is the manifest's optional slash-delimited grouping path
+	// (e.g. "Tools/Utilities") used to group plugin entries in the
+	// user-facing Apps navigation. Empty (omitted) when the manifest
+	// declares no category. Additive-only per v1 API rules.
+	Category string `json:"category,omitempty"`
 }
 
 type pluginUserSettingsListResponse struct {
@@ -847,6 +855,8 @@ func uploadErrorResponse(err error) (int, string) {
 		return http.StatusConflict, "Upload session is incomplete"
 	case errors.Is(err, uploads.ErrAlreadyCompleted):
 		return http.StatusConflict, "Upload session is already complete"
+	case errors.Is(err, uploads.ErrChunkBusy):
+		return http.StatusConflict, "This chunk is already being uploaded"
 	case errors.Is(err, uploads.ErrInvalidChunk), errors.Is(err, uploads.ErrInvalidRequest):
 		return http.StatusBadRequest, err.Error()
 	default:
@@ -875,6 +885,10 @@ func (h *PluginHandler) HandleUpdateInstallation(w http.ResponseWriter, r *http.
 		}
 		slog.ErrorContext(r.Context(), "loading current plugin installation", "component", "api", "error", err)
 		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to load plugin installation")
+		return
+	}
+	if currentInstallation.IsBuiltin() {
+		writeError(w, http.StatusConflict, "builtin_installation", "Built-in host providers cannot be modified")
 		return
 	}
 
@@ -928,6 +942,9 @@ func (h *PluginHandler) HandleApplyUpdate(w http.ResponseWriter, r *http.Request
 		writeError(w, http.StatusBadRequest, "bad_request", "Invalid installation ID")
 		return
 	}
+	if h.rejectBuiltinInstallation(w, r, id) {
+		return
+	}
 
 	installation, err := h.service.UpdateToAvailableVersion(r.Context(), id)
 	if err != nil {
@@ -969,8 +986,13 @@ func (h *PluginHandler) HandlePutInstallationConfig(w http.ResponseWriter, r *ht
 		writeError(w, http.StatusInternalServerError, "internal_error", "Plugin service not configured")
 		return
 	}
+	if h.rejectBuiltinInstallation(w, r, id) {
+		return
+	}
 
-	if err := h.service.SetGlobalConfig(r.Context(), id, req.Key, req.Value); err != nil {
+	if err := h.service.SetGlobalConfigWithClears(
+		r.Context(), id, req.Key, req.Value, req.ClearSecrets,
+	); err != nil {
 		var validationErr *plugins.ConfigValidationError
 		switch {
 		case errors.As(err, &validationErr):
@@ -1007,8 +1029,13 @@ func (h *PluginHandler) HandleTestInstallationConfig(w http.ResponseWriter, r *h
 		writeError(w, http.StatusBadRequest, "bad_request", "key is required")
 		return
 	}
+	if h.rejectBuiltinInstallation(w, r, id) {
+		return
+	}
 
-	if err := h.service.TestGlobalConfig(r.Context(), id, req.Key, req.Value); err != nil {
+	if err := h.service.TestGlobalConfigWithClears(
+		r.Context(), id, req.Key, req.Value, req.ClearSecrets,
+	); err != nil {
 		if errors.Is(err, plugins.ErrInstallationNotFound) {
 			writeError(w, http.StatusNotFound, "not_found", "Plugin installation not found")
 			return
@@ -1041,6 +1068,10 @@ func (h *PluginHandler) HandlePutAuthBinding(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
+	if h.rejectBuiltinInstallation(w, r, id) {
+		return
+	}
+
 	var req pluginAuthBindingRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "bad_request", "Invalid request body")
@@ -1064,6 +1095,8 @@ func (h *PluginHandler) HandlePutAuthBinding(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
+	h.restartStatus.MarkRequired("plugin_auth_binding")
+	w.Header().Set("X-Silo-Restart-Required", "true")
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -1071,6 +1104,10 @@ func (h *PluginHandler) HandlePutTaskBinding(w http.ResponseWriter, r *http.Requ
 	id, err := parseNamedIDParam(r, "id")
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "bad_request", "Invalid installation ID")
+		return
+	}
+
+	if h.rejectBuiltinInstallation(w, r, id) {
 		return
 	}
 
@@ -1101,6 +1138,21 @@ func (h *PluginHandler) HandlePutTaskBinding(w http.ResponseWriter, r *http.Requ
 	writeJSON(w, http.StatusOK, pluginTaskBindingUpdateResponse{RestartRequired: true})
 }
 
+// rejectBuiltinInstallation writes a 409 and returns true when the target
+// installation is the reserved builtin row, which no plugin-management
+// endpoint may mutate. Lookup errors are left to the caller's own handling.
+func (h *PluginHandler) rejectBuiltinInstallation(w http.ResponseWriter, r *http.Request, id int) bool {
+	installation, err := h.installations.GetByID(r.Context(), id)
+	if err != nil {
+		return false
+	}
+	if !installation.IsBuiltin() {
+		return false
+	}
+	writeError(w, http.StatusConflict, "builtin_installation", "Built-in host providers cannot be modified")
+	return true
+}
+
 func (h *PluginHandler) HandleDeleteInstallation(w http.ResponseWriter, r *http.Request) {
 	id, err := parseNamedIDParam(r, "id")
 	if err != nil {
@@ -1108,9 +1160,42 @@ func (h *PluginHandler) HandleDeleteInstallation(w http.ResponseWriter, r *http.
 		return
 	}
 
-	if err := h.installations.Delete(r.Context(), id); err != nil {
+	installation, err := h.installations.GetByID(r.Context(), id)
+	if err != nil {
 		if errors.Is(err, plugins.ErrInstallationNotFound) {
 			writeError(w, http.StatusNotFound, "not_found", "Plugin installation not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to load plugin installation")
+		return
+	}
+	if installation.IsBuiltin() {
+		writeError(w, http.StatusConflict, "builtin_installation", "Built-in host providers cannot be uninstalled")
+		return
+	}
+
+	stopped := false
+	if h.service != nil {
+		if err := h.service.Stop(id); err != nil && !errors.Is(err, pluginhost.ErrClientNotFound) {
+			slog.ErrorContext(r.Context(), "stopping plugin before uninstall", "component", "api", "installation_id", id, "error", err)
+			writeError(w, http.StatusInternalServerError, "internal_error", "Failed to stop plugin installation")
+			return
+		}
+		stopped = true
+	}
+
+	if err := h.installations.Delete(r.Context(), id); err != nil {
+		if stopped && installation.Enabled {
+			if _, restartErr := h.service.Start(r.Context(), id); restartErr != nil {
+				slog.ErrorContext(r.Context(), "restarting plugin after failed uninstall", "component", "api", "installation_id", id, "error", restartErr)
+			}
+		}
+		if errors.Is(err, plugins.ErrInstallationNotFound) {
+			writeError(w, http.StatusNotFound, "not_found", "Plugin installation not found")
+			return
+		}
+		if errors.Is(err, plugins.ErrBuiltinInstallationImmutable) {
+			writeError(w, http.StatusConflict, "builtin_installation", "Built-in host providers cannot be uninstalled")
 			return
 		}
 		slog.ErrorContext(r.Context(), "deleting plugin installation", "component", "api", "error", err)
@@ -1151,6 +1236,11 @@ func (h *PluginHandler) HandleListUserPluginSettings(w http.ResponseWriter, r *h
 		Installations: make([]pluginUserSettingsSummary, 0, len(installations)),
 	}
 	for _, installation := range installations {
+		// The reserved builtin row has no manifest on disk; without this skip
+		// the whole user-scoped settings list would 500.
+		if installation.IsBuiltin() {
+			continue
+		}
 		manifest, err := plugins.LoadManifestFile(plugins.InstalledManifestPath(installation.InstallPath))
 		if err != nil {
 			slog.ErrorContext(r.Context(), "loading plugin manifest", "component", "api", "installation_id", installation.ID, "error", err)
@@ -1233,7 +1323,7 @@ func (h *PluginHandler) loadUserConfigInstallation(
 		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to load plugin installation")
 		return nil, nil, err
 	}
-	if !installation.Enabled {
+	if !installation.Enabled || installation.IsBuiltin() {
 		writeError(w, http.StatusNotFound, "not_found", "Plugin installation not found")
 		return nil, nil, plugins.ErrInstallationNotFound
 	}
@@ -1277,6 +1367,12 @@ func (h *PluginHandler) buildInstallationResponses(
 	}
 	response := make([]pluginInstallationResponse, 0, len(installations))
 	for _, installation := range installations {
+		// The reserved builtin row is not a manageable plugin: old web builds
+		// would render a phantom entry with uninstall/upgrade buttons that
+		// error, and the chain editor does not need it in this list.
+		if installation.IsBuiltin() {
+			continue
+		}
 		item, err := h.buildInstallationResponseWithBindings(
 			ctx,
 			installation,
@@ -1390,6 +1486,7 @@ func (h *PluginHandler) buildInstallationResponseWithBindings(
 		Version:            installation.Version,
 		InstallPath:        installation.InstallPath,
 		Enabled:            installation.Enabled,
+		Kind:               installation.Kind,
 		UpdatePolicy:       installation.UpdatePolicy,
 		AvailableVersion:   installation.AvailableVersion,
 		SourceKind:         sourceKind,
@@ -1403,7 +1500,7 @@ func (h *PluginHandler) buildInstallationResponseWithBindings(
 		Routes:             routes,
 		Assets:             assets,
 		Metadata:           metadata,
-		GlobalConfigs:      configValuesToJSON(configs),
+		GlobalConfigs:      configValuesToJSON(configs, manifest),
 		AuthBindings:       authBindingsForInstallation(installation.ID, authBindings),
 		TaskBindings:       taskBindingsForInstallation(installation.ID, taskBindings),
 		CreatedAt:          installation.CreatedAt,
@@ -1465,6 +1562,7 @@ func toUserPluginSettingsSummary(
 		UserConfigSchema: configSchemasToJSON(manifest.GetUserConfigSchema()),
 		Routes:           routesToJSON(manifest.GetHttpRoutes()),
 		Assets:           assetsToJSON(manifest.GetAssets()),
+		Category:         manifest.GetCategory(),
 	}
 }
 
@@ -1636,18 +1734,51 @@ func assetsToJSON(assets []*pluginv1.PackagedAsset) []pluginAssetJSON {
 	return response
 }
 
-func configValuesToJSON(configs []*plugins.RuntimeConfig) []pluginConfigValueJSON {
+func configValuesToJSON(
+	configs []*plugins.RuntimeConfig,
+	manifest *pluginv1.PluginManifest,
+) []pluginConfigValueJSON {
 	response := make([]pluginConfigValueJSON, 0, len(configs))
 	for _, config := range configs {
 		if config == nil {
 			continue
 		}
+		value := make(map[string]any)
+		configuredSecrets := make([]string, 0)
+		if manifest == nil || !plugins.HasGlobalConfigSchema(manifest, config.Key) {
+			// Without a manifest there is no trustworthy sensitivity schema.
+			// A row can also outlive a renamed/removed schema after an upgrade;
+			// fail closed rather than returning a potentially secret object.
+		} else {
+			publicFields, secretFields := plugins.GlobalConfigFieldSets(manifest, config.Key)
+			for _, field := range publicFields {
+				if saved, ok := config.Value[field]; ok {
+					value[field] = saved
+				}
+			}
+			for _, field := range secretFields {
+				if saved, ok := config.Value[field]; ok && pluginSecretConfigured(saved) {
+					configuredSecrets = append(configuredSecrets, field)
+				}
+			}
+		}
 		response = append(response, pluginConfigValueJSON{
-			Key:   config.Key,
-			Value: config.Value,
+			Key:               config.Key,
+			Value:             value,
+			ConfiguredSecrets: configuredSecrets,
 		})
 	}
 	return response
+}
+
+func pluginSecretConfigured(value any) bool {
+	if value == nil {
+		return false
+	}
+	if text, ok := value.(string); ok {
+		return strings.TrimSpace(text) != ""
+	}
+	return true
 }
 
 func authBindingsForInstallation(installationID int, bindings []*plugins.AuthBinding) []pluginAuthBindingJSON {

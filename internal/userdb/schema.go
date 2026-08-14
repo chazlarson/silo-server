@@ -124,6 +124,18 @@ CREATE TABLE IF NOT EXISTS personal_collections (
     updated_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS collection_sort_preferences (
+    profile_id TEXT NOT NULL,
+    collection_kind TEXT NOT NULL,
+    collection_id TEXT NOT NULL,
+    sort_field TEXT NOT NULL DEFAULT '',
+    sort_order TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (profile_id, collection_kind, collection_id),
+    CHECK (collection_kind IN ('library', 'user')),
+    CHECK (sort_order IN ('', 'asc', 'desc'))
+);
+
 CREATE TABLE IF NOT EXISTS personal_collection_items (
     collection_id TEXT NOT NULL,
     media_item_id TEXT NOT NULL,
@@ -180,6 +192,16 @@ CREATE TABLE IF NOT EXISTS library_playback_preferences (
     show_forced_subtitles BOOLEAN,
     updated_at TEXT NOT NULL,
     PRIMARY KEY (profile_id, library_id)
+);
+
+CREATE TABLE IF NOT EXISTS profile_onboarding (
+    profile_id TEXT NOT NULL,
+    tour_id TEXT NOT NULL,
+    last_step TEXT NOT NULL DEFAULT '',
+    completed_at TEXT,
+    skipped_at TEXT,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (profile_id, tour_id)
 );
 
 CREATE TABLE IF NOT EXISTS user_settings (
@@ -255,12 +277,112 @@ CREATE INDEX IF NOT EXISTS idx_home_item_dismissals_lookup
 
 CREATE INDEX IF NOT EXISTS idx_hidden_history_items_lookup
     ON hidden_history_items(profile_id, hidden_before);
+` + settingContractSchema + jellycompatDisplayPrefsSchema
+
+// jellycompatDisplayPrefsSchema is the dedicated home for Jellyfin
+// DisplayPreferences blobs, which used to ride user_settings under synthetic
+// jellycompat:* keys. It mirrors the PostgreSQL table in
+// migrations/sql (jellycompat_displayprefs) with user_id omitted: this
+// database is already scoped to one user. The value is opaque Jellyfin client
+// JSON stored verbatim, so it is TEXT with no json_valid CHECK — this table
+// stores what the client sent, it does not interpret it.
+const jellycompatDisplayPrefsSchema = `
+CREATE TABLE IF NOT EXISTS jellycompat_displayprefs (
+    prefs_id   TEXT NOT NULL,
+    client     TEXT NOT NULL,
+    value      TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (prefs_id, client)
+);
+`
+
+// settingContractSchema is the per-user half of the canonical settings contract
+// storage. It mirrors the PostgreSQL shape in
+// migrations/sql/20260727010621_user_setting_values.sql with user_id omitted:
+// this database is already scoped to one user. jsonb becomes TEXT plus a
+// json_valid CHECK, bigserial becomes INTEGER PRIMARY KEY AUTOINCREMENT, and
+// timestamptz becomes an RFC3339 TEXT column, matching the rest of this schema.
+//
+// This file declares no foreign keys, deliberately and consistently with every
+// other table here, so deleting a profile, library, series or device removes
+// these rows through the owning delete path rather than a cascade. The userstore
+// conformance suite holds both backends to identical behavior there.
+const settingContractSchema = `
+CREATE TABLE IF NOT EXISTS user_setting_values (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    key         TEXT NOT NULL,
+    scope       TEXT NOT NULL,
+    profile_id  TEXT,
+    client_family TEXT,
+    device_id   TEXT,
+    library_id  INTEGER,
+    series_id   TEXT,
+    value       TEXT NOT NULL CHECK (json_valid(value)),
+    revision    INTEGER NOT NULL DEFAULT 1,
+    created_at  TEXT NOT NULL,
+    updated_at  TEXT NOT NULL,
+    CHECK (scope IN ('account', 'profile', 'profile_client', 'profile_device', 'profile_library', 'profile_series')),
+    CHECK (client_family IS NULL OR client_family IN ('tv', 'mobile', 'tablet', 'desktop', 'web')),
+    CHECK (
+      (scope = 'account' AND profile_id IS NULL AND client_family IS NULL AND device_id IS NULL AND library_id IS NULL AND series_id IS NULL) OR
+      (scope = 'profile' AND profile_id IS NOT NULL AND client_family IS NULL AND device_id IS NULL AND library_id IS NULL AND series_id IS NULL) OR
+      (scope = 'profile_client' AND profile_id IS NOT NULL AND client_family IS NOT NULL AND device_id IS NULL AND library_id IS NULL AND series_id IS NULL) OR
+      (scope = 'profile_device' AND profile_id IS NOT NULL AND client_family IS NULL AND device_id IS NOT NULL AND library_id IS NULL AND series_id IS NULL) OR
+      (scope = 'profile_library' AND profile_id IS NOT NULL AND client_family IS NULL AND device_id IS NULL AND library_id IS NOT NULL AND series_id IS NULL) OR
+      (scope = 'profile_series' AND profile_id IS NOT NULL AND client_family IS NULL AND device_id IS NULL AND library_id IS NULL AND series_id IS NOT NULL)
+    )
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS user_setting_values_account_uq
+    ON user_setting_values (key) WHERE scope = 'account';
+CREATE UNIQUE INDEX IF NOT EXISTS user_setting_values_profile_uq
+    ON user_setting_values (profile_id, key) WHERE scope = 'profile';
+CREATE UNIQUE INDEX IF NOT EXISTS user_setting_values_profile_device_uq
+    ON user_setting_values (profile_id, device_id, key) WHERE scope = 'profile_device';
+CREATE UNIQUE INDEX IF NOT EXISTS user_setting_values_profile_library_uq
+    ON user_setting_values (profile_id, library_id, key) WHERE scope = 'profile_library';
+CREATE UNIQUE INDEX IF NOT EXISTS user_setting_values_profile_series_uq
+    ON user_setting_values (profile_id, series_id, key) WHERE scope = 'profile_series';
+
+CREATE INDEX IF NOT EXISTS user_setting_values_resolution_idx
+    ON user_setting_values (profile_id, key, scope);
+CREATE INDEX IF NOT EXISTS user_setting_values_series_idx
+    ON user_setting_values (profile_id, series_id);
+CREATE INDEX IF NOT EXISTS user_setting_values_library_idx
+    ON user_setting_values (profile_id, library_id);
+
+CREATE TABLE IF NOT EXISTS user_setting_mutations (
+    mutation_id  TEXT PRIMARY KEY,
+    request_hash TEXT NOT NULL,
+    result       TEXT NOT NULL CHECK (json_valid(result)),
+    created_at   TEXT NOT NULL,
+    expires_at   TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS user_setting_mutations_expiry_idx
+    ON user_setting_mutations (expires_at);
+
+CREATE TABLE IF NOT EXISTS user_setting_migration_rejects (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_table TEXT NOT NULL,
+    source_key   TEXT NOT NULL,
+    identity     TEXT NOT NULL CHECK (json_valid(identity)),
+    value        TEXT,
+    reason       TEXT NOT NULL,
+    recorded_at  TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS user_setting_migration_rejects_source_idx
+    ON user_setting_migration_rejects (source_table);
 `
 
 // InitSchema creates all tables in the given SQLite database.
 func InitSchema(db *sql.DB) error {
 	_, err := db.Exec(Schema)
 	if err != nil {
+		return err
+	}
+	if err := ensureSettingValuesClientFamily(db); err != nil {
 		return err
 	}
 	if err := ensureProfileSectionOverridesRemovedColumn(db); err != nil {
@@ -295,6 +417,111 @@ func InitSchema(db *sql.DB) error {
 	}
 	return backfillUserDevices(db)
 }
+
+// ensureSettingValuesClientFamily upgrades the canonical settings table before
+// runMigrations reads it. InitSchema runs first on every open, and SQLite
+// cannot widen a table CHECK constraint with ALTER TABLE, so an existing table
+// must be rebuilt here rather than merely gaining a nullable column. The
+// rebuild is transactional and preserves ids, revisions, values, and
+// timestamps verbatim.
+func ensureSettingValuesClientFamily(db *sql.DB) error {
+	var count int
+	if err := db.QueryRow(
+		"SELECT COUNT(*) FROM pragma_table_info(?) WHERE name = ?",
+		"user_setting_values", "client_family",
+	).Scan(&count); err != nil {
+		return fmt.Errorf("checking user_setting_values.client_family column: %w", err)
+	}
+	if count > 0 {
+		_, err := db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS user_setting_values_profile_client_uq
+			ON user_setting_values (profile_id, client_family, key) WHERE scope = 'profile_client'`)
+		if err != nil {
+			return fmt.Errorf("creating profile_client setting index: %w", err)
+		}
+		return nil
+	}
+
+	tx, err := db.Begin()
+	if err != nil {
+		return fmt.Errorf("beginning profile_client settings migration: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck
+
+	if _, err := tx.Exec(`
+CREATE TABLE user_setting_values_profile_client_new (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    key           TEXT NOT NULL,
+    scope         TEXT NOT NULL,
+    profile_id    TEXT,
+    client_family TEXT,
+    device_id     TEXT,
+    library_id    INTEGER,
+    series_id     TEXT,
+    value         TEXT NOT NULL CHECK (json_valid(value)),
+    revision      INTEGER NOT NULL DEFAULT 1,
+    created_at    TEXT NOT NULL,
+    updated_at    TEXT NOT NULL,
+    CHECK (scope IN ('account', 'profile', 'profile_client', 'profile_device', 'profile_library', 'profile_series')),
+    CHECK (client_family IS NULL OR client_family IN ('tv', 'mobile', 'tablet', 'desktop', 'web')),
+    CHECK (
+      (scope = 'account' AND profile_id IS NULL AND client_family IS NULL AND device_id IS NULL AND library_id IS NULL AND series_id IS NULL) OR
+      (scope = 'profile' AND profile_id IS NOT NULL AND client_family IS NULL AND device_id IS NULL AND library_id IS NULL AND series_id IS NULL) OR
+      (scope = 'profile_client' AND profile_id IS NOT NULL AND client_family IS NOT NULL AND device_id IS NULL AND library_id IS NULL AND series_id IS NULL) OR
+      (scope = 'profile_device' AND profile_id IS NOT NULL AND client_family IS NULL AND device_id IS NOT NULL AND library_id IS NULL AND series_id IS NULL) OR
+      (scope = 'profile_library' AND profile_id IS NOT NULL AND client_family IS NULL AND device_id IS NULL AND library_id IS NOT NULL AND series_id IS NULL) OR
+      (scope = 'profile_series' AND profile_id IS NOT NULL AND client_family IS NULL AND device_id IS NULL AND library_id IS NULL AND series_id IS NOT NULL)
+    )
+);
+INSERT INTO user_setting_values_profile_client_new
+    (id, key, scope, profile_id, client_family, device_id, library_id, series_id,
+     value, revision, created_at, updated_at)
+SELECT id, key, scope, profile_id, NULL, device_id, library_id, series_id,
+       value, revision, created_at, updated_at
+  FROM user_setting_values;
+DROP TABLE user_setting_values;
+ALTER TABLE user_setting_values_profile_client_new RENAME TO user_setting_values;
+CREATE UNIQUE INDEX user_setting_values_account_uq
+    ON user_setting_values (key) WHERE scope = 'account';
+CREATE UNIQUE INDEX user_setting_values_profile_uq
+    ON user_setting_values (profile_id, key) WHERE scope = 'profile';
+CREATE UNIQUE INDEX user_setting_values_profile_client_uq
+    ON user_setting_values (profile_id, client_family, key) WHERE scope = 'profile_client';
+CREATE UNIQUE INDEX user_setting_values_profile_device_uq
+    ON user_setting_values (profile_id, device_id, key) WHERE scope = 'profile_device';
+CREATE UNIQUE INDEX user_setting_values_profile_library_uq
+    ON user_setting_values (profile_id, library_id, key) WHERE scope = 'profile_library';
+CREATE UNIQUE INDEX user_setting_values_profile_series_uq
+    ON user_setting_values (profile_id, series_id, key) WHERE scope = 'profile_series';
+CREATE INDEX user_setting_values_resolution_idx
+    ON user_setting_values (profile_id, key, scope);
+CREATE INDEX user_setting_values_series_idx
+    ON user_setting_values (profile_id, series_id);
+CREATE INDEX user_setting_values_library_idx
+    ON user_setting_values (profile_id, library_id);
+`); err != nil {
+		return fmt.Errorf("rebuilding user_setting_values for profile_client: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("committing profile_client settings migration: %w", err)
+	}
+	return nil
+}
+
+// collectionSortPreferencesSchema is kept as its own const (rather than only
+// inlined in Schema) so migrateToV19 can create the table on databases that
+// predate it. collection_kind separates the 'library' and 'user' id spaces.
+const collectionSortPreferencesSchema = `
+CREATE TABLE IF NOT EXISTS collection_sort_preferences (
+    profile_id TEXT NOT NULL,
+    collection_kind TEXT NOT NULL,
+    collection_id TEXT NOT NULL,
+    sort_field TEXT NOT NULL DEFAULT '',
+    sort_order TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (profile_id, collection_kind, collection_id),
+    CHECK (collection_kind IN ('library', 'user')),
+    CHECK (sort_order IN ('', 'asc', 'desc'))
+);`
 
 // watchProgressSyncTriggers stamps the server-owned cursor (synced_seq) on every
 // watch_progress write and owns the LWW key: event_at defaults to the write

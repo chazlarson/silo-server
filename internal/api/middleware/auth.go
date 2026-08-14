@@ -47,6 +47,8 @@ type AuthMiddleware struct {
 	sessionValidator SessionValidator
 	apiKeyValidator  APIKeyValidator  // nil if API keys not configured
 	apiKeyUserLoader APIKeyUserLoader // nil if API keys not configured
+
+	apiKeyLastUsed *auth.APIKeyLastUsedTracker
 }
 
 // NewAuthMiddleware creates a new AuthMiddleware with the given token validator
@@ -57,6 +59,7 @@ func NewAuthMiddleware(tv TokenValidator, sv SessionValidator, akv APIKeyValidat
 		sessionValidator: sv,
 		apiKeyValidator:  akv,
 		apiKeyUserLoader: akul,
+		apiKeyLastUsed:   auth.NewAPIKeyLastUsedTracker(akv, nil),
 	}
 }
 
@@ -98,10 +101,7 @@ func (am *AuthMiddleware) RequireAuth(next http.Handler) http.Handler {
 				return
 			}
 
-			// Update last_used_at asynchronously.
-			go func(id int64) {
-				_ = am.apiKeyValidator.UpdateLastUsed(context.Background(), id)
-			}(apiKey.ID)
+			am.apiKeyLastUsed.Touch(apiKey.ID)
 
 			claims = &auth.Claims{
 				UserID:    user.ID,

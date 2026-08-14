@@ -302,6 +302,18 @@ type SettingEntry struct {
 	Value string `json:"value"`
 }
 
+// OnboardingState is one profile's progress through one onboarding tour.
+// Timestamps are RFC3339 strings, empty when unset, matching the store's
+// other per-profile tables.
+type OnboardingState struct {
+	ProfileID   string
+	TourID      string
+	LastStep    string
+	CompletedAt string
+	SkippedAt   string
+	UpdatedAt   string
+}
+
 // SectionOverride represents a per-profile section customization.
 type SectionOverride struct {
 	ID          string
@@ -362,6 +374,27 @@ type SeriesPlaybackPreference struct {
 	HDR        bool   `json:"hdr"`
 	CodecVideo string `json:"codec_video"`
 	UpdatedAt  string `json:"updated_at"`
+}
+
+// Collection kinds for CollectionSortPreference. Collection ids are unique
+// within a kind but not across the two id spaces, so the kind is part of the
+// preference's identity.
+const (
+	CollectionKindLibrary = "library"
+	CollectionKindUser    = "user"
+)
+
+// CollectionSortPreference records that a profile changed the sort order while
+// browsing a collection, overriding whatever default the collection's creator
+// configured. An empty SortField is a real choice — "show me this collection in
+// its own source order" — and is distinct from having no preference row at all.
+type CollectionSortPreference struct {
+	ProfileID      string `json:"profile_id"`
+	CollectionKind string `json:"collection_kind"`
+	CollectionID   string `json:"collection_id"`
+	SortField      string `json:"sort_field"`
+	SortOrder      string `json:"sort_order"`
+	UpdatedAt      string `json:"updated_at"`
 }
 
 // LibraryPlaybackPreference stores per-library playback settings.

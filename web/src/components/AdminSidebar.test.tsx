@@ -57,10 +57,10 @@ vi.mock("@/hooks/queries/admin/policy", () => ({
   usePolicyCapability: () => mockUsePolicyCapability(),
 }));
 
-function renderSidebar() {
+function renderSidebar(embedded = false) {
   return renderToStaticMarkup(
     <MemoryRouter initialEntries={["/admin"]}>
-      <AdminSidebar />
+      <AdminSidebar embedded={embedded} />
     </MemoryRouter>,
   );
 }
@@ -85,11 +85,26 @@ describe("AdminSidebar", () => {
     }
   });
 
+  it("renders as an embedded rail inside the mobile drawer", () => {
+    const markup = renderSidebar(true);
+
+    expect(markup).toContain('data-layout="drawer"');
+    expect(markup).toContain("relative h-full w-full");
+    expect(markup).not.toContain("fixed top-0 bottom-0 left-0");
+  });
+
   it("includes a Sections link in the content navigation", () => {
     const markup = renderSidebar();
 
     expect(markup).toContain('href="/admin/sections"');
     expect(markup).toContain(">Sections<");
+  });
+
+  it("includes Diagnostics next to the operational overview links", () => {
+    const markup = renderSidebar();
+
+    expect(markup).toContain('href="/admin/diagnostics"');
+    expect(markup).toContain(">Diagnostics<");
   });
 
   it("includes a Maintenance link in the system navigation", () => {

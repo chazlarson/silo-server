@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"math"
 	"net/http"
 	"strconv"
 	"sync"
@@ -43,6 +44,23 @@ func (mw *Middleware) ActiveBackend() string {
 		return "memory"
 	}
 	return "redis"
+}
+
+// SharedLimiter returns the process's configured per-key limiter, so an action
+// handler that enforces its own budget (person refresh, trailer refresh) counts
+// against the same backend the middleware uses rather than a private in-memory
+// one. That distinction only matters on Redis deployments, where a private
+// limiter would give every instance an independent allowance for the same user
+// and multiply the stated budget by the instance count.
+//
+// Handlers must tolerate nil: rate limiting is disabled outright when
+// rate_limit.enabled is false or the database is unavailable, and no limiter
+// exists then.
+func (mw *Middleware) SharedLimiter() RateLimiter {
+	if mw == nil {
+		return nil
+	}
+	return mw.perKey
 }
 
 // Init loads config and seeds defaults. Call once at startup.
@@ -91,11 +109,7 @@ func (mw *Middleware) Handler(next http.Handler) http.Handler {
 		// Check global limiter (per-second only — spec says no per-minute global limit).
 		// Setting RequestsPerMinute = RPS*60 makes the per-minute limiter a mathematical
 		// no-op: it never triggers before the per-second limiter does.
-		globalRate := Rate{
-			RequestsPerSecond: cfg.GlobalReqPerSecond,
-			RequestsPerMinute: cfg.GlobalReqPerSecond * 60,
-			Burst:             int(cfg.GlobalReqPerSecond),
-		}
+		globalRate := globalRateFor(cfg)
 		globalResult := mw.global.Allow(r.Context(), "global", globalRate)
 		if !globalResult.Allowed {
 			writeRateLimitResponse(w, globalResult)
@@ -161,8 +175,9 @@ type rateLimitError struct {
 	RetryAfter int    `json:"retry_after"`
 }
 
-// AuthEndpointHandler returns middleware for IP-based rate limiting on auth endpoints.
-// It checks both the global per-IP limit and the tighter per-endpoint limit.
+// AuthEndpointHandler returns middleware for public auth/webhook endpoints. It
+// applies the shared per-IP and endpoint-specific budgets before consuming the
+// process-wide budget, so one rejected client cannot drain capacity for others.
 func (mw *Middleware) AuthEndpointHandler(endpoint string) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -176,41 +191,59 @@ func (mw *Middleware) AuthEndpointHandler(endpoint string) func(http.Handler) ht
 			}
 
 			clientIP := clientip.FromContext(r.Context())
-			if clientIP == "" {
-				next.ServeHTTP(w, r)
-				return
-			}
-
-			// Check global per-IP limit (shared counter with authenticated routes)
-			ipRate := Rate{
-				RequestsPerSecond: cfg.IPReqPerSecond,
-				RequestsPerMinute: cfg.IPReqPerMinute,
-				Burst:             cfg.IPBurst,
-			}
-			ipResult := mw.perKey.Allow(r.Context(), "ip:"+clientIP, ipRate)
-			if !ipResult.Allowed {
-				writeRateLimitResponse(w, ipResult)
-				return
-			}
-
-			// Check per-endpoint limit
-			epCfg, ok := cfg.AuthEndpoints[endpoint]
-			if ok {
-				epRate := Rate{
-					RequestsPerSecond: epCfg.RequestsPerMinute / 60,
-					RequestsPerMinute: epCfg.RequestsPerMinute,
-					Burst:             epCfg.Burst,
+			if clientIP != "" {
+				// Check global per-IP limit (shared counter with authenticated routes)
+				ipRate := Rate{
+					RequestsPerSecond: cfg.IPReqPerSecond,
+					RequestsPerMinute: cfg.IPReqPerMinute,
+					Burst:             cfg.IPBurst,
 				}
-				epKey := fmt.Sprintf("authip:%s:%s", clientIP, endpoint)
-				epResult := mw.perKey.Allow(r.Context(), epKey, epRate)
-				if !epResult.Allowed {
-					writeRateLimitResponse(w, epResult)
+				ipResult := mw.perKey.Allow(r.Context(), "ip:"+clientIP, ipRate)
+				if !ipResult.Allowed {
+					writeRateLimitResponse(w, ipResult)
 					return
 				}
+
+				// Check per-endpoint limit
+				epCfg, ok := cfg.AuthEndpoints[endpoint]
+				if ok {
+					epRate := Rate{
+						RequestsPerSecond: epCfg.RequestsPerMinute / 60,
+						RequestsPerMinute: epCfg.RequestsPerMinute,
+						Burst:             epCfg.Burst,
+					}
+					epKey := fmt.Sprintf("authip:%s:%s", clientIP, endpoint)
+					epResult := mw.perKey.Allow(r.Context(), epKey, epRate)
+					if !epResult.Allowed {
+						writeRateLimitResponse(w, epResult)
+						return
+					}
+				}
+			}
+
+			globalRate := globalRateFor(cfg)
+			globalResult := mw.global.Allow(r.Context(), "global", globalRate)
+			if !globalResult.Allowed {
+				writeRateLimitResponse(w, globalResult)
+				return
 			}
 
 			next.ServeHTTP(w, r)
 		})
+	}
+}
+
+func globalRateFor(cfg Config) Rate {
+	requestsPerSecond := cfg.GlobalReqPerSecond
+	if math.IsNaN(requestsPerSecond) || math.IsInf(requestsPerSecond, 0) || requestsPerSecond <= 0 {
+		requestsPerSecond = DefaultConfig().GlobalReqPerSecond
+	} else if requestsPerSecond > MaxGlobalRequestsPerSecond {
+		requestsPerSecond = MaxGlobalRequestsPerSecond
+	}
+	return Rate{
+		RequestsPerSecond: requestsPerSecond,
+		RequestsPerMinute: requestsPerSecond * 60,
+		Burst:             max(1, int(math.Ceil(requestsPerSecond))),
 	}
 }
 

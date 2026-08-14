@@ -23,18 +23,19 @@ import (
 
 // SectionHandler handles section management and batch section endpoints.
 type SectionHandler struct {
-	repo           *sections.Repository
-	fetcher        *sections.Fetcher
-	previewFetcher sectionPreviewFetcher // set to fetcher at construction; separate for test injection
-	episodeFetcher sectionEpisodeFetcher
-	FolderRepo     *catalog.FolderRepository
-	EpisodeRepo    *catalog.EpisodeRepository
-	StoreProvider  userstore.UserStoreProvider
-	UserRepo       *auth.UserRepository
-	DetailSvc      *catalog.DetailService
-	Settings       catalog.SettingsStore
-	CollectionRepo *catalog.LibraryCollectionRepository
-	EbookProgress  EbookReaderProgressLister
+	repo                  *sections.Repository
+	fetcher               *sections.Fetcher
+	previewFetcher        sectionPreviewFetcher // set to fetcher at construction; separate for test injection
+	episodeFetcher        sectionEpisodeFetcher
+	FolderRepo            *catalog.FolderRepository
+	EpisodeRepo           *catalog.EpisodeRepository
+	StoreProvider         userstore.UserStoreProvider
+	UserRepo              *auth.UserRepository
+	DetailSvc             *catalog.DetailService
+	Settings              catalog.SettingsStore
+	CollectionRepo        *catalog.LibraryCollectionRepository
+	SortPreferenceCleaner *userstore.CollectionSortPreferenceCleaner
+	EbookProgress         EbookReaderProgressLister
 }
 
 // NewSectionHandler creates a new SectionHandler.
@@ -405,6 +406,8 @@ func (h *SectionHandler) deleteUnreferencedSectionManagedCollection(ctx context.
 	}
 	if err := h.CollectionRepo.Delete(ctx, collectionID); err != nil && !errors.Is(err, catalog.ErrLibraryCollectionNotFound) {
 		slog.WarnContext(ctx, "failed to delete unreferenced section-managed collection", "component", "api", "collection_id", collectionID, "error", err)
+	} else if err == nil && h.SortPreferenceCleaner != nil {
+		h.SortPreferenceCleaner.DeleteForCollection(ctx, userstore.CollectionKindLibrary, collectionID)
 	}
 }
 
@@ -1499,7 +1502,7 @@ func (h *SectionHandler) sectionPresignURL(r *http.Request, path string, variant
 }
 
 // maybeInjectNextUp injects a SectionNextUp entry after SectionContinueWatching
-// if the user's next_up_mode setting is "separate".
+// if the profile's ui.next_up_mode setting resolves to "separate".
 func (h *SectionHandler) maybeInjectNextUp(ctx context.Context, resolved []sections.ResolvedSection, userID int) []sections.ResolvedSection {
 	if h.StoreProvider == nil || userID <= 0 {
 		return resolved
@@ -1508,8 +1511,7 @@ func (h *SectionHandler) maybeInjectNextUp(ctx context.Context, resolved []secti
 	if err != nil {
 		return resolved
 	}
-	mode, _ := store.GetSetting(ctx, "next_up_mode")
-	if mode == "separate" {
+	if sections.NextUpMode(ctx, store, apimw.GetProfileID(ctx)) == sections.NextUpModeSeparate {
 		return injectNextUpSection(resolved)
 	}
 	return resolved

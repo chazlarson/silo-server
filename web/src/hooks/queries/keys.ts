@@ -158,6 +158,11 @@ export const profileKeys = {
   householdSessions: () => ["profiles", "household", "sessions"] as const,
 };
 
+export const compatKeys = {
+  all: ["compat"] as const,
+  connectInfo: () => ["compat", "connect-info"] as const,
+};
+
 export const personKeys = {
   all: ["people"] as const,
   search: (query: string, limit = 20) => ["people", "search", query, limit] as const,
@@ -198,27 +203,21 @@ export const libraryKeys = {
   user: (profileId?: string | null) => ["libraries", "user", profileId ?? "none"] as const,
 };
 
-export const libraryPlaybackPreferenceKeys = {
-  all: ["libraryPlaybackPreferences"] as const,
-  list: (profileId?: string | null) =>
-    ["libraryPlaybackPreferences", "list", profileId ?? "none"] as const,
-  library: (profileId: string | null | undefined, libraryId: number) =>
-    ["libraryPlaybackPreferences", "library", profileId ?? "none", libraryId] as const,
-};
-
 export const progressKeys = {
   all: ["progress"] as const,
   list: (status?: string, libraryId?: number) => ["progress", "list", status, libraryId] as const,
 };
 
+export const deviceKeys = {
+  all: ["devices"] as const,
+  list: (scope: "own" | "household") => ["devices", "list", scope] as const,
+};
+
 export const settingsKeys = {
+  // The canonical value queries live under ["settings", "values", …] and build
+  // their own key (effectiveSettingsQueryKey), so one invalidation of that
+  // prefix covers every scope and batch.
   all: ["settings"] as const,
-  list: () => ["settings", "list"] as const,
-  detail: (key: string) => ["settings", key] as const,
-  deviceDetail: (profileId: string | null | undefined, key: string) =>
-    ["settings", "device", profileId ?? "none", key] as const,
-  effective: (profileId: string | null | undefined, keys: string[]) =>
-    ["settings", "effective", profileId ?? "none", [...keys].sort().join(",")] as const,
   plugins: () => ["settings", "plugins"] as const,
   pluginDetail: (installationId: number) => ["settings", "plugins", installationId] as const,
 };
@@ -370,6 +369,7 @@ export const adminKeys = {
   stats: () => ["admin", "stats"] as const,
   sessions: () => ["admin", "sessions"] as const,
   serverSettings: () => ["admin", "serverSettings"] as const,
+  serverStatus: () => ["admin", "serverStatus"] as const,
   catalogSearchStatus: () => ["admin", "catalogSearchStatus"] as const,
   jellyfinCompatStatus: () => ["admin", "jellyfinCompatStatus"] as const,
   requestsRoot: () => ["admin", "requests"] as const,
@@ -379,6 +379,7 @@ export const adminKeys = {
   requestUserLimit: (userId: number) => ["admin", "requests", "users", userId, "limit"] as const,
   recommendationsStatus: () => ["admin", "recommendationsStatus"] as const,
   inviteCodes: () => ["admin", "inviteCodes"] as const,
+  invitations: () => ["admin", "invitations"] as const,
   apiKeys: () => ["admin", "apiKeys"] as const,
   rateLimitConfig: () => ["admin", "rateLimitConfig"] as const,
   playbackHistory: (params: {
@@ -392,6 +393,10 @@ export const adminKeys = {
   ipUsers: (ip: string, days?: number) => ["admin", "ips", ip, days] as const,
   operationalLogs: (params: Record<string, unknown>) => ["admin", "logs", "app", params] as const,
   auditLogs: (params: Record<string, unknown>) => ["admin", "logs", "audit", params] as const,
+  diagnosticStatus: () => ["diagnostics", "status"] as const,
+  diagnosticReports: (params: Record<string, unknown>) =>
+    ["admin", "diagnostics", "reports", params] as const,
+  diagnosticReport: (id?: string) => ["admin", "diagnostics", "reports", id ?? "none"] as const,
   policyCapability: () => ["policy", "capability"] as const,
   policyVendor: () => ["admin", "policy", "vendor"] as const,
   policyDocuments: () => ["admin", "policy", "documents"] as const,

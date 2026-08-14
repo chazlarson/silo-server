@@ -2,6 +2,7 @@ import type { ReactNode } from "react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router";
 import { AdminSessionActions } from "@/components/AdminSessionActions";
+import { JellyfinSessionPill } from "@/components/JellyfinSessionPill";
 import { useRealtimeEvents } from "@/components/realtimeEventsContext";
 import { useOperationalLogs } from "@/hooks/queries/admin/logs";
 import { usePageActivity } from "@/hooks/usePageActivity";
@@ -12,6 +13,11 @@ import type { AdminSession, OperationalLogEntry, IPUserEntry } from "@/api/types
 import { useIPUsers } from "@/hooks/queries/admin/ips";
 import { useAdminSessions } from "@/hooks/queries/admin/stats";
 import {
+  activityMethodMeta,
+  classifyActivityMethod,
+  compareActivityMethods,
+  decisionBadgeClass,
+  isJellyfinSession,
   formatAudioDetail,
   formatContainerDetail,
   formatDeliveredAudioSummary,
@@ -23,6 +29,7 @@ import {
   formatSourceContainerSummary,
   formatTranscodeModeSummary,
   getSessionClientLabel,
+  getSessionClientLabelFull,
   formatVideoDetail,
   formatVideoSummary,
   normalizeContainerDecision,
@@ -118,8 +125,10 @@ export default function AdminActivity() {
   // Aggregate counts
   const methods = useMemo(() => {
     const counts: Record<string, number> = {};
-    for (const s of sessions)
-      counts[s.play_method || "unknown"] = (counts[s.play_method || "unknown"] || 0) + 1;
+    for (const s of sessions) {
+      const method = classifyActivityMethod(s);
+      counts[method] = (counts[method] || 0) + 1;
+    }
     return counts;
   }, [sessions]);
 
@@ -141,12 +150,15 @@ export default function AdminActivity() {
           s.media_title?.toLowerCase().includes(q) ||
           s.series_name?.toLowerCase().includes(q) ||
           s.episode_name?.toLowerCase().includes(q) ||
-          getSessionClientLabel(s).toLowerCase().includes(q) ||
+          // Search the exact label, not the compact one: "which sessions are on
+          // build 5?" is the question this identity exists to answer, and the
+          // compact label deliberately omits the build.
+          getSessionClientLabelFull(s).toLowerCase().includes(q) ||
           s.client_user_agent?.toLowerCase().includes(q) ||
           s.client_ip?.toLowerCase().includes(q),
       );
     }
-    if (methodFilter) result = result.filter((s) => s.play_method === methodFilter);
+    if (methodFilter) result = result.filter((s) => classifyActivityMethod(s) === methodFilter);
     if (nodeFilter) result = result.filter((s) => s.reporting_node === nodeFilter);
     if (typeFilter) result = result.filter((s) => s.media_type === typeFilter);
 
@@ -160,7 +172,7 @@ export default function AdminActivity() {
           cmp = getDisplayTitle(a).localeCompare(getDisplayTitle(b));
           break;
         case "method":
-          cmp = (a.play_method || "").localeCompare(b.play_method || "");
+          cmp = compareActivityMethods(classifyActivityMethod(a), classifyActivityMethod(b));
           break;
         case "node":
           cmp = (a.reporting_node || "").localeCompare(b.reporting_node || "");
@@ -328,18 +340,18 @@ export default function AdminActivity() {
             </div>
             <div className="flex h-1.5 overflow-hidden rounded-full">
               {Object.entries(methods)
-                .sort(([a], [b]) => a.localeCompare(b))
+                .sort(([a], [b]) => compareActivityMethods(a, b))
                 .map(([method, count]) => (
                   <div
                     key={method}
-                    className={`transition-all duration-500 ${methodBarColor(method)}`}
+                    className={`transition-all duration-500 ${activityMethodMeta(method).swatchClass}`}
                     style={{ width: `${(count / sessions.length) * 100}%` }}
                   />
                 ))}
             </div>
             <div className="mt-2 flex flex-wrap gap-x-4 gap-y-1">
               {Object.entries(methods)
-                .sort(([a], [b]) => a.localeCompare(b))
+                .sort(([a], [b]) => compareActivityMethods(a, b))
                 .map(([method, count]) => (
                   <button
                     key={method}
@@ -349,7 +361,7 @@ export default function AdminActivity() {
                     }`}
                   >
                     <span
-                      className={`inline-block h-2 w-2 rounded-full ${methodDotColor(method)}`}
+                      className={`inline-block h-2 w-2 rounded-full ${activityMethodMeta(method).swatchClass}`}
                     />
                     <span className="font-medium capitalize">{method}</span>
                     <span className="text-muted-foreground tabular-nums">{count}</span>
@@ -520,8 +532,16 @@ function StreamRow({
   const streamMeta = [sourceContainer, streamBitrate].filter(Boolean).join(" · ");
   const clientIP = session.client_ip?.trim() || "";
   const clientLabel = getSessionClientLabel(session);
+  // The row stays compact; the exact version, build, and channel live in the
+  // tooltip and in the expanded panel's Client card.
+  const clientLabelFull = getSessionClientLabelFull(session);
+  const clientUserAgent = session.client_user_agent?.trim() || "";
+  const clientTitle = clientUserAgent
+    ? `${clientLabelFull || clientLabel} — ${clientUserAgent}`
+    : clientLabelFull || clientLabel;
   const playbackPosition = formatPlaybackPosition(session);
   const transcodeMode = formatTranscodeModeSummary(session);
+  const activityMethod = classifyActivityMethod(session);
   const containerDecision = normalizeContainerDecision(session.play_method);
   const videoDecision = normalizeStreamDecision(session.video_decision || session.play_method);
   const audioDecision = normalizeStreamDecision(
@@ -589,13 +609,11 @@ function StreamRow({
                 </span>
               </div>
             ) : null}
-            {(clientLabel || clientIP) && (
+            {(clientLabel || clientIP || isJellyfinSession(session)) && (
               <div className="text-muted-foreground mt-1 flex min-w-0 items-center gap-1.5 text-[10px]">
+                <JellyfinSessionPill session={session} />
                 {clientLabel ? (
-                  <span
-                    title={session.client_user_agent || clientLabel}
-                    className="max-w-[8rem] min-w-0 truncate"
-                  >
+                  <span title={clientTitle} className="max-w-[8rem] min-w-0 truncate">
                     {clientLabel}
                   </span>
                 ) : null}
@@ -771,10 +789,11 @@ function StreamRow({
               ) : null}
             </Link>
             <span
-              className={`inline-flex flex-shrink-0 rounded border px-1.5 py-0.5 text-[9px] font-semibold ${methodBadgeColor(session.play_method)}`}
+              className={`inline-flex flex-shrink-0 rounded border px-1.5 py-0.5 text-[9px] font-semibold capitalize ${activityMethodMeta(activityMethod).badgeClass}`}
             >
-              {session.play_method || "?"}
+              {activityMethod}
             </span>
+            <JellyfinSessionPill session={session} />
           </div>
           <div className="text-muted-foreground mt-0.5 flex items-center gap-1.5 text-[11px]">
             {itemHref ? (
@@ -790,10 +809,7 @@ function StreamRow({
           {(clientLabel || clientIP || streamMeta) && (
             <div className="text-muted-foreground mt-1 flex min-w-0 gap-1.5 text-[10px]">
               {clientLabel ? (
-                <span
-                  title={session.client_user_agent || clientLabel}
-                  className="max-w-[9rem] shrink-0 truncate"
-                >
+                <span title={clientTitle} className="max-w-[9rem] shrink-0 truncate">
                   {clientLabel}
                 </span>
               ) : null}
@@ -943,7 +959,7 @@ function PlaybackSummaryLine({
         {label}
       </span>
       <span
-        className={`inline-flex shrink-0 rounded border px-1.5 py-0.5 text-[8px] leading-none font-semibold ${methodBadgeColor(decision)}`}
+        className={`inline-flex shrink-0 rounded border px-1.5 py-0.5 text-[8px] leading-none font-semibold ${decisionBadgeClass(decision)}`}
       >
         {formatDecisionLabel(decision)}
       </span>
@@ -1040,6 +1056,7 @@ function PlaybackExpandedPanel({
             audioDecision === "transcode" && videoDecision !== "transcode" ? transcodeMode : null
           }
         />
+        <PlaybackClientCard session={session} />
       </div>
 
       {showFFmpeg ? (
@@ -1121,23 +1138,58 @@ function PlaybackDetailCard({
   mode?: string | null;
 }) {
   return (
+    <PlaybackDetailCardShell
+      label={label}
+      badge={
+        <span
+          className={`inline-flex rounded border px-1.5 py-0.5 text-[9px] font-semibold ${decisionBadgeClass(decision)}`}
+        >
+          {formatDecisionLabel(decision)}
+        </span>
+      }
+    >
+      <PlaybackDetailLine label="Source" value={source} />
+      <PlaybackDetailLine label="Delivered" value={delivered} />
+      {mode ? <PlaybackDetailLine label="Mode" value={mode} /> : null}
+      <PlaybackDetailLine label="Detail" value={detail} muted />
+    </PlaybackDetailCardShell>
+  );
+}
+
+/**
+ * The exact streaming client: app name, version, build, and channel, with the
+ * raw user agent underneath. This is the surface that answers "which build is
+ * this?" — the session rows only have room for the compact label.
+ */
+function PlaybackClientCard({ session }: { session: AdminSession }) {
+  const label = getSessionClientLabelFull(session) || "Unknown client";
+  const userAgent = session.client_user_agent?.trim() || "";
+  return (
+    <PlaybackDetailCardShell label="Client">
+      <PlaybackDetailLine label="App" value={label} />
+      {userAgent ? <PlaybackDetailLine label="Agent" value={userAgent} muted /> : null}
+    </PlaybackDetailCardShell>
+  );
+}
+
+function PlaybackDetailCardShell({
+  label,
+  badge,
+  children,
+}: {
+  label: string;
+  badge?: ReactNode;
+  children: ReactNode;
+}) {
+  return (
     <div className="rounded-lg border border-[var(--terminal-border)]/60 bg-[var(--terminal-bg)]/60 px-3 py-2">
       <div className="mb-2 flex items-center gap-2">
         <span className="text-[10px] font-semibold tracking-[0.18em] text-[var(--terminal-muted)] uppercase">
           {label}
         </span>
-        <span
-          className={`inline-flex rounded border px-1.5 py-0.5 text-[9px] font-semibold ${methodBadgeColor(decision)}`}
-        >
-          {formatDecisionLabel(decision)}
-        </span>
+        {badge}
       </div>
-      <div className="grid gap-1 text-[11px]">
-        <PlaybackDetailLine label="Source" value={source} />
-        <PlaybackDetailLine label="Delivered" value={delivered} />
-        {mode ? <PlaybackDetailLine label="Mode" value={mode} /> : null}
-        <PlaybackDetailLine label="Detail" value={detail} muted />
-      </div>
+      <div className="grid gap-1 text-[11px]">{children}</div>
     </div>
   );
 }
@@ -1296,47 +1348,4 @@ function stringAttr(entry: OperationalLogEntry, key: string) {
   if (typeof value === "string" && value.length > 0) return value;
   if (typeof value === "number") return String(value);
   return "-";
-}
-
-function methodBadgeColor(method: string): string {
-  switch (method) {
-    case "direct":
-      return "bg-success/10 text-success border-success/15";
-    case "copy":
-    case "remux":
-    case "hls":
-      return "bg-info/10 text-info border-info/15";
-    case "transcode":
-      return "bg-warning/10 text-warning border-warning/15";
-    default:
-      return "bg-surface text-muted-foreground border-border";
-  }
-}
-
-function methodBarColor(method: string): string {
-  switch (method) {
-    case "direct":
-      return "bg-success";
-    case "copy":
-    case "remux":
-    case "hls":
-      return "bg-info";
-    case "transcode":
-      return "bg-warning";
-    default:
-      return "bg-muted-foreground";
-  }
-}
-
-function methodDotColor(method: string): string {
-  switch (method) {
-    case "direct":
-      return "bg-success";
-    case "remux":
-      return "bg-info";
-    case "transcode":
-      return "bg-warning";
-    default:
-      return "bg-muted-foreground";
-  }
 }

@@ -3,9 +3,6 @@
  * Zero imports from app-specific code.
  */
 
-/** How the server will deliver the stream. */
-export type PlayMethod = "direct" | "remux" | "transcode";
-
 /** Subtitle display mode. */
 export type SubtitleMode = "off" | "auto" | "always";
 
@@ -79,6 +76,7 @@ export interface PlayerVideoTrack {
   frame_rate?: string;
   bitrate?: number;
   video_range?: string;
+  color_range?: string;
   color_primaries?: string;
   color_space?: string;
   color_transfer?: string;
@@ -100,24 +98,24 @@ export interface PlayerAudioTrack {
   default?: boolean;
 }
 
-export interface PlaybackSessionPlaybackInfo {
-  stream_type: "progressive" | "hls";
-  transcode_audio: boolean;
-  video_codec: string;
-  audio_codec: string;
-}
-
 /** Subtitle track information. */
 export interface PlayerSubtitleInfo {
+  /**
+   * The server's combined ordinal for this track, copied verbatim from the
+   * plan's subtitle inventory. It is the identity echoed back on a track
+   * change; it is never derived by counting or summing track arrays.
+   */
   index: number;
   /** Media file whose subtitle inventory assigned this track index. */
   media_file_id?: number;
   /**
-   * Downloaded-subtitle row id, when this track is a stored downloaded subtitle.
-   * Lets the player match a translation-completed / `subtitle_ready` event
-   * (which carries the DB id) to a track after a list refresh.
+   * The server publishes this track but cannot deliver it as a sidecar, so
+   * selecting it asks the server to composite it into the video instead of
+   * rendering it in the browser.
    */
-  id?: number;
+  burn_in_only?: boolean;
+  /** Server-assigned track identity, echoed back on a track change. */
+  track_id?: string;
   language: string;
   codec?: string;
   label: string;
@@ -188,40 +186,6 @@ export interface MarkerRegionView {
   end: number;
 }
 
-/** Response from POST /playback/start. */
-export interface PlaybackSessionResponse {
-  session_id: string;
-  user_id: number;
-  profile_id: string;
-  media_file_id: number;
-  play_method: PlayMethod;
-  position: number;
-  is_paused: boolean;
-  stream_url: string;
-  audio_track_index: number;
-  duration_seconds: number | null;
-  subtitle_urls?: PlayerSubtitleInfo[];
-  playback_info?: PlaybackSessionPlaybackInfo;
-}
-
-/** Response from PATCH /playback/{session_id}/audio. */
-export interface ChangeAudioResponse {
-  audio_track_index: number;
-  play_method: PlayMethod;
-  stream_url: string;
-  switch_mode: "reload";
-  playback_info?: PlaybackSessionPlaybackInfo;
-}
-
-/** Client codec capabilities sent to the server. */
-export interface ClientCodecCapabilities {
-  codecs_video: string[];
-  codecs_audio: string[];
-  containers: string[];
-  max_resolution: string;
-  hdr: boolean;
-}
-
 /** Hints from the last playback session for version selection on resume. */
 export interface ResumeHints {
   lastFileId?: number;
@@ -276,6 +240,8 @@ export interface WatchPageProps {
   initialPosition?: number;
   forceInitialPosition?: boolean;
   qualityPreference?: string | null;
+  /** Bandwidth cap in kbps from playback.max_bitrate_kbps; null/undefined is uncapped. */
+  maxBitrateKbps?: number | null;
   explicitAudioTrackIndex?: number | null;
   preferredSubtitleLanguage?: string | null;
   preferredSubtitleTrackSignature?: PlayerSubtitleTrackSignature | null;
@@ -315,20 +281,6 @@ export interface QualityOption {
   resolution: string;
   bitrateKbps: number;
   isOriginal: boolean;
-}
-
-/** Request body for POST /playback/transcode/start. */
-export interface TranscodeStartRequest {
-  session_id: string;
-  seek_seconds: number;
-  target_resolution: string;
-  target_codec_video: string;
-  target_codec_audio: string;
-  target_bitrate_kbps: number;
-  segment_duration: number;
-  subtitle_track_index: number;
-  subtitle_media_file_id?: number;
-  subtitle_burn_in: boolean;
 }
 
 /** Context for series playback (episode navigation). */

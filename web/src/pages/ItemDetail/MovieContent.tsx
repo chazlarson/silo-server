@@ -34,6 +34,7 @@ import MediaInfoDialog from "./components/MediaInfoDialog";
 import SubtitleSearchDialog from "./components/SubtitleSearchDialog";
 import { sortByResolution } from "./components/VersionFlyout";
 import { selectDefaultPlaybackVariantVersion } from "./components/versionRankingUtils";
+import { resolveSelectedMediaSummary } from "./components/selectedMediaSummary";
 import { RecommendationGridSkeleton } from "./components/SectionSkeletons";
 import { resolveLeafPrimaryAction } from "./itemDetailLayout";
 import { getWatchedActionLabel } from "./watchedState";
@@ -41,13 +42,8 @@ import {
   canCurateMetadata as canCurateMetadataForUser,
   canEditMarkers as canEditMarkersForUser,
 } from "@/lib/permissions";
-
-function formatDuration(minutes: number): string {
-  if (minutes <= 0) return "";
-  const h = Math.floor(minutes / 60);
-  const m = minutes % 60;
-  return h > 0 ? `${h}h ${m}m` : `${m}m`;
-}
+import { formatRuntimeMinutes } from "@/lib/mediaFormat";
+import { useQualityPreference } from "@/hooks/queries/qualityPreference";
 
 export default function MovieContent({ item }: { item: ItemDetail & { type: "movie" } }) {
   const { translating: overviewTranslating, onTranslate: onTranslateOverview } =
@@ -57,6 +53,10 @@ export default function MovieContent({ item }: { item: ItemDetail & { type: "mov
   const { user } = useAuth();
   const isAdmin = useIsActingAdmin();
   const { profile: currentProfile } = useCurrentProfile();
+  // The resolution cap comes from the settings contract, where the quality
+  // picker writes; the profile column it falls back to is only the pre-cutover
+  // choice, since that picker no longer mirrors into it.
+  const qualityPreference = useQualityPreference(currentProfile?.quality_preference);
   const canCurateMetadata = canCurateMetadataForUser(user, currentProfile);
   const canEditMarkers = canEditMarkersForUser(user, currentProfile);
 
@@ -88,11 +88,11 @@ export default function MovieContent({ item }: { item: ItemDetail & { type: "mov
         sortedVersions,
         item.playback_variants,
         userData,
-        currentProfile?.quality_preference,
+        qualityPreference,
         item.effective_version_edition_key,
       ),
     [
-      currentProfile?.quality_preference,
+      qualityPreference,
       item.effective_version_edition_key,
       item.playback_variants,
       sortedVersions,
@@ -106,6 +106,10 @@ export default function MovieContent({ item }: { item: ItemDetail & { type: "mov
         ? (sortedVersions.find((version) => version.file_id === manualSelectedFileId) ?? null)
         : null) ?? defaultSelectedVersion,
     [defaultSelectedVersion, manualSelectedFileId, sortedVersions],
+  );
+  const selectedMediaSummary = useMemo(
+    () => resolveSelectedMediaSummary(selectedVersion, item.playback_variants, item.runtime ?? 0),
+    [item.playback_variants, item.runtime, selectedVersion],
   );
   const openMediaInfo = useCallback(
     (fileId?: number) => {
@@ -236,9 +240,9 @@ export default function MovieContent({ item }: { item: ItemDetail & { type: "mov
             <MetadataBadges
               year={year || undefined}
               contentRating={item.content_rating || undefined}
-              duration={formatDuration(item.runtime ?? 0) || undefined}
+              duration={formatRuntimeMinutes(selectedMediaSummary.durationMinutes) || undefined}
             />
-            <QualityBadges versions={item.versions} />
+            <QualityBadges summary={selectedMediaSummary} />
           </div>
         }
         scoreRow={
@@ -320,7 +324,7 @@ export default function MovieContent({ item }: { item: ItemDetail & { type: "mov
             }
             rating={item.user_rating ?? null}
             onRatingChange={handleRatingChange}
-            qualityPreference={currentProfile?.quality_preference}
+            qualityPreference={qualityPreference}
             audioSelectionMode={audioSelectionMode}
             explicitAudioTrackIndex={explicitAudioTrackIndex}
             onSelectAudioTrack={handleSelectAudioTrack}
