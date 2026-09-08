@@ -52,7 +52,7 @@ func ScoreCandidate(source, target MatchItem) Candidate {
 
 func sharedExternalID(a, b map[string]string) (string, string, bool) {
 	for provider, aID := range a {
-		if aID == "" || provider == "asin" {
+		if aID == "" || provider == ProviderASIN {
 			continue
 		}
 		if bID := b[provider]; bID != "" && bID == aID {

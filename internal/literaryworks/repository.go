@@ -247,7 +247,7 @@ func matchCandidateIDsQuery(source MatchItem, limit int) (string, []any) {
 	// occupy separate cache entries.
 	providers := make([]string, 0, len(source.ExternalIDs))
 	for provider, providerID := range source.ExternalIDs {
-		if provider != "" && provider != "asin" && providerID != "" {
+		if provider != "" && provider != ProviderASIN && providerID != "" {
 			providers = append(providers, provider)
 		}
 	}
