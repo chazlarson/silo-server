@@ -114,6 +114,47 @@ jobs:
       - name: Test
         run: make test-go
 
+  # The literaryworks candidate tests gate the SQL rewrite against a legacy
+  # oracle and need only temporary tables on any Postgres (no migrations, no
+  # libvips — the package does not import imageutil), so they run here against
+  # a service container instead of skipping like the rest of make test-go's
+  # DB-backed tests. The expensive synthetic-catalog comparison stays opt-in
+  # via SILO_TEST_LITERARY_PERF. Scoped to the one package that needs the
+  # database so the job stays fast.
+  literaryworks-db:
+    name: Literaryworks candidate query
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg18
+        env:
+          POSTGRES_USER: silo
+          POSTGRES_PASSWORD: silo
+          POSTGRES_DB: silo_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U silo"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Test
+        env:
+          SILO_TEST_DATABASE_URL: postgres://silo:silo@localhost:5432/silo_test?sslmode=disable
+        run: go test ./internal/literaryworks -count=1
+
   web:
     name: Web
     runs-on: ubuntu-latest

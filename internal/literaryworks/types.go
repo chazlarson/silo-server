@@ -16,6 +16,12 @@ const (
 
 	DecisionConfirmed = "confirmed"
 	DecisionIgnored   = "ignored"
+
+	// ProviderASIN keys external IDs from Amazon/Audible. Candidate lookup and
+	// scoring exclude it on purpose: the Kindle and Audible editions of one
+	// work normally carry different ASINs, so ASIN equality is not evidence
+	// of the same work across formats.
+	ProviderASIN = "asin"
 )
 
 type Work struct {
