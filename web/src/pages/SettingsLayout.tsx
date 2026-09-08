@@ -20,6 +20,7 @@ import {
   Bell,
   MonitorSmartphone,
   PanelTop,
+  KeyRound,
 } from "lucide-react";
 // Sparkles is used by the Personalization nav entry below.
 import type { LucideIcon } from "lucide-react";
@@ -93,7 +94,7 @@ const NAV_SECTIONS: NavSection[] = [
           "Maximum bitrate",
           "Spoken language",
           "Metadata language",
-          "Auto-skip intros",
+          "Skip intros",
           "Auto-skip credits",
           "Auto-skip recaps",
           "Start next at preview",
@@ -401,6 +402,15 @@ const NAV_SECTIONS: NavSection[] = [
     label: "Account",
     items: [
       {
+        path: "account",
+        label: "Account",
+        icon: KeyRound,
+        description: "Change the password shared by every household profile.",
+        keywords: ["password", "credential", "sign in", "security", "account"],
+        settings: settingIndex("Current password", "New password", "Confirm new password"),
+        primaryOrAdmin: true,
+      },
+      {
         path: "profiles",
         label: "Profiles",
         icon: Users,
@@ -513,10 +523,6 @@ export default function SettingsLayout() {
     [canManageProfiles],
   );
 
-  const flatItems = useMemo(
-    () => visibleSections.flatMap((section) => section.items),
-    [visibleSections],
-  );
   const filteredSections = useMemo(
     () => filterSettingsSearchGroups(visibleSections, settingsSearch),
     [settingsSearch, visibleSections],
@@ -531,7 +537,7 @@ export default function SettingsLayout() {
         {activeSegment ? (
           <>
             <div className="hidden lg:block">
-              <PageBack to="/" preferHistory={false} floating />
+              <PageBack to="/" up floating />
             </div>
             <Link
               to="/settings"
@@ -551,7 +557,6 @@ export default function SettingsLayout() {
                 value={settingsSearch}
                 onChange={setSettingsSearch}
                 resultCount={filteredSettingsCount}
-                totalCount={flatItems.length}
                 className="w-full sm:max-w-sm"
                 shortcutMediaQuery={activeSegment ? "(min-width: 64rem)" : undefined}
               />
@@ -604,7 +609,7 @@ export default function SettingsLayout() {
           </>
         ) : (
           <>
-            <PageBack to="/" preferHistory={false} floating />
+            <PageBack to="/" up floating />
             <div className="page-header mt-10 mb-6 gap-5 sm:mt-12 sm:mb-8">
               <div className="min-w-0 space-y-3">
                 <h1 className="page-title text-[clamp(2rem,4vw,3rem)]">Settings</h1>
@@ -616,7 +621,6 @@ export default function SettingsLayout() {
                 value={settingsSearch}
                 onChange={setSettingsSearch}
                 resultCount={filteredSettingsCount}
-                totalCount={flatItems.length}
                 className="w-full sm:max-w-sm lg:w-[26rem] lg:max-w-none"
                 showShortcutHint
               />

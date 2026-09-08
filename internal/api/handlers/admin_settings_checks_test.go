@@ -99,6 +99,121 @@ func TestAdminGetEffectiveSettingsReturnsRuntimeDefaultsAndRedactsSecrets(t *tes
 	}
 }
 
+func TestAdminSettingsReadsHideMachineManagedCheckpoint(t *testing.T) {
+	const checkpoint = `{"baseline_identity":"old","target_identity":"new"}`
+	settings := &fakeServerSettingsStore{values: map[string]string{
+		"server.log_level":                          "debug",
+		config.ArtworkStorageReconcileCheckpointKey: checkpoint,
+	}}
+	handler := &AdminHandler{SettingsRepo: settings}
+
+	for _, tc := range []struct {
+		name   string
+		handle func(http.ResponseWriter, *http.Request)
+		path   string
+	}{
+		{name: "raw settings", handle: handler.HandleGetSettings, path: "/admin/settings"},
+		{name: "effective settings", handle: handler.HandleGetEffectiveSettings, path: "/admin/settings/effective"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			tc.handle(rec, httptest.NewRequest(http.MethodGet, tc.path, nil))
+
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+			}
+			var values map[string]string
+			if err := json.NewDecoder(rec.Body).Decode(&values); err != nil {
+				t.Fatalf("decode response: %v", err)
+			}
+			if _, leaked := values[config.ArtworkStorageReconcileCheckpointKey]; leaked {
+				t.Fatalf("response leaked machine-managed checkpoint: %#v", values)
+			}
+			if values["server.log_level"] != "debug" {
+				t.Fatalf("server.log_level = %q, want debug", values["server.log_level"])
+			}
+		})
+	}
+
+	t.Run("single setting", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/admin/settings/"+config.ArtworkStorageReconcileCheckpointKey, nil)
+		req = withChiParam(req, "key", config.ArtworkStorageReconcileCheckpointKey)
+		rec := httptest.NewRecorder()
+
+		handler.HandleGetSetting(rec, req)
+
+		if rec.Code != http.StatusNotFound {
+			t.Fatalf("status = %d, want 404; body=%s", rec.Code, rec.Body.String())
+		}
+		if strings.Contains(rec.Body.String(), checkpoint) {
+			t.Fatalf("response leaked machine-managed checkpoint: %s", rec.Body.String())
+		}
+	})
+}
+
+func TestAdminSettingsWritesRejectMachineManagedCheckpoint(t *testing.T) {
+	const (
+		storedCheckpoint      = `{"baseline_identity":"old","target_identity":"new"}`
+		replacementCheckpoint = `{"baseline_identity":"wrong","target_identity":"wrong"}`
+	)
+
+	t.Run("batch settings", func(t *testing.T) {
+		settings := &fakeServerSettingsStore{values: map[string]string{
+			config.ArtworkStorageReconcileCheckpointKey: storedCheckpoint,
+		}}
+		handler := &AdminHandler{SettingsRepo: settings}
+		body, err := json.Marshal(updateSettingsRequest{Values: map[string]string{
+			config.ArtworkStorageReconcileCheckpointKey: replacementCheckpoint,
+		}})
+		if err != nil {
+			t.Fatalf("marshal request: %v", err)
+		}
+		rec := httptest.NewRecorder()
+
+		handler.HandleUpdateSettings(rec, httptest.NewRequest(http.MethodPut, "/admin/settings", bytes.NewReader(body)))
+
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400; body=%s", rec.Code, rec.Body.String())
+		}
+		if got := settings.values[config.ArtworkStorageReconcileCheckpointKey]; got != storedCheckpoint {
+			t.Fatalf("checkpoint = %q, want unchanged %q", got, storedCheckpoint)
+		}
+		if settings.atomicCalls != 0 {
+			t.Fatalf("atomic update calls = %d, want 0", settings.atomicCalls)
+		}
+	})
+
+	t.Run("single setting", func(t *testing.T) {
+		settings := &fakeServerSettingsStore{values: map[string]string{
+			config.ArtworkStorageReconcileCheckpointKey: storedCheckpoint,
+		}}
+		handler := &AdminHandler{SettingsRepo: settings}
+		body, err := json.Marshal(updateSettingRequest{Value: replacementCheckpoint})
+		if err != nil {
+			t.Fatalf("marshal request: %v", err)
+		}
+		req := httptest.NewRequest(
+			http.MethodPut,
+			"/admin/settings/"+config.ArtworkStorageReconcileCheckpointKey,
+			bytes.NewReader(body),
+		)
+		req = withChiParam(req, "key", config.ArtworkStorageReconcileCheckpointKey)
+		rec := httptest.NewRecorder()
+
+		handler.HandleUpdateSetting(rec, req)
+
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400; body=%s", rec.Code, rec.Body.String())
+		}
+		if got := settings.values[config.ArtworkStorageReconcileCheckpointKey]; got != storedCheckpoint {
+			t.Fatalf("checkpoint = %q, want unchanged %q", got, storedCheckpoint)
+		}
+		if settings.atomicCalls != 0 {
+			t.Fatalf("atomic update calls = %d, want 0", settings.atomicCalls)
+		}
+	})
+}
+
 func TestAdminGetEffectiveSettingsUsesEnvironmentManagedRuntimeValue(t *testing.T) {
 	settings := &fakeServerSettingsStore{values: map[string]string{
 		"clientip.trusted_proxies": "10.0.0.0/8",
@@ -291,6 +406,113 @@ func TestAdminUpdateSettingsRejectsWholeBatchBeforeWrite(t *testing.T) {
 	}
 	if settings.values["branding.server_name"] != "Silo" {
 		t.Fatalf("valid sibling value was partially persisted: %#v", settings.values)
+	}
+}
+
+func TestAdminUpdateSettingsValidatesRoutingAgainstStoredPeer(t *testing.T) {
+	settings := &fakeServerSettingsStore{values: map[string]string{
+		config.PlaybackRoutingRemuxEgressSettingKey: string(config.PlaybackEgressProxyOnly),
+	}}
+	handler := &AdminHandler{SettingsRepo: settings}
+	req := httptest.NewRequest(
+		http.MethodPut,
+		"/admin/settings",
+		strings.NewReader(`{"values":{"playback.routing.remux_execution":"api_only"}}`),
+	)
+	rec := httptest.NewRecorder()
+
+	handler.HandleUpdateSettings(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body=%s", rec.Code, rec.Body.String())
+	}
+	if settings.setManyCalls != 0 {
+		t.Fatalf("SetMany calls = %d, want 0", settings.setManyCalls)
+	}
+	if _, exists := settings.values[config.PlaybackRoutingRemuxExecutionSettingKey]; exists {
+		t.Fatalf("invalid routing setting was persisted: %#v", settings.values)
+	}
+}
+
+func TestAdminUpdateSettingValidatesRoutingAgainstStoredPeer(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		storedKey string
+		stored    string
+		key       string
+		value     string
+	}{
+		{
+			name: "remux execution against proxy-only egress", storedKey: config.PlaybackRoutingRemuxEgressSettingKey,
+			stored: string(config.PlaybackEgressProxyOnly), key: config.PlaybackRoutingRemuxExecutionSettingKey,
+			value: string(config.PlaybackExecutionAPIOnly),
+		},
+		{
+			name: "remux egress against API-only execution", storedKey: config.PlaybackRoutingRemuxExecutionSettingKey,
+			stored: string(config.PlaybackExecutionAPIOnly), key: config.PlaybackRoutingRemuxEgressSettingKey,
+			value: string(config.PlaybackEgressProxyOnly),
+		},
+		{
+			name: "video execution against proxy-only egress", storedKey: config.PlaybackRoutingVideoTranscodeEgressSettingKey,
+			stored: string(config.PlaybackEgressProxyOnly), key: config.PlaybackRoutingVideoTranscodeExecutionSettingKey,
+			value: string(config.PlaybackExecutionAPIOnly),
+		},
+		{
+			name: "video egress against API-only execution", storedKey: config.PlaybackRoutingVideoTranscodeExecutionSettingKey,
+			stored: string(config.PlaybackExecutionAPIOnly), key: config.PlaybackRoutingVideoTranscodeEgressSettingKey,
+			value: string(config.PlaybackEgressProxyOnly),
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			settings := &fakeServerSettingsStore{values: map[string]string{test.storedKey: test.stored}}
+			handler := &AdminHandler{SettingsRepo: settings}
+			request := httptest.NewRequest(
+				http.MethodPut,
+				"/admin/settings/"+test.key,
+				strings.NewReader(`{"value":"`+test.value+`"}`),
+			)
+			request = withChiParam(request, "key", test.key)
+			recorder := httptest.NewRecorder()
+
+			handler.HandleUpdateSetting(recorder, request)
+
+			if recorder.Code != http.StatusBadRequest || !strings.Contains(recorder.Body.String(), `"error":"invalid_settings"`) {
+				t.Fatalf("response = %d %s, want invalid-settings rejection", recorder.Code, recorder.Body.String())
+			}
+			if settings.atomicCalls != 1 || settings.setManyCalls != 0 {
+				t.Fatalf("atomic calls=%d writes=%d, want 1 and 0", settings.atomicCalls, settings.setManyCalls)
+			}
+			if _, exists := settings.values[test.key]; exists {
+				t.Fatalf("invalid routing setting was persisted: %#v", settings.values)
+			}
+			if _, err := config.LoadFromDB(settings.values); err != nil {
+				t.Fatalf("rejected write left restart-invalid settings: %v", err)
+			}
+		})
+	}
+}
+
+func TestAdminUpdateSettingCanRepairLegacyInvalidRoutingPair(t *testing.T) {
+	settings := &fakeServerSettingsStore{values: map[string]string{
+		config.PlaybackRoutingRemuxExecutionSettingKey: string(config.PlaybackExecutionAPIOnly),
+		config.PlaybackRoutingRemuxEgressSettingKey:    string(config.PlaybackEgressProxyOnly),
+	}}
+	handler := &AdminHandler{SettingsRepo: settings}
+	request := httptest.NewRequest(
+		http.MethodPut,
+		"/admin/settings/"+config.PlaybackRoutingRemuxExecutionSettingKey,
+		strings.NewReader(`{"value":"worker_only"}`),
+	)
+	request = withChiParam(request, "key", config.PlaybackRoutingRemuxExecutionSettingKey)
+	recorder := httptest.NewRecorder()
+
+	handler.HandleUpdateSetting(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("response = %d %s, want repair accepted", recorder.Code, recorder.Body.String())
+	}
+	if _, err := config.LoadFromDB(settings.values); err != nil {
+		t.Fatalf("repaired settings are restart-invalid: %v", err)
 	}
 }
 
@@ -1625,4 +1847,81 @@ func withChiParam(r *http.Request, key, value string) *http.Request {
 	routeCtx := chi.NewRouteContext()
 	routeCtx.URLParams.Add(key, value)
 	return r.WithContext(context.WithValue(r.Context(), chi.RouteCtxKey, routeCtx))
+}
+
+func TestAdminGetSettingReportsRestartRequired(t *testing.T) {
+	const restartKey = "scanner.max_concurrent_libraries"
+	const liveKey = "server.log_level"
+
+	handler := &AdminHandler{
+		SettingsRepo: &fakeServerSettingsStore{values: map[string]string{
+			restartKey: "4",
+			liveKey:    "debug",
+		}},
+		BootstrapSensitiveValues: map[string]string{
+			"playback.ffmpeg_path": "/opt/ffmpeg",
+		},
+	}
+
+	for _, tc := range []struct {
+		name            string
+		key             string
+		wantValue       string
+		wantRestart     bool
+		wantRestartSeen bool
+	}{
+		{
+			name:            "stored restart-required key",
+			key:             restartKey,
+			wantValue:       "4",
+			wantRestart:     true,
+			wantRestartSeen: true,
+		},
+		{
+			name:      "stored hot-reloading key omits the flag",
+			key:       liveKey,
+			wantValue: "debug",
+		},
+		{
+			name:            "bootstrap value",
+			key:             "playback.ffmpeg_path",
+			wantValue:       "/opt/ffmpeg",
+			wantRestart:     true,
+			wantRestartSeen: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if config.RestartRequired(tc.key) != tc.wantRestart {
+				t.Fatalf("test fixture drifted: config.RestartRequired(%q) = %v", tc.key, !tc.wantRestart)
+			}
+
+			req := httptest.NewRequest(http.MethodGet, "/admin/settings/"+tc.key, nil)
+			req = withChiParam(req, "key", tc.key)
+			rec := httptest.NewRecorder()
+
+			handler.HandleGetSetting(rec, req)
+
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+			}
+			var payload struct {
+				Key             string `json:"key"`
+				Value           string `json:"value"`
+				RestartRequired bool   `json:"restart_required"`
+			}
+			if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+				t.Fatalf("decode response: %v", err)
+			}
+			if payload.Key != tc.key || payload.Value != tc.wantValue {
+				t.Fatalf("payload = %+v, want key %q value %q", payload, tc.key, tc.wantValue)
+			}
+			if payload.RestartRequired != tc.wantRestart {
+				t.Fatalf("restart_required = %v, want %v", payload.RestartRequired, tc.wantRestart)
+			}
+			// omitempty must keep the flag off the wire for live keys.
+			if seen := strings.Contains(rec.Body.String(), "restart_required"); seen != tc.wantRestartSeen {
+				t.Fatalf("restart_required present = %v, want %v; body=%s", seen, tc.wantRestartSeen, rec.Body.String())
+			}
+		})
+	}
 }

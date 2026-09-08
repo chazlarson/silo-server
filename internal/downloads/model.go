@@ -2,7 +2,7 @@
 // quality-aware registry shared by the web app and mobile clients for offline
 // playback. It replaces the former internal/download package, absorbing its
 // bandwidth/quota/serving logic and reshaping the table and /downloads contract. See
-// docs/superpowers/specs/2026-06-18-offline-sync-mobile-design.md.
+// docs/downloads-api.md.
 package downloads
 
 import (
@@ -89,6 +89,12 @@ var (
 	// ErrQualityUnavailable means the requested quality is valid and permitted in
 	// principle but cannot be fulfilled by the current server wiring.
 	ErrQualityUnavailable = errors.New("requested download quality is not available")
+	// ErrCapacityUnavailable means compatible artifact executors exist, but none
+	// currently has reservable capacity. Callers may retry the same request.
+	ErrCapacityUnavailable = errors.New("download preparation capacity is unavailable")
+	// ErrCapabilityUnavailable means executor discovery failed transiently, so
+	// callers may retry without changing the requested quality or policy.
+	ErrCapabilityUnavailable = errors.New("download preparation capability is unavailable")
 	// ErrBulkQualityUnavailable keeps season/series batches original-only until
 	// batch artifact UX and storage reporting are explicit.
 	ErrBulkQualityUnavailable = errors.New("bulk quality downloads are not available")

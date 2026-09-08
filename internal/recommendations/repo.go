@@ -364,28 +364,8 @@ func (r *Repo) findTasteProfileCandidates(
 		if len(filter.AllowedLibraryIDs) == 0 {
 			return []ScoredItem{}, map[string][]string{}, nil
 		}
-		conditions = append(conditions, fmt.Sprintf(`
-			EXISTS (
-				SELECT 1
-				FROM media_item_libraries mil
-				WHERE mil.content_id = mi.content_id
-				  AND mil.media_folder_id = ANY($%d)
-			)`, argIdx))
-		args = append(args, filter.AllowedLibraryIDs)
-		argIdx++
 	}
-
-	if len(filter.DisabledLibraryIDs) > 0 {
-		conditions = append(conditions, fmt.Sprintf(`
-			EXISTS (
-				SELECT 1
-				FROM media_item_libraries mil
-				WHERE mil.content_id = mi.content_id
-				  AND mil.media_folder_id != ALL($%d)
-			)`, argIdx))
-		args = append(args, filter.DisabledLibraryIDs)
-		argIdx++
-	}
+	catalog.ApplyLibraryAccessFilter("mi.content_id", filter, &conditions, &args, &argIdx)
 
 	if filter.MaxContentRating != "" {
 		allowedRatings := access.AllowedRatingsUpTo(filter.MaxContentRating)
@@ -1345,7 +1325,7 @@ func (r *Repo) GetPopularItems(ctx context.Context, days, limit int) ([]ScoredIt
 		watched_items AS (
 			SELECT item_id, watcher_id
 			FROM   watched_activity
-			WHERE  updated_at > NOW() - ($1 || ' days')::interval
+			WHERE  updated_at > NOW() - make_interval(days => $1)
 		)
 		SELECT wi.item_id, COUNT(DISTINCT wi.watcher_id) AS watch_count
 		FROM   watched_items wi
@@ -1353,7 +1333,7 @@ func (r *Repo) GetPopularItems(ctx context.Context, days, limit int) ([]ScoredIt
 		GROUP  BY wi.item_id
 		ORDER  BY watch_count DESC
 		LIMIT  $2`, watchedActivityCTE)
-	rows, err := r.pool.Query(ctx, query, fmt.Sprintf("%d", days), limit)
+	rows, err := r.pool.Query(ctx, query, days, limit)
 	if err != nil {
 		return nil, fmt.Errorf("get popular items: %w", err)
 	}
@@ -1382,10 +1362,10 @@ func (r *Repo) GetRecentlyAddedItems(ctx context.Context, days, limit int) ([]Sc
 		SELECT mi.content_id, mi.created_at
 		FROM   media_items mi
 		WHERE  %s
-		  AND  mi.created_at > NOW() - ($1 || ' days')::interval
+		  AND  mi.created_at > NOW() - make_interval(days => $1)
 		ORDER  BY mi.created_at DESC
 		LIMIT  $2`, recommendationItemEligibilityWhereClause("mi"))
-	rows, err := r.pool.Query(ctx, query, fmt.Sprintf("%d", days), limit)
+	rows, err := r.pool.Query(ctx, query, days, limit)
 	if err != nil {
 		return nil, fmt.Errorf("get recently added: %w", err)
 	}
@@ -1600,30 +1580,10 @@ func (r *Repo) FilterAccessibleItemIDs(ctx context.Context, itemIDs []string, fi
 		argIdx++
 	}
 
-	if filter.AllowedLibraryIDs != nil {
-		if len(filter.AllowedLibraryIDs) == 0 {
-			return map[string]struct{}{}, nil
-		}
-		conditions = append(conditions, fmt.Sprintf(`
-			EXISTS (
-				SELECT 1
-				FROM media_item_libraries mil
-				WHERE mil.content_id = mi.content_id
-				  AND mil.media_folder_id = ANY($%d)
-			)`, argIdx))
-		args = append(args, filter.AllowedLibraryIDs)
-		argIdx++
-	} else if len(filter.DisabledLibraryIDs) > 0 {
-		conditions = append(conditions, fmt.Sprintf(`
-			EXISTS (
-				SELECT 1
-				FROM media_item_libraries mil
-				WHERE mil.content_id = mi.content_id
-				  AND mil.media_folder_id != ALL($%d)
-			)`, argIdx))
-		args = append(args, filter.DisabledLibraryIDs)
-		argIdx++
+	if filter.AllowedLibraryIDs != nil && len(filter.AllowedLibraryIDs) == 0 {
+		return map[string]struct{}{}, nil
 	}
+	catalog.ApplyLibraryAccessFilter("mi.content_id", filter, &conditions, &args, &argIdx)
 
 	if filter.MaxContentRating != "" {
 		allowedRatings := access.AllowedRatingsUpTo(filter.MaxContentRating)

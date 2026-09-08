@@ -14,6 +14,7 @@ import { fetchWatchDetail } from "@/hooks/queries/items";
 import { itemKeys } from "@/hooks/queries/keys";
 import { useWatchPlaybackController } from "@/playback/watchPlaybackContext";
 import { useWatchTogetherRoomConnection } from "../hooks/useWatchTogetherRoomConnection";
+import { toast } from "sonner";
 
 function patchChapterThumbnail(
   versions: PlayerFileVersion[],
@@ -73,12 +74,14 @@ export function WatchPage({
   qualityPreference,
   maxBitrateKbps,
   explicitAudioTrackIndex,
+  initialSubtitleTrackIndexByFileId,
+  initialBitmapSubtitleTrackIndexByFileId,
   preferredSubtitleLanguage,
   preferredSubtitleTrackSignature,
   subtitleMode,
   showForcedSubtitles,
   profileLanguage,
-  autoSkipIntro,
+  introSkipMode,
   autoSkipRecap,
   autoPlayNextPreview,
   canEditMarkers,
@@ -128,7 +131,20 @@ export function WatchPage({
     maxBitrateKbps,
     resumeHints,
     explicitAudioTrackIndex,
+    initialSubtitleTrackIndexByFileId,
+    initialBitmapSubtitleTrackIndexByFileId,
   );
+
+  const initialSubtitleErrorKeyRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!session.initialSubtitleError || !session.playbackAttemptId) return;
+    const key = `${session.playbackAttemptId}:${session.initialSubtitleError}`;
+    if (initialSubtitleErrorKeyRef.current === key) return;
+    initialSubtitleErrorKeyRef.current = key;
+    toast.error(session.initialSubtitleErrorTitle ?? "That subtitle track can't be used", {
+      description: session.initialSubtitleError,
+    });
+  }, [session.initialSubtitleError, session.initialSubtitleErrorTitle, session.playbackAttemptId]);
 
   const audioTracks = useMemo(
     () => playbackVersions.find((v) => v.file_id === session.mediaFileId)?.audio_tracks ?? [],
@@ -450,15 +466,16 @@ export function WatchPage({
       onQualitySelect={session.changeQuality}
       onSubtitleTrackChange={session.changeSubtitleTrack}
       onPlanFailure={session.recoverFromFailure}
+      onPlanInvalidated={session.invalidatePlan}
       onReanchorSeek={session.reanchorSeek}
       onApplySubtitleTrack={session.applySubtitleTrack}
       preferredSubtitleLanguage={preferredSubtitleLanguage}
       preferredSubtitleTrackSignature={preferredSubtitleTrackSignature}
-      subtitleMode={subtitleMode}
-      showForcedSubtitles={showForcedSubtitles}
+      subtitleMode={session.initialSubtitleError ? "off" : subtitleMode}
+      showForcedSubtitles={session.initialSubtitleError ? false : showForcedSubtitles}
       profileLanguage={profileLanguage}
       intro={activeMarkers.intro}
-      autoSkipIntro={autoSkipIntro}
+      introSkipMode={introSkipMode}
       credits={activeMarkers.credits}
       recap={activeMarkers.recap}
       autoSkipRecap={autoSkipRecap}

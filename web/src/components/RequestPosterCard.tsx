@@ -90,6 +90,12 @@ function DiscoverCard({
               reserveLibrarySpace={Boolean(item.library_content_id)}
             />
           )}
+          {requestable && onRequest && (
+            <div
+              data-testid="request-poster-hover-overlay"
+              className="pointer-events-none absolute inset-0 translate-y-2 bg-gradient-to-t from-black/85 via-black/45 to-transparent opacity-0 transition-all duration-200 ease-out group-focus-within/req-card:translate-y-0 group-focus-within/req-card:opacity-100 group-hover/req-card:translate-y-0 group-hover/req-card:opacity-100"
+            />
+          )}
         </PosterFrame>
 
         <CardMeta
@@ -101,7 +107,7 @@ function DiscoverCard({
       </Link>
 
       {requestable && onRequest && (
-        <div className="pointer-events-none absolute inset-x-0 top-0 flex aspect-[2/3] translate-y-2 items-end justify-center bg-gradient-to-t from-black/85 via-black/45 to-transparent p-3 opacity-0 transition-all duration-200 ease-out group-focus-within/req-card:translate-y-0 group-focus-within/req-card:opacity-100 group-hover/req-card:translate-y-0 group-hover/req-card:opacity-100">
+        <div className="pointer-events-none absolute top-0 left-0 flex aspect-[2/3] w-full translate-y-2 items-end justify-center pb-3 opacity-0 transition-all duration-200 ease-out group-focus-within/req-card:translate-y-0 group-focus-within/req-card:opacity-100 group-hover/req-card:translate-y-0 group-hover/req-card:opacity-100">
           <button
             type="button"
             disabled={Boolean(isSubmitting)}
@@ -319,8 +325,16 @@ function CardMeta({
       {hasMeta && (
         <div className="text-muted-foreground mt-1 flex items-center gap-1.5 text-[11px]">
           {mediaType && (
-            <Icon className="h-3 w-3 shrink-0 opacity-60" strokeWidth={2} aria-hidden />
+            <>
+              <Icon className="h-3 w-3 shrink-0 opacity-60" strokeWidth={2} aria-hidden />
+              <span>{mediaType === "series" ? "Series" : "Movie"}</span>
+            </>
           )}
+          {mediaType && year ? (
+            <span aria-hidden className="text-muted-foreground/40">
+              ·
+            </span>
+          ) : null}
           {year ? <span className="tabular-nums">{year}</span> : null}
           {(year || mediaType) && rating ? (
             <span aria-hidden className="text-muted-foreground/40">

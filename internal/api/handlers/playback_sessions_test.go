@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
 	"unicode"
@@ -70,7 +71,8 @@ func TestSessionsCapabilitiesAdvertisesActivityFields(t *testing.T) {
 	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("decode capabilities: %v", err)
 	}
-	if !resp.EffectivePlayMethod || !resp.IsJellyfinClient || !resp.ClientBuild || !resp.ClientChannel {
+	if !resp.EffectivePlayMethod || !resp.IsJellyfinClient || !resp.TranscodeHWAccel || !resp.ToneMapMode ||
+		!resp.ClientBuild || !resp.ClientChannel || !resp.TargetAudioChannels || !resp.NodeRouting {
 		t.Fatalf("capabilities must advertise every additive field: %+v", resp)
 	}
 	want := []string{"direct", "remux", "transcode", "audio"}
@@ -81,6 +83,31 @@ func TestSessionsCapabilitiesAdvertisesActivityFields(t *testing.T) {
 		if resp.EffectivePlayMethodValues[i] != v {
 			t.Fatalf("bucket vocabulary = %v, want %v", resp.EffectivePlayMethodValues, want)
 		}
+	}
+	if got, wantToneMap := resp.ToneMapModeValues, []string{"hardware", "software"}; len(got) != len(wantToneMap) || got[0] != wantToneMap[0] || got[1] != wantToneMap[1] {
+		t.Fatalf("tone-map vocabulary = %v, want %v", got, wantToneMap)
+	}
+}
+
+func TestPlaybackRoutingCapabilitiesAdvertisePolicyVocabulary(t *testing.T) {
+	rr := httptest.NewRecorder()
+	(&AdminHandler{}).HandleGetPlaybackRoutingCapabilities(rr,
+		httptest.NewRequest(http.MethodGet, "/admin/playback-routing/capabilities", nil))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d", rr.Code)
+	}
+	var response playbackRoutingCapabilitiesResponse
+	if err := json.Unmarshal(rr.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if len(response.Features) != 1 || response.Features[0] != "playback_node_routing_v1" {
+		t.Fatalf("features = %v", response.Features)
+	}
+	if len(response.Workloads) != 3 || len(response.ExecutionPreferences) != 5 || len(response.EgressPreferences) != 4 {
+		t.Fatalf("capabilities = %+v", response)
+	}
+	if !slices.Contains(response.ExecutionPreferences, "prefer_transcode") {
+		t.Fatalf("execution preferences = %v, want prefer_transcode", response.ExecutionPreferences)
 	}
 }
 
@@ -412,7 +439,7 @@ func TestPlaybackClientInfoFromRequestClampsHeaders(t *testing.T) {
 	req.Header.Set("X-Silo-Client-Build", strings.Repeat("b", 100))
 	req.Header.Set("X-Silo-Client-Channel", strings.Repeat("c", 100))
 
-	got := playbackClientInfoFromRequest(req)
+	got := playback.ClientInfoFromRequest(req)
 
 	for _, tc := range []struct {
 		field string
@@ -441,7 +468,7 @@ func TestNormalizeClientMetadataCountsRunes(t *testing.T) {
 	// counts it, well past it as bytes.
 	req.Header.Set("X-Silo-Client-Channel", strings.Repeat("δ", 40))
 
-	got := playbackClientInfoFromRequest(req)
+	got := playback.ClientInfoFromRequest(req)
 
 	if runes := utf8.RuneCountInString(got.Channel); runes != 32 {
 		t.Errorf("Channel runes = %d, want the 32-character bound", runes)

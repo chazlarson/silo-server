@@ -199,8 +199,12 @@ export function formatTranscodeModeSummary(session: AdminSession): string | null
   if (videoDecision !== "transcode" && audioDecision !== "transcode") {
     return null;
   }
+  // Every other label in this function names the video encoder's HW/SW mode,
+  // which does not exist when only audio is re-encoded: "Audio SW" read as a
+  // client-side software capability instead of "the audio stream is being
+  // re-encoded". Name the work, not an acceleration mode.
   if (videoDecision !== "transcode") {
-    return "Audio SW";
+    return "Audio Transcode";
   }
 
   const hwAccel = session.transcode_hw_accel?.trim().toLowerCase();
@@ -209,6 +213,8 @@ export function formatTranscodeModeSummary(session: AdminSession): string | null
       return "HW QSV";
     case "vaapi":
       return "HW VAAPI";
+    case "videotoolbox":
+      return "HW VideoToolbox";
     case "none":
       return "SW";
     case "auto":
@@ -218,6 +224,30 @@ export function formatTranscodeModeSummary(session: AdminSession): string | null
       return "HW/SW unknown";
     default:
       return `HW ${hwAccel.toUpperCase()}`;
+  }
+}
+
+/** Labels for a confirmed HDR-to-SDR executor in compact and detailed views. */
+export interface ToneMapSummary {
+  badge: "HW Tone map" | "SW Tone map";
+  detail: "Hardware" | "Software";
+  mode: "hardware" | "software";
+}
+
+/** Format a confirmed HDR-to-SDR executor without guessing from legacy data. */
+export function formatToneMapSummary(session: AdminSession): ToneMapSummary | null {
+  const videoDecision = normalizeStreamDecision(session.video_decision || session.play_method);
+  if (videoDecision !== "transcode") {
+    return null;
+  }
+
+  switch (session.tone_map_mode?.trim().toLowerCase()) {
+    case "hardware":
+      return { badge: "HW Tone map", detail: "Hardware", mode: "hardware" };
+    case "software":
+      return { badge: "SW Tone map", detail: "Software", mode: "software" };
+    default:
+      return null;
   }
 }
 
@@ -255,6 +285,76 @@ export function getSessionClientLabelFull(session: AdminSession): string {
   // The server omits client_label_full when it would repeat client_label, and
   // older servers never send it at all — both degrade to the compact label.
   return session.client_label_full?.trim() || getSessionClientLabel(session);
+}
+
+export interface ActivityRouteNode {
+  key: string;
+  kind: "transcode" | "proxy" | "server" | "legacy";
+  label: "Transcode" | "Proxy" | "Server" | "Node";
+  name: string;
+}
+
+function namedRouteNode(
+  kind: "transcode" | "proxy",
+  name: string | undefined,
+  id: number | undefined,
+): ActivityRouteNode {
+  const label = kind === "transcode" ? "Transcode" : "Proxy";
+  const trimmedName = name?.trim();
+  return {
+    key: `${kind}:${id ?? trimmedName ?? "unknown"}`,
+    kind,
+    label,
+    name: trimmedName || (id !== undefined ? `Node #${id}` : `Unknown ${kind} node`),
+  };
+}
+
+function reportingServerRouteNode(session: AdminSession): ActivityRouteNode {
+  const reportedName = session.reporting_node?.trim();
+  if (!reportedName || reportedName.toLowerCase() === "local") {
+    return { key: "server:local", kind: "server", label: "Server", name: "Local server" };
+  }
+  return { key: `server:${reportedName}`, kind: "server", label: "Server", name: reportedName };
+}
+
+/**
+ * Return registered playback nodes in work-to-viewer order. Routes without a
+ * registered node retain the reporting API server's identity, while rows from
+ * older servers fall back to their legacy node fields.
+ */
+export function getSessionRouteNodes(session: AdminSession): ActivityRouteNode[] {
+  const execution = session.routing_execution?.trim();
+  const egress = session.routing_egress?.trim();
+  const hasResolvedRoute = Boolean(session.routing_workload?.trim() || execution || egress);
+
+  if (!hasResolvedRoute) {
+    const reportedName = session.node_display_name?.trim() || session.reporting_node?.trim();
+    const name =
+      !reportedName || reportedName.toLowerCase() === "local" ? "Local server" : reportedName;
+    return [{ key: `legacy:${name}`, kind: "legacy", label: "Node", name }];
+  }
+
+  const nodes: ActivityRouteNode[] = [];
+  const executionNodeName =
+    session.routing_execution_node_name?.trim() || session.node_display_name;
+  if (execution === "transcode") {
+    nodes.push(namedRouteNode("transcode", executionNodeName, session.routing_execution_node_id));
+  } else if (execution === "proxy") {
+    nodes.push(namedRouteNode("proxy", executionNodeName, session.routing_execution_node_id));
+  }
+
+  if (egress === "proxy") {
+    const egressNode = namedRouteNode(
+      "proxy",
+      session.routing_egress_node_name,
+      session.routing_egress_node_id,
+    );
+    if (!nodes.some((node) => node.key === egressNode.key)) {
+      nodes.push(egressNode);
+    }
+  }
+
+  return nodes.length > 0 ? nodes : [reportingServerRouteNode(session)];
 }
 
 export function formatSourceContainerSummary(session: AdminSession): string {
@@ -349,6 +449,22 @@ export function formatAudioSummary(session: AdminSession): string {
   return [lead, format].filter(Boolean).join(" · ") || "Unknown source";
 }
 
+/**
+ * The audio a transcode actually delivers: the target codec, plus the target
+ * channel layout only when the server reported one. The source channel count is
+ * deliberately not a fallback — a TrueHD 7.1 source downmixed to AAC 5.1 read as
+ * "AAC 7.1" while it did. Servers that do not send `target_audio_channels` get
+ * the bare codec instead of an invented layout.
+ */
+function formatTargetAudio(session: AdminSession): string {
+  return [
+    formatCodec(session.target_audio_codec || "aac"),
+    formatChannelLayout(session.target_audio_channels),
+  ]
+    .filter(Boolean)
+    .join(" ");
+}
+
 export function formatDeliveredAudioSummary(session: AdminSession): string {
   const decision =
     session.audio_decision || (session.transcode_audio ? "transcode" : session.play_method);
@@ -356,14 +472,7 @@ export function formatDeliveredAudioSummary(session: AdminSession): string {
     return formatAudioSummary(session);
   }
 
-  return (
-    [
-      formatCodec(session.target_audio_codec || "aac"),
-      formatChannelLayout(session.source_audio_channels),
-    ]
-      .filter(Boolean)
-      .join(" ") || "Audio transcode"
-  );
+  return formatTargetAudio(session) || "Audio Transcode";
 }
 
 export function formatAudioDetail(session: AdminSession): string {
@@ -371,13 +480,8 @@ export function formatAudioDetail(session: AdminSession): string {
     session.audio_decision || (session.transcode_audio ? "transcode" : session.play_method),
   );
   if (decision === "transcode") {
-    const target = [
-      formatCodec(session.target_audio_codec || "aac"),
-      formatChannelLayout(session.source_audio_channels),
-    ]
-      .filter(Boolean)
-      .join(" ");
-    return target ? `→ ${target}` : "Audio transcode";
+    const target = formatTargetAudio(session);
+    return target ? `→ ${target}` : "Audio Transcode";
   }
   if (decision === "copy") {
     return "Audio stream copied";

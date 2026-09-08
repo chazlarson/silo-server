@@ -63,12 +63,13 @@ type pluginImageResolverSourceEntry struct {
 // by parsing the prefix, routing to the correct plugin, and returning resolved URLs.
 // It implements catalog.ImageResolver and the catalog expiry-aware resolver extension.
 type PluginImageResolver struct {
-	mu           sync.RWMutex
-	sources      map[string][]pluginImageResolverSourceEntry
-	s3Presigner  s3ImagePresigner
-	s3PresignTTL time.Duration
-	urlCache     *cache.TTLCache[catalog.ResolvedImageURL]
-	group        singleflight.Group
+	mu                  sync.RWMutex
+	sources             map[string][]pluginImageResolverSourceEntry
+	s3Presigner         s3ImagePresigner
+	s3PresignTTL        time.Duration
+	urlCache            *cache.TTLCache[catalog.ResolvedImageURL]
+	artworkAvailability ArtworkAvailabilityReader
+	group               singleflight.Group
 }
 
 // NewPluginImageResolver creates a new resolver with no registered sources.
@@ -144,6 +145,15 @@ func (r *PluginImageResolver) SetS3Presigner(presigner s3ImagePresigner, ttl tim
 	if ttl > 0 {
 		r.s3PresignTTL = ttl
 	}
+}
+
+// SetArtworkAvailabilityReader supplies durable publication/delivery metadata.
+// Catalog reads never use the storage client to discover availability.
+func (r *PluginImageResolver) SetArtworkAvailabilityReader(reader ArtworkAvailabilityReader) {
+	r.mu.Lock()
+	r.artworkAvailability = reader
+	r.mu.Unlock()
+	r.urlCache.InvalidatePrefix("")
 }
 
 // Close stops the resolver cache sweeper.
@@ -316,14 +326,25 @@ func (r *PluginImageResolver) resolveS3Batch(
 	if presigner == nil {
 		return resolved
 	}
-	expiresAt := time.Now().Add(ttl)
+	r.mu.RLock()
+	availability := r.artworkAvailability
+	r.mu.RUnlock()
+	now := time.Now()
+	expiresAt := now.Add(ttl)
+	ladderKeys := resolvePublishedLadderKeys(ctx, availability, entries)
+
 	for _, entry := range entries {
-		url, err := presigner.PresignGetURL(ctx, presigner.Bucket(), entry.originalPath, ttl)
-		if err != nil {
-			slog.ErrorContext(ctx, "s3 image resolution failed", "component", "metadata", "path", entry.originalPath, "error", err)
+		key := ladderKeys[entry.originalPath]
+		if key == "" {
 			continue
 		}
-		expiry := expiresAt
+		url, err := presigner.PresignGetURL(ctx, presigner.Bucket(), key, ttl)
+		if err != nil {
+			slog.ErrorContext(ctx, "s3 image resolution failed", "component", "metadata", "path", key, "error", err)
+			continue
+		}
+		// Availability may improve or degrade independently of URL signatures.
+		expiry := minURLExpiry(expiresAt, now.Add(5*time.Minute+resolvedURLCacheSafetyMargin))
 		resolved[entry.originalPath] = catalog.ResolvedImageURL{URL: url, ExpiresAt: &expiry}
 	}
 	return resolved

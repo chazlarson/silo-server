@@ -9,7 +9,7 @@
  */
 
 export const SETTINGS_API_VERSION = 1;
-export const SETTINGS_REVISION = 6;
+export const SETTINGS_REVISION = 8;
 
 export interface SettingSuggestedOption {
   value: string;
@@ -181,6 +181,8 @@ export const SETTING_KEYS = {
   PLAYBACK_AUTO_SKIP_INTRO: "playback.auto_skip_intro",
   /** Auto-skip recaps */
   PLAYBACK_AUTO_SKIP_RECAP: "playback.auto_skip_recap",
+  /** Skip intros */
+  PLAYBACK_INTRO_SKIP_MODE: "playback.intro_skip_mode",
   /** Maximum bitrate */
   PLAYBACK_MAX_BITRATE_KBPS: "playback.max_bitrate_kbps",
   /** Next up prompt */
@@ -229,8 +231,14 @@ export const SETTING_KEYS = {
   SUBTITLE_MATCHES_DEVICE: "subtitle.matches_device",
   /** Poster badges */
   UI_CARD_OVERLAYS: "ui.card_overlays",
+  /** Card overlays enabled */
+  UI_CARD_OVERLAYS_ENABLED: "ui.card_overlays_enabled",
   /** Media cards */
   UI_CARD_PRESENTATION: "ui.card_presentation",
+  /** Card quick actions */
+  UI_CARD_QUICK_ACTIONS: "ui.card_quick_actions",
+  /** Card quick actions enabled */
+  UI_CARD_QUICK_ACTIONS_ENABLED: "ui.card_quick_actions_enabled",
   /** Custom CSS */
   UI_CUSTOM_CSS: "ui.custom_css",
   /** Custom theme variables */
@@ -273,6 +281,11 @@ export interface SettingDefinition {
    * hide definitions, scopes, enum members and widened bounds introduced
    * after that revision — the server would reject them. */
   introducedIn: number;
+  /** Superseded by another definition. The key still resolves and still
+   * has to be readable, but a client must not offer it as a second control
+   * beside its replacement — editing one would silently rewrite the other
+   * through the server's compatibility mirror. */
+  deprecated?: boolean;
   scopes: readonly string[];
   /** Revision each scope became writable at, aligned with scopes. */
   scopeIntroducedIn: readonly number[];
@@ -511,6 +524,7 @@ export const SETTING_DEFINITIONS: Record<SettingKey, SettingDefinition> = {
     nullable: false,
     persistence: "remote",
     introducedIn: 1,
+    deprecated: true,
     scopes: ["profile", "profile_device"],
     scopeIntroducedIn: [1, 1],
     resolutionOrder: ["profile_device", "profile", "default"],
@@ -534,6 +548,27 @@ export const SETTING_DEFINITIONS: Record<SettingKey, SettingDefinition> = {
     description: 'Skip "previously on" recaps automatically when Silo can detect them.',
     category: "playback",
     control: "switch",
+  },
+  "playback.intro_skip_mode": {
+    key: "playback.intro_skip_mode",
+    type: "enum",
+    nullable: false,
+    persistence: "remote",
+    introducedIn: 7,
+    scopes: ["profile", "profile_device"],
+    scopeIntroducedIn: [7, 7],
+    resolutionOrder: ["profile_device", "profile", "default"],
+    defaultValue: "ask",
+    label: "Skip intros",
+    description:
+      "What Silo does when an intro starts: leave it alone, offer a Skip Intro button, or skip it and offer an undo.",
+    category: "playback",
+    control: "select",
+    values: [
+      { value: "never", label: "Never", introducedIn: 7 },
+      { value: "ask", label: "Ask to skip", introducedIn: 7 },
+      { value: "always", label: "Skip automatically", introducedIn: 7 },
+    ],
   },
   "playback.max_bitrate_kbps": {
     key: "playback.max_bitrate_kbps",
@@ -973,6 +1008,22 @@ export const SETTING_DEFINITIONS: Record<SettingKey, SettingDefinition> = {
     category: "appearance",
     platforms: ["web", "ios", "tvos", "macos", "android", "android_tv"],
   },
+  "ui.card_overlays_enabled": {
+    key: "ui.card_overlays_enabled",
+    type: "boolean",
+    nullable: true,
+    persistence: "remote",
+    introducedIn: 8,
+    scopes: ["profile"],
+    scopeIntroducedIn: [8],
+    resolutionOrder: ["profile", "default"],
+    defaultValue: null,
+    label: "Card overlays enabled",
+    description: "Show overlay badges on media cards.",
+    category: "appearance",
+    control: "switch",
+    platforms: ["web"],
+  },
   "ui.card_presentation": {
     key: "ui.card_presentation",
     type: "object",
@@ -988,6 +1039,43 @@ export const SETTING_DEFINITIONS: Record<SettingKey, SettingDefinition> = {
     category: "appearance",
     control: "panel",
     platforms: ["web", "ios", "tvos", "macos", "android", "android_tv"],
+  },
+  "ui.card_quick_actions": {
+    key: "ui.card_quick_actions",
+    type: "enum",
+    nullable: true,
+    persistence: "remote",
+    introducedIn: 8,
+    scopes: ["profile"],
+    scopeIntroducedIn: [8],
+    resolutionOrder: ["profile", "default"],
+    defaultValue: null,
+    label: "Card quick actions",
+    description: "Which favorite and watched shortcuts appear on media cards.",
+    category: "appearance",
+    control: "select",
+    platforms: ["web"],
+    values: [
+      { value: "both", label: "Both", introducedIn: 8 },
+      { value: "favorites", label: "Favorites only", introducedIn: 8 },
+      { value: "watched", label: "Watch indicator only", introducedIn: 8 },
+    ],
+  },
+  "ui.card_quick_actions_enabled": {
+    key: "ui.card_quick_actions_enabled",
+    type: "boolean",
+    nullable: true,
+    persistence: "remote",
+    introducedIn: 8,
+    scopes: ["profile"],
+    scopeIntroducedIn: [8],
+    resolutionOrder: ["profile", "default"],
+    defaultValue: null,
+    label: "Card quick actions enabled",
+    description: "Show the selected favorite and watched shortcuts on media cards.",
+    category: "appearance",
+    control: "switch",
+    platforms: ["web"],
   },
   "ui.custom_css": {
     key: "ui.custom_css",

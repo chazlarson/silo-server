@@ -17,7 +17,7 @@ import (
 const (
 	// DeliveryTypeRequestFulfilled is the operational notice posted once the
 	// requested media is present in the catalog
-	// (docs/superpowers/plans/notifications/06, item 2).
+	// (docs/architecture/notifications.md, "Request notifications").
 	DeliveryTypeRequestFulfilled = "request.fulfilled"
 	// DeliveryTypeRequestApproved notifies the requesting profile that an
 	// admin (or auto-approval) approved their request.
@@ -32,11 +32,12 @@ const (
 // display fields); approved/declined rows have no catalog item yet, so the
 // title rides along.
 type RequestFlags struct {
-	RequestID string `json:"request_id"`
-	TMDBID    int    `json:"tmdb_id"`
-	MediaType string `json:"media_type"`
-	Title     string `json:"title,omitempty"`
-	Year      int    `json:"year,omitempty"`
+	RequestID  string `json:"request_id"`
+	TMDBID     int    `json:"tmdb_id"`
+	MediaType  string `json:"media_type"`
+	Title      string `json:"title,omitempty"`
+	Year       int    `json:"year,omitempty"`
+	PosterPath string `json:"poster_path,omitempty"`
 	// Reason is the admin's decline message, when one was given.
 	Reason string `json:"reason,omitempty"`
 }
@@ -192,11 +193,12 @@ func (s *System) dispatchRequestLifecycle(ctx context.Context, req requests.Requ
 		return nil
 	}
 	flags := RequestFlags{
-		RequestID: req.ID,
-		TMDBID:    req.TMDBID,
-		MediaType: string(req.MediaType),
-		Title:     req.Title,
-		Reason:    req.DeclineReason,
+		RequestID:  req.ID,
+		TMDBID:     req.TMDBID,
+		MediaType:  string(req.MediaType),
+		Title:      req.Title,
+		PosterPath: req.PosterPath,
+		Reason:     req.DeclineReason,
 	}
 	if req.Year != nil {
 		flags.Year = *req.Year

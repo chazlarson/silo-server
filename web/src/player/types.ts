@@ -6,6 +6,9 @@
 /** Subtitle display mode. */
 export type SubtitleMode = "off" | "auto" | "always";
 
+/** What the player does when it enters a detected intro. */
+export type IntroSkipMode = "never" | "ask" | "always";
+
 /** A file version available for playback. */
 export interface PlayerFileVersion {
   file_id: number;
@@ -243,13 +246,22 @@ export interface WatchPageProps {
   /** Bandwidth cap in kbps from playback.max_bitrate_kbps; null/undefined is uncapped. */
   maxBitrateKbps?: number | null;
   explicitAudioTrackIndex?: number | null;
+  /** Initial server subtitle ordinal keyed by file ID. Missing entries mean subtitles start off. */
+  initialSubtitleTrackIndexByFileId?: Record<number, number>;
+  /**
+   * The subset of initial subtitle ordinals that require bitmap burn-in. A
+   * refused initial start is retried without these tracks so playback remains
+   * available when the server cannot perform the required video conversion.
+   */
+  initialBitmapSubtitleTrackIndexByFileId?: Record<number, number>;
   preferredSubtitleLanguage?: string | null;
   preferredSubtitleTrackSignature?: PlayerSubtitleTrackSignature | null;
   subtitleMode?: SubtitleMode;
   showForcedSubtitles?: boolean;
   profileLanguage?: string | null;
   intro: PlayerTimeRange | null;
-  autoSkipIntro?: boolean;
+  /** null while the connected server's answer is still unknown; see VideoPlayer. */
+  introSkipMode?: IntroSkipMode | null;
   credits: PlayerTimeRange | null;
   recap?: PlayerTimeRange | null;
   preview?: PlayerTimeRange | null;

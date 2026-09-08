@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ParsedCue } from "../utils/parseVTT";
 import { resolveSubtitleAutoSelect } from "../utils/subtitleSort";
 import type HlsType from "hls.js";
-import { PlayerControls } from "./PlayerControls";
+import { PlayerControls, SKIP_BACK_SECONDS, SKIP_FORWARD_SECONDS } from "./PlayerControls";
 import { PlaybackInfoOverlay } from "./PlaybackInfoOverlay";
 import { PlaybackNoticeOverlay } from "./PlaybackNoticeOverlay";
 import { IntroSkipButton } from "./IntroSkipButton";
@@ -11,11 +11,13 @@ import { NextEpisodeOverlay } from "./NextEpisodeOverlay";
 import { usePlaybackRealtime } from "../hooks/usePlaybackRealtime";
 import { useWatchProgress } from "../hooks/useWatchProgress";
 import { useKeyboardShortcuts } from "../hooks/useKeyboardShortcuts";
+import { useIntroSkipPrompt } from "../hooks/useIntroSkipPrompt";
 import { useRemuxSeeking } from "../hooks/useRemuxSeeking";
 import { useSubtitleTracks } from "../hooks/useSubtitleTracks";
 import { useASSSubtitles } from "../hooks/useASSSubtitles";
 import { useSubtitleAppearance } from "../hooks/useSubtitleAppearance";
 import { useSubtitleLayout } from "../hooks/useSubtitleLayout";
+import { useCoarsePointer } from "../hooks/useCoarsePointer";
 import { computeSubtitleFontSize } from "@/lib/subtitleAppearance";
 import { useNextEpisode } from "../hooks/useNextEpisode";
 import { MARKER_KINDS, useMarkerEditor } from "../hooks/useMarkerEditor";
@@ -26,6 +28,7 @@ import { usePlayerConfig } from "../context/PlayerConfigContext";
 import { qualityOptionsFromPlanV3 } from "../playback-info";
 import { preconnectToStreamOrigin } from "../stream-url";
 import { WatchTogetherPanel } from "./WatchTogetherPanel";
+import { readPlanInvalidatedPayload, VIDEO_PLAYBACK_COMMANDS } from "../realtime-protocol";
 import type {
   PlaybackRealtimeCommandEnvelope,
   PlaybackRealtimeEventEnvelope,
@@ -33,9 +36,12 @@ import type {
 import { resolvePendingSeekTime } from "../utils/pendingSeek";
 import { resolveVersionAudioLanguage } from "../utils/effectiveAudioLanguage";
 import { HlsStartupGuard } from "../utils/hlsStartupGuard";
+import { isSafariBrowserV3, resolveHLSEngineV3 } from "../utils/hlsEngine";
+import { isFirefoxUserAgent } from "../utils/browser";
 import { normalizeSubtitleMode } from "../utils/subtitleMode";
 import type {
   PlaybackExitState,
+  IntroSkipMode,
   PlayerDisplayMode,
   PlayerPictureInPictureChange,
   PlayerPlaybackStateChange,
@@ -65,6 +71,25 @@ import {
   setWatchTogetherGuestControl,
 } from "@/lib/watchTogetherActions";
 import { toast } from "sonner";
+
+let hlsJSModule: Promise<typeof HlsType> | null = null;
+
+function loadHLSJS(): Promise<typeof HlsType> {
+  hlsJSModule ??= import("hls.js").then(
+    (module) => module.default,
+    (error) => {
+      // Drop the memoized rejection so a later playback retries the fetch.
+      hlsJSModule = null;
+      throw error;
+    },
+  );
+  return hlsJSModule;
+}
+
+// Warm the hls.js chunk at module load so the first playback's time to first
+// frame doesn't pay the cold dynamic-import latency on top of plan resolution.
+// A failed warm-up stays quiet here; playback retries and reports it.
+void loadHLSJS().catch(() => {});
 
 // Reserved index for the in-progress live AI translation track. Sits well above
 // any real subtitle index so it never collides.
@@ -107,6 +132,12 @@ interface VideoPlayerProps {
   onSubtitleTrackChange?: (combinedIndex: number | null, currentPosition: number) => void;
   /** `failure_recovery` replan after the client could not play the plan. */
   onPlanFailure?: (failure: FailureV3, currentPosition: number) => void;
+  /**
+   * Replan for a plan the server invalidated over the realtime
+   * `plan_invalidated` command. Resolving false rejects the command, which is
+   * what tells the server to stop the session instead.
+   */
+  onPlanInvalidated?: (planId: string, reason: string, currentPosition: number) => Promise<boolean>;
   /** `seek_reanchor` replan when a seek target falls outside the seekable window. */
   onReanchorSeek?: (positionSeconds: number) => void;
   preferredSubtitleLanguage?: string | null;
@@ -115,7 +146,12 @@ interface VideoPlayerProps {
   showForcedSubtitles?: boolean;
   profileLanguage?: string | null;
   intro: PlayerTimeRange | null;
-  autoSkipIntro?: boolean;
+  /**
+   * null means the connected server's answer is not in yet, which is not the
+   * same as "ask": prompting on a guess can skip an intro the viewer told the
+   * server to leave alone.
+   */
+  introSkipMode?: IntroSkipMode | null;
   credits: PlayerTimeRange | null;
   recap?: PlayerTimeRange | null;
   autoSkipRecap?: boolean;
@@ -151,10 +187,19 @@ interface VideoPlayerProps {
   watchTogetherConnection?: WatchTogetherRoomConnectionResult;
 }
 
-/** Preload hls.js eagerly so it's cached before the first transcode. */
-const hlsPromise: Promise<typeof HlsType> = import("hls.js").then((m) => m.default);
 const EXIT_PROGRESS_FLUSH_TIMEOUT_MS = 1_000;
 const FIREFOX_COMPATIBILITY_FALLBACK_DELAY_MS = 8_000;
+// How often a rejected autoplay is retried, and how many times. A transport
+// swap tears the previous source down with `load()`, and the media element load
+// algorithm is required to reject any play that is still pending with an
+// AbortError — so the first attempt against a replacement transport can fail
+// for a reason that is gone a moment later. The retry is timed rather than
+// purely event-driven because the failure leaves nothing to wake it: once the
+// engine has filled its buffer it stops fetching, so no further readiness event
+// arrives. The budget is small so a genuinely blocked autoplay settles into a
+// paused player with working controls instead of retrying forever.
+const AUTOPLAY_RETRY_DELAY_MS = 400;
+const MAX_AUTOPLAY_ATTEMPTS = 4;
 
 interface PlaybackNoticeState {
   title?: string;
@@ -209,6 +254,7 @@ export function VideoPlayer({
   onQualitySelect,
   onSubtitleTrackChange,
   onPlanFailure,
+  onPlanInvalidated,
   onReanchorSeek,
   preferredSubtitleLanguage,
   preferredSubtitleTrackSignature,
@@ -216,7 +262,7 @@ export function VideoPlayer({
   showForcedSubtitles,
   profileLanguage,
   intro,
-  autoSkipIntro = false,
+  introSkipMode = "ask",
   credits,
   recap = null,
   autoSkipRecap = false,
@@ -265,8 +311,8 @@ export function VideoPlayer({
   const subtitleFetchAnchorRef = useRef(initialPosition);
   const backendDurationRef = useRef(propDuration ?? 0);
   const autoEnterPictureInPictureAttemptedRef = useRef(false);
-  const autoSkippedIntroKeyRef = useRef<string | null>(null);
   const autoSkippedRecapKeyRef = useRef<string | null>(null);
+  const lastInputWasKeyboardRef = useRef(false);
   const endedFiredRef = useRef(false);
   const [hasEnded, setHasEnded] = useState(false);
   const onEndedRef = useRef(onEnded);
@@ -275,7 +321,7 @@ export function VideoPlayer({
   const compatibilityFallbackKeyRef = useRef<string | null>(null);
   const lastRoomCommandIdRef = useRef<string | null>(null);
   const roomCommandTimerRef = useRef<number | null>(null);
-  const performPlayerSeekRef = useRef<(seconds: number) => void>(() => {});
+  const performPlayerSeekRef = useRef<(seconds: number) => boolean>(() => false);
   const reportRoomReadyRef = useRef<
     (positionSeconds?: number, isPaused?: boolean) => { ok: boolean }
   >(() => ({ ok: false }));
@@ -470,9 +516,7 @@ export function VideoPlayer({
   }, [isPlayerReady, planRevision]);
 
   const isFirefoxBrowser =
-    typeof navigator !== "undefined" &&
-    /firefox/i.test(navigator.userAgent) &&
-    !/seamonkey/i.test(navigator.userAgent);
+    typeof navigator !== "undefined" && isFirefoxUserAgent(navigator.userAgent);
   const watchTogether =
     watchTogetherConnection ??
     ({
@@ -699,10 +743,13 @@ export function VideoPlayer({
   // against the plan's timeline below.
   const { handleSeek } = useRemuxSeeking(videoRef);
 
+  // Reports whether the seek was taken up, which callers that show an
+  // affordance for it (the intro prompt) need in order to know whether the
+  // affordance did anything.
   const performPlayerSeek = useCallback(
-    (seconds: number) => {
+    (seconds: number): boolean => {
       const video = videoRef.current;
-      if (!video) return;
+      if (!video) return false;
 
       setPendingSeekTime(seconds);
       setCurrentTime(seconds);
@@ -711,7 +758,7 @@ export function VideoPlayer({
       if (canSeekAnywhere) {
         if (isHlsStream) video.currentTime = nativeSeconds;
         else handleSeek(nativeSeconds);
-        return;
+        return true;
       }
 
       const seekable = video.seekable;
@@ -719,19 +766,22 @@ export function VideoPlayer({
         if (nativeSeconds >= seekable.start(i) && nativeSeconds <= seekable.end(i)) {
           if (isHlsStream) video.currentTime = nativeSeconds;
           else handleSeek(nativeSeconds);
-          return;
+          return true;
         }
       }
 
       // Outside the server-anchored window: this is a timeline operation, not
       // a failure, so it asks for a reanchor rather than reporting a failure.
+      // A wired handler replans and lands the position, so that counts as
+      // accepted; with no handler the seek is simply dropped.
       onReanchorSeek?.(seconds);
+      return onReanchorSeek !== undefined;
     },
     [canSeekAnywhere, handleSeek, isHlsStream, onReanchorSeek],
   );
 
   const handlePlayerSeek = useCallback(
-    (seconds: number) => {
+    (seconds: number): boolean => {
       if (
         watchTogetherRoomId &&
         !watchTogether.closedReason &&
@@ -741,23 +791,27 @@ export function VideoPlayer({
           "Reconnecting to room. Controls are temporarily unavailable.",
           "warning",
         );
-        return;
+        return false;
       }
       if (watchTogether.room && !watchTogether.room.self_can_manage_room) {
         showWatchTogetherNotice("Only the host can seek the room.", "warning");
-        return;
+        return false;
       }
       if (watchTogether.room && watchTogetherSync.attachedSessionId !== sessionId) {
         showWatchTogetherNotice("Joining room playback. Try again in a moment.", "info");
-        return;
+        return false;
       }
 
       if (watchTogether.room) {
         const video = videoRef.current;
-        watchTogetherSync.requestTransport("seek", seconds, video?.paused ?? true);
-        return;
+        // In a room the seek is a request: `ok` says it reached the room, and
+        // the position moves when the room's transport command comes back. That
+        // is the strongest answer available synchronously, and it is false for
+        // exactly the cases the caller cares about — a dropped socket or a
+        // session the room is not driving.
+        return watchTogetherSync.requestTransport("seek", seconds, video?.paused ?? true).ok;
       }
-      performPlayerSeek(seconds);
+      return performPlayerSeek(seconds);
     },
     [
       performPlayerSeek,
@@ -1282,52 +1336,40 @@ export function VideoPlayer({
     }
   }, [cancelNextEpisodeAutoPlay, displayMode]);
 
-  // -- Intro skip --
-  const showIntroSkip = intro != null && currentTime >= intro.start && currentTime < intro.end;
+  // -- Intro/recap skip --
   const showRecapSkip = recap != null && currentTime >= recap.start && currentTime < recap.end;
-
-  const skipIntro = useCallback(() => {
-    if (intro) handlePlayerSeek(intro.end);
-  }, [intro, handlePlayerSeek]);
 
   const skipRecap = useCallback(() => {
     if (recap) handlePlayerSeek(recap.end);
   }, [recap, handlePlayerSeek]);
 
-  useEffect(() => {
-    if (!autoSkipIntro || !intro || !isPlayerReady || awaitingFirstFrame) {
-      return;
-    }
-    if (currentTime < intro.start || currentTime >= intro.end) {
-      return;
-    }
-    if (
-      roomPlaybackActive &&
-      (!watchTogether.room?.self_can_manage_room ||
-        watchTogetherSync.attachedSessionId !== sessionId)
-    ) {
-      return;
-    }
-
-    const introKey = `${sessionId}:${activeFileId ?? "unknown"}:${intro.start}:${intro.end}`;
-    if (autoSkippedIntroKeyRef.current === introKey) {
-      return;
-    }
-    autoSkippedIntroKeyRef.current = introKey;
-    handlePlayerSeek(intro.end);
-  }, [
-    activeFileId,
-    autoSkipIntro,
-    awaitingFirstFrame,
-    currentTime,
-    handlePlayerSeek,
+  const introPromptCanSeek =
+    !roomPlaybackActive ||
+    (watchTogether.room?.self_can_manage_room === true &&
+      watchTogetherSync.attachedSessionId === sessionId);
+  const introKey = intro
+    ? `${sessionId}:${activeFileId ?? selectedVersion?.file_id ?? "unknown"}:${intro.start}:${intro.end}`
+    : null;
+  const {
+    prompt: activeIntroPrompt,
+    select: selectActiveIntroPrompt,
+    dismiss: dismissActiveIntroPrompt,
+  } = useIntroSkipPrompt({
+    mode: introSkipMode ?? "ask",
     intro,
-    isPlayerReady,
-    roomPlaybackActive,
-    sessionId,
-    watchTogether.room?.self_can_manage_room,
-    watchTogetherSync.attachedSessionId,
-  ]);
+    introKey,
+    currentTime,
+    playing,
+    enabled:
+      displayMode === "foreground" &&
+      isPlayerReady &&
+      !awaitingFirstFrame &&
+      introPromptCanSeek &&
+      // An unknown mode neither prompts nor skips. The mode above is only the
+      // placeholder that keeps the hook's contract total while this is false.
+      introSkipMode !== null,
+    onSeek: handlePlayerSeek,
+  });
 
   useEffect(() => {
     if (!autoSkipRecap || !recap || !isPlayerReady || awaitingFirstFrame) {
@@ -1367,6 +1409,7 @@ export function VideoPlayer({
   // Only the bitrate matters for buffer sizing, and the plan states what is
   // actually being delivered rather than what the source file happens to hold.
   const plannedBitrateKbps = plan.effective_recipe.bitrate_kbps ?? 0;
+  const plannedDynamicRange = plan.effective_recipe.dynamic_range;
 
   // -- hls.js lifecycle --
   useEffect(() => {
@@ -1375,14 +1418,24 @@ export function VideoPlayer({
 
     let hls: HlsType | null = null;
     let destroyed = false;
-    let autoplayStarted = false;
+    let playbackStarted = false;
+    let autoplayInFlight = false;
+    let autoplayAttempts = 0;
+    let autoplayRetryTimer: ReturnType<typeof setTimeout> | null = null;
     let nativeHLSMetadataHandler: (() => void) | null = null;
 
     mediaRecoveryAttemptsRef.current = 0;
     setError(null);
     setAwaitingFirstFrame(true);
 
+    const clearAutoplayRetry = () => {
+      if (autoplayRetryTimer === null) return;
+      clearTimeout(autoplayRetryTimer);
+      autoplayRetryTimer = null;
+    };
+
     const cleanupStartupListeners = () => {
+      clearAutoplayRetry();
       video.removeEventListener("loadeddata", attemptAutoplayWhenReady);
       video.removeEventListener("canplay", attemptAutoplayWhenReady);
       video.removeEventListener("loadedmetadata", attemptAutoplayWhenReady);
@@ -1392,35 +1445,103 @@ export function VideoPlayer({
       }
     };
 
+    // Settles the player into a deliberate paused state: the startup guard is
+    // told playback is viable so it does not report a bogus startup timeout,
+    // and the first frame is shown with the controls up.
+    const settlePaused = () => {
+      playbackStarted = true;
+      cleanupStartupListeners();
+      hlsStartupGuardRef.current?.markPlaybackStarted();
+      setAwaitingFirstFrame(false);
+      setPlaying(false);
+    };
+
     const attemptAutoplayWhenReady = () => {
-      if (destroyed || autoplayStarted || hlsStartupGuardRef.current?.hasFailed()) return;
+      if (destroyed || playbackStarted || autoplayInFlight) return;
+      if (hlsStartupGuardRef.current?.hasFailed()) return;
       // HAVE_FUTURE_DATA means the browser has enough media to advance beyond
       // the current frame. Starting earlier can produce a visible first-frame
       // freeze where audio advances before video begins moving.
       if (video.readyState < HTMLMediaElement.HAVE_FUTURE_DATA) return;
-      autoplayStarted = true;
-      cleanupStartupListeners();
       if (!shouldAutoPlay) {
-        hlsStartupGuardRef.current?.markPlaybackStarted();
-        setAwaitingFirstFrame(false);
-        setPlaying(false);
+        settlePaused();
         return;
       }
-      video.play().catch(() => setPlaying(false));
+
+      clearAutoplayRetry();
+      autoplayInFlight = true;
+      autoplayAttempts += 1;
+      video.play().then(
+        () => {
+          autoplayInFlight = false;
+          if (destroyed) return;
+          playbackStarted = true;
+          cleanupStartupListeners();
+        },
+        (error: unknown) => {
+          autoplayInFlight = false;
+          if (destroyed) return;
+          // The element is paused now, whatever happens next, so the transport
+          // reflects that immediately.
+          setPlaying(false);
+          if (autoplayAttempts < MAX_AUTOPLAY_ATTEMPTS) {
+            // Deliberately keeps the readiness listeners armed: whichever
+            // wakes first — a later `canplay` or this timer — retries.
+            autoplayRetryTimer = setTimeout(() => {
+              autoplayRetryTimer = null;
+              attemptAutoplayWhenReady();
+            }, AUTOPLAY_RETRY_DELAY_MS);
+            return;
+          }
+          // Out of retries. The engine has media buffered and simply is not
+          // allowed to start it, so stop pretending startup is still in
+          // progress and leave the viewer a player they can press play on.
+          console.warn("[player] playback did not resume after the transport changed", error);
+          settlePaused();
+        },
+      );
     };
 
     video.addEventListener("loadeddata", attemptAutoplayWhenReady);
     video.addEventListener("canplay", attemptAutoplayWhenReady);
+
+    const attachNativeHLS = () => {
+      video.src = effectiveStreamUrl;
+      nativeHLSMetadataHandler = () => {
+        video.currentTime = effectiveInitialPosition;
+        attemptAutoplayWhenReady();
+      };
+      video.addEventListener("loadedmetadata", nativeHLSMetadataHandler, { once: true });
+    };
 
     async function init() {
       if (!video || destroyed) return;
 
       if (isHlsStream) {
         try {
-          const Hls = await hlsPromise;
+          const nativeSupported = video.canPlayType("application/vnd.apple.mpegurl") !== "";
+          // Safari's HLS capability evidence comes from its media element, so
+          // keep every Safari plan on that same engine. Chromium can also
+          // advertise native HLS, but treats an in-progress copy remux as live
+          // and jumps toward its rapidly advancing production edge; its
+          // conservative HLS claims and runtime both use hls.js instead.
+          const preferNativeHLS =
+            typeof navigator !== "undefined" && isSafariBrowserV3(navigator.userAgent);
+          const resolution = await resolveHLSEngineV3(
+            plannedDynamicRange,
+            nativeSupported,
+            loadHLSJS,
+            (error) => {
+              console.error("[hls.js] Failed to initialize, falling back to native HLS:", error);
+            },
+            preferNativeHLS,
+          );
           if (destroyed || hlsStartupGuardRef.current?.hasFailed()) return;
 
-          if (Hls.isSupported()) {
+          if (resolution.engine === "native") {
+            attachNativeHLS();
+          } else if (resolution.engine === "hlsjs") {
+            const Hls = resolution.hlsjs;
             const maxBufferLength = plannedBitrateKbps >= 25000 ? 60 : 120;
             const retryingLoadPolicy = {
               maxTimeToFirstByteMs: 45000,
@@ -1518,13 +1639,6 @@ export function VideoPlayer({
             hls.loadSource(effectiveStreamUrl);
             hls.attachMedia(video);
             hlsRef.current = hls;
-          } else if (video.canPlayType("application/vnd.apple.mpegurl")) {
-            video.src = effectiveStreamUrl;
-            nativeHLSMetadataHandler = () => {
-              video.currentTime = effectiveInitialPosition;
-              attemptAutoplayWhenReady();
-            };
-            video.addEventListener("loadedmetadata", nativeHLSMetadataHandler, { once: true });
           } else {
             if (
               !reportCurrentPlanFailure({
@@ -1548,10 +1662,14 @@ export function VideoPlayer({
           }
         }
       } else {
-        // Direct play — set video src directly.
+        // Direct play — set video src directly. Starting playback goes through
+        // the same readiness gate as HLS rather than calling play() against a
+        // src that has not loaded yet: a play issued at HAVE_NOTHING is racing
+        // the load algorithm that is about to seek to the resume position, and
+        // the spec has that algorithm reject it.
         video.src = effectiveStreamUrl;
         video.currentTime = effectiveInitialPosition;
-        if (shouldAutoPlay) video.play().catch(() => setPlaying(false));
+        attemptAutoplayWhenReady();
       }
     }
 
@@ -1581,6 +1699,7 @@ export function VideoPlayer({
     isPlayerReady,
     planRevision,
     plannedBitrateKbps,
+    plannedDynamicRange,
     reportCurrentPlanFailure,
     shouldAutoPlay,
   ]);
@@ -1741,7 +1860,9 @@ export function VideoPlayer({
 
   // -- Control visibility (hover anywhere to show) --
   const [controlsVisible, setControlsVisible] = useState(true);
+  const isCoarsePointer = useCoarsePointer();
   const hideTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const surfaceTapTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const clearControlsTimer = useCallback(() => {
     if (hideTimerRef.current) {
@@ -1777,6 +1898,105 @@ export function VideoPlayer({
     return clearControlsTimer;
   }, [clearControlsTimer, playing, resetControlsTimer]);
 
+  useEffect(() => {
+    const markKeyboardInput = (event: KeyboardEvent) => {
+      if (
+        event.key === "Tab" ||
+        event.key === "Enter" ||
+        event.key === " " ||
+        event.key.startsWith("Arrow")
+      ) {
+        lastInputWasKeyboardRef.current = true;
+      }
+    };
+    const markPointerInput = () => {
+      lastInputWasKeyboardRef.current = false;
+    };
+    document.addEventListener("keydown", markKeyboardInput, true);
+    document.addEventListener("pointerdown", markPointerInput, true);
+    return () => {
+      document.removeEventListener("keydown", markKeyboardInput, true);
+      document.removeEventListener("pointerdown", markPointerInput, true);
+    };
+  }, []);
+
+  const focusTransportAfterIntroPrompt = useCallback(() => {
+    resetControlsTimer();
+    window.setTimeout(() => {
+      containerRef.current
+        ?.querySelector<HTMLElement>('[role="slider"][aria-label="Seek"]')
+        ?.focus({ preventScroll: true });
+    }, 0);
+  }, [resetControlsTimer]);
+
+  const selectIntroPrompt = useCallback(() => {
+    if (!selectActiveIntroPrompt()) return false;
+    focusTransportAfterIntroPrompt();
+    return true;
+  }, [focusTransportAfterIntroPrompt, selectActiveIntroPrompt]);
+
+  const dismissIntroPrompt = useCallback(() => {
+    if (!dismissActiveIntroPrompt()) return false;
+    focusTransportAfterIntroPrompt();
+    return true;
+  }, [dismissActiveIntroPrompt, focusTransportAfterIntroPrompt]);
+
+  const introPromptVisible = activeIntroPrompt !== null;
+  useEffect(() => {
+    if (!introPromptVisible || displayMode !== "foreground") return;
+
+    const promptSelector = '[data-intro-skip-prompt="true"]';
+
+    const handlePromptKeyDown = (event: KeyboardEvent) => {
+      if (event.defaultPrevented) return;
+      const target = event.target instanceof HTMLElement ? event.target : null;
+      const targetInPrompt = target?.closest(promptSelector) != null;
+      const isEditingOrInMenu =
+        !targetInPrompt &&
+        target?.closest(
+          'input, textarea, select, [contenteditable="true"], [role="dialog"], [role="menu"], [role="listbox"]',
+        ) != null;
+      if (isEditingOrInMenu) return;
+
+      const isSelect = event.key === "Enter" || event.key === " ";
+      const isBack = event.key === "Escape" || event.key === "BrowserBack";
+      if (!isSelect && !isBack) return;
+
+      // Enter and Space belong to whatever control has focus: taking them at
+      // the document would make Space on Play/Pause or on the seek slider skip
+      // the intro and swallow the press. So Select is only claimed when the
+      // pill itself is focused, or when no control is — the case the spec's
+      // "handled at the player root" rule exists for. Back stays global: it has
+      // no competing meaning on the transport, and it must reach the pill
+      // whether or not the pill is in the focus tree.
+      const active = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+      const promptHasFocus = targetInPrompt || active?.closest(promptSelector) != null;
+      const focusIsUnclaimed =
+        active === null || active === document.body || active === containerRef.current;
+      if (isSelect && !promptHasFocus && !focusIsUnclaimed) return;
+
+      const handled = isSelect ? selectIntroPrompt() : dismissIntroPrompt();
+      if (!handled) return;
+      event.preventDefault();
+      event.stopImmediatePropagation();
+    };
+
+    document.addEventListener("keydown", handlePromptKeyDown, true);
+    return () => document.removeEventListener("keydown", handlePromptKeyDown, true);
+  }, [dismissIntroPrompt, displayMode, introPromptVisible, selectIntroPrompt]);
+
+  const focusIntroPromptOnMount = (() => {
+    if (!activeIntroPrompt || !lastInputWasKeyboardRef.current) return false;
+    const active = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    const interactionInProgress =
+      active?.closest(
+        'input, textarea, select, [contenteditable="true"], [role="dialog"], [role="menu"], [role="listbox"], [role="slider"]',
+      ) !== null ||
+      containerRef.current?.querySelector('[role="dialog"], [role="menu"], [role="listbox"]') !=
+        null;
+    return !interactionInProgress;
+  })();
+
   // -- Marker editing --
   const currentMarkers = useMemo<MarkerDraft>(
     () => ({ intro, recap, credits, preview }),
@@ -1810,9 +2030,27 @@ export function VideoPlayer({
 
   // -- Fullscreen tracking --
   useEffect(() => {
-    const onChange = () => setIsFullscreen(!!document.fullscreenElement);
+    const video = videoRef.current as
+      | (HTMLVideoElement & {
+          webkitDisplayingFullscreen?: boolean;
+        })
+      | null;
+
+    const onChange = () => {
+      const isDocFullscreen = !!document.fullscreenElement;
+      const isVideoFullscreen = !!video?.webkitDisplayingFullscreen;
+      setIsFullscreen(isDocFullscreen || isVideoFullscreen);
+    };
+
     document.addEventListener("fullscreenchange", onChange);
-    return () => document.removeEventListener("fullscreenchange", onChange);
+    video?.addEventListener("webkitbeginfullscreen", onChange);
+    video?.addEventListener("webkitendfullscreen", onChange);
+
+    return () => {
+      document.removeEventListener("fullscreenchange", onChange);
+      video?.removeEventListener("webkitbeginfullscreen", onChange);
+      video?.removeEventListener("webkitendfullscreen", onChange);
+    };
   }, []);
 
   // -- Subtitle appearance --
@@ -1876,6 +2114,8 @@ export function VideoPlayer({
   // -- Subtitle cue matching --
   // Returns active cue texts for custom rendering instead of native TextTrack
   // (which has browser bugs with stale cues persisting after seek).
+  const [textSubtitleState, setTextSubtitleState] = useState("idle");
+  const [assSubtitleState, setASSSubtitleState] = useState("idle");
   const activeCueTexts = useSubtitleTracks(
     videoRef,
     effectiveSubtitleTracks,
@@ -1887,6 +2127,7 @@ export function VideoPlayer({
     liveCues,
     liveTranslation?.trackKey ?? null,
     subtitleStreamGeneration,
+    setTextSubtitleState,
   );
 
   // -- ASS/SSA subtitle rendering via JASSUB (client-side libass) --
@@ -1897,7 +2138,9 @@ export function VideoPlayer({
     isDetached,
     timelineOffsetSeconds,
     subtitleDelayMs,
+    setASSSubtitleState,
   );
+  const subtitleLoadState = isASSActive ? assSubtitleState : textSubtitleState;
 
   // -- Authoritative subtitle track selection --
   // Some tracks (bitmap PGS/DVD/DVB) cannot be delivered as a sidecar and are
@@ -1911,6 +2154,12 @@ export function VideoPlayer({
       : null;
   const requestedSubtitleTrackChangeRef = useRef<string | null>(null);
   useEffect(() => {
+    // Live AI cues belong to the client overlay, not the server inventory.
+    // Leave the current plan alone until a real downloaded track is ready.
+    if (activeSubtitleIndex === LIVE_SUBTITLE_INDEX) {
+      requestedSubtitleTrackChangeRef.current = null;
+      return;
+    }
     const desiredServerIndex = pendingServerSubtitleSelection(
       plan.subtitle.mode,
       plan.selected_tracks.subtitle?.index ?? null,
@@ -2067,6 +2316,60 @@ export function VideoPlayer({
     video.pause();
   }, [sessionId, showWatchTogetherNotice, watchTogether, watchTogetherRoomId, watchTogetherSync]);
 
+  const handleSurfaceTap = useCallback(
+    (event?: React.MouseEvent<HTMLElement>) => {
+      if (!isCoarsePointer) {
+        handlePlayPause();
+        return;
+      }
+      if (surfaceTapTimerRef.current) {
+        clearTimeout(surfaceTapTimerRef.current);
+        surfaceTapTimerRef.current = null;
+        const rect = event?.currentTarget.getBoundingClientRect();
+        const relativeX = rect && event ? (event.clientX - rect.left) / rect.width : 0.5;
+        const now = videoRef.current?.currentTime ?? currentTime;
+        if (relativeX < 1 / 3) {
+          handlePlayerSeek(Math.max(0, now - SKIP_BACK_SECONDS));
+          resetControlsTimer();
+        } else if (relativeX > 2 / 3) {
+          handlePlayerSeek(
+            Math.min(duration || now + SKIP_FORWARD_SECONDS, now + SKIP_FORWARD_SECONDS),
+          );
+          resetControlsTimer();
+        } else {
+          handlePlayPause();
+        }
+        return;
+      }
+      surfaceTapTimerRef.current = setTimeout(() => {
+        surfaceTapTimerRef.current = null;
+        if (controlsVisible) {
+          clearControlsTimer();
+          setControlsVisible(false);
+        } else {
+          resetControlsTimer();
+        }
+      }, 250);
+    },
+    [
+      clearControlsTimer,
+      controlsVisible,
+      currentTime,
+      duration,
+      handlePlayPause,
+      handlePlayerSeek,
+      isCoarsePointer,
+      resetControlsTimer,
+    ],
+  );
+
+  useEffect(
+    () => () => {
+      if (surfaceTapTimerRef.current) clearTimeout(surfaceTapTimerRef.current);
+    },
+    [],
+  );
+
   useEffect(() => {
     reportRoomReadyRef.current = watchTogetherSync.reportReady;
   }, [watchTogetherSync.reportReady]);
@@ -2163,10 +2466,33 @@ export function VideoPlayer({
   }, []);
 
   const handleFullscreenToggle = useCallback(() => {
+    const video = videoRef.current as
+      | (HTMLVideoElement & {
+          webkitSupportsFullscreen?: boolean;
+          webkitDisplayingFullscreen?: boolean;
+          webkitEnterFullscreen?: () => void;
+          webkitExitFullscreen?: () => void;
+        })
+      | null;
+
     if (document.fullscreenElement) {
       document.exitFullscreen().catch(() => {});
-    } else {
-      containerRef.current?.requestFullscreen().catch(() => {});
+    } else if (video?.webkitDisplayingFullscreen) {
+      video.webkitExitFullscreen?.();
+    } else if (containerRef.current?.requestFullscreen) {
+      containerRef.current.requestFullscreen().catch(() => {
+        if (
+          video?.webkitSupportsFullscreen !== false &&
+          typeof video?.webkitEnterFullscreen === "function"
+        ) {
+          video.webkitEnterFullscreen();
+        }
+      });
+    } else if (
+      video?.webkitSupportsFullscreen !== false &&
+      typeof video?.webkitEnterFullscreen === "function"
+    ) {
+      video.webkitEnterFullscreen();
     }
   }, []);
 
@@ -2312,6 +2638,28 @@ export function VideoPlayer({
             tone: "warning",
           });
           return;
+        case "plan_invalidated": {
+          // The server decided the route it planned cannot serve this source
+          // after all. Ack (already sent by the transport), replan off it, and
+          // report the outcome: a rejection is the server's cue to stop the
+          // session so the client's own recovery can mint a fresh attempt.
+          const invalidated = readPlanInvalidatedPayload(command.payload);
+          if (!invalidated) {
+            throw new Error("invalid_plan_invalidated_payload");
+          }
+          if (!onPlanInvalidated) {
+            throw new Error("plan_invalidation_unsupported");
+          }
+          const replaced = await onPlanInvalidated(
+            invalidated.plan_id,
+            invalidated.reason,
+            currentTimeRef.current,
+          );
+          if (!replaced) {
+            throw new Error("plan_invalidation_replan_failed");
+          }
+          return;
+        }
         case "stop":
         case "terminate":
           if (command.payload) {
@@ -2332,13 +2680,14 @@ export function VideoPlayer({
           throw new Error("unsupported");
       }
     },
-    [handleExit, performPlayerSeek],
+    [handleExit, onPlanInvalidated, performPlayerSeek],
   );
 
   const realtime = usePlaybackRealtime({
     sessionId,
     onCommand: executeRealtimeCommand,
     onEvent: handleRealtimeEvent,
+    supportedCommands: VIDEO_PLAYBACK_COMMANDS,
   });
 
   useEffect(() => {
@@ -2443,7 +2792,7 @@ export function VideoPlayer({
       {/* Back button + media info */}
       {!isDetached && (
         <div
-          className={`absolute top-4 left-4 z-50 flex items-center gap-3 transition-opacity duration-300 ${
+          className={`absolute top-[max(1rem,env(safe-area-inset-top))] left-[max(1rem,env(safe-area-inset-left))] z-50 flex items-center gap-3 transition-opacity duration-300 ${
             controlsVisible ? "opacity-100" : "pointer-events-none opacity-0"
           }`}
         >
@@ -2607,10 +2956,25 @@ export function VideoPlayer({
       <video
         ref={videoRef}
         className={isDetached ? "h-full w-full" : "absolute inset-0 h-full w-full"}
-        onClick={displayMode === "postroll" ? undefined : handlePlayPause}
+        onClick={displayMode === "postroll" ? undefined : handleSurfaceTap}
         playsInline
         style={!isPlayerReady ? { visibility: "hidden" } : undefined}
       />
+
+      {!isDetached &&
+        activeSubtitleIndex !== null &&
+        (subtitleLoadState === "loading" || subtitleLoadState === "error") && (
+          <div
+            role="status"
+            className="pointer-events-none absolute inset-x-0 top-20 z-40 flex justify-center"
+          >
+            <span className="rounded bg-black/75 px-3 py-2 text-sm text-white">
+              {subtitleLoadState === "loading"
+                ? "Loading subtitles…"
+                : "Subtitles couldn't load. Retrying…"}
+            </span>
+          </div>
+        )}
 
       {/* Subtitle overlay — suppressed when JASSUB (ASS) is rendering; bitmap
           tracks are burned into the video server-side and never reach here.
@@ -2641,8 +3005,17 @@ export function VideoPlayer({
         </div>
       )}
 
-      {/* Intro skip button */}
-      {!isDetached && showIntroSkip && <IntroSkipButton onSkip={skipIntro} />}
+      {/* Intro skip / undo prompt */}
+      {!isDetached && activeIntroPrompt && (
+        <IntroSkipButton
+          onSkip={selectIntroPrompt}
+          label={activeIntroPrompt.label}
+          caption={activeIntroPrompt.caption}
+          timer={activeIntroPrompt}
+          controlsVisible={controlsVisible}
+          focusOnMount={focusIntroPromptOnMount}
+        />
+      )}
       {!isDetached && showRecapSkip && <IntroSkipButton onSkip={skipRecap} label="Skip Recap" />}
 
       {/* Marker editor */}
@@ -2690,6 +3063,7 @@ export function VideoPlayer({
           muted={muted}
           isFullscreen={isFullscreen}
           subtitleTracks={effectiveSubtitleTracks}
+          preferredSubtitleLanguage={preferredSubtitleLanguage}
           activeSubtitleIndex={activeSubtitleIndex}
           onSubtitleSelect={handleSubtitleSelect}
           subtitleDelayMs={subtitleDelayMs}
@@ -2730,6 +3104,7 @@ export function VideoPlayer({
           onVolumeChange={handleVolumeChange}
           onMutedChange={handleMutedChange}
           onFullscreenToggle={handleFullscreenToggle}
+          onSurfaceTap={isCoarsePointer ? handleSurfaceTap : undefined}
           showPlaybackInfo={showPlaybackInfo}
           onTogglePlaybackInfo={() => setShowPlaybackInfo((v) => !v)}
           hasPrevEpisode={!!prevEpisodeRef}

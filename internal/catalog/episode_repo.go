@@ -376,13 +376,37 @@ func (r *EpisodeRepository) Upsert(ctx context.Context, ep *models.Episode) erro
 	return nil
 }
 
-// BulkUpsert inserts or updates multiple episodes for a single series in two
-// round-trips: one to clear stale external IDs, one for the multi-row upsert.
-// Stored content IDs are written back to each Episode struct.
+// BulkUpsert inserts or updates multiple episodes for a single series. The
+// stale-ID clear, multi-row upsert, and denormalized air-date update share one
+// transaction so callers can safely fall back to single-row writes if any step
+// fails. Stored content IDs are written back to each Episode struct.
 func (r *EpisodeRepository) BulkUpsert(ctx context.Context, seriesID string, episodes []*models.Episode) error {
 	if len(episodes) == 0 {
 		return nil
 	}
+	for i, ep := range episodes {
+		if ep == nil {
+			return fmt.Errorf("bulk upserting episodes: episode %d is nil", i)
+		}
+		if ep.SeriesID != seriesID {
+			return fmt.Errorf("bulk upserting episodes: episode %d belongs to series %q, want %q", i, ep.SeriesID, seriesID)
+		}
+		if !FitsPostgresInteger(ep.SeasonNumber) || !FitsPostgresInteger(ep.EpisodeNumber) {
+			return fmt.Errorf("bulk upserting episodes: episode %d number %d/%d is outside PostgreSQL integer range",
+				i, ep.SeasonNumber, ep.EpisodeNumber)
+		}
+		if !FitsPostgresInteger(ep.Runtime) {
+			return fmt.Errorf("bulk upserting episodes: episode %d runtime %d is outside PostgreSQL integer range", i, ep.Runtime)
+		}
+	}
+
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin bulk episode upsert: %w", err)
+	}
+	defer func() {
+		_ = tx.Rollback(ctx)
+	}()
 
 	// Collect external IDs and their owning (season_number, episode_number)
 	// pairs for the batch stale-ID clear.
@@ -427,7 +451,7 @@ func (r *EpisodeRepository) BulkUpsert(ctx context.Context, seriesID string, epi
 				OR (tmdb_id <> '' AND tmdb_id = ANY($3::text[]))
 				OR (tvdb_id <> '' AND tvdb_id = ANY($4::text[]))
 			  )`
-		if _, err := r.pool.Exec(ctx, clearQuery,
+		if _, err := tx.Exec(ctx, clearQuery,
 			seriesID, imdbIDs, tmdbIDs, tvdbIDs, ownerSNs, ownerENs,
 		); err != nil {
 			return fmt.Errorf("bulk clearing stale episode external IDs: %w", err)
@@ -521,7 +545,7 @@ func (r *EpisodeRepository) BulkUpsert(ctx context.Context, seriesID string, epi
 			updated_at = NOW()
 		RETURNING content_id, season_number, episode_number`
 
-	rows, err := r.pool.Query(ctx, query,
+	rows, err := tx.Query(ctx, query,
 		contentIDs, epSeriesIDs, seasonIDs, seasonNums, episodeNums,
 		titles, defaultMetadataLanguages, overviews, airDates, runtimes,
 		ratingsIMDB, ratingsTMDB,
@@ -532,7 +556,6 @@ func (r *EpisodeRepository) BulkUpsert(ctx context.Context, seriesID string, epi
 	if err != nil {
 		return fmt.Errorf("bulk upserting episodes: %w", err)
 	}
-	defer rows.Close()
 
 	// Build a map to write back content IDs by (season_number, episode_number).
 	type epKey struct {
@@ -543,10 +566,12 @@ func (r *EpisodeRepository) BulkUpsert(ctx context.Context, seriesID string, epi
 		var cid string
 		var sn, en int32
 		if err := rows.Scan(&cid, &sn, &en); err != nil {
+			rows.Close()
 			return fmt.Errorf("scanning bulk upsert episode result: %w", err)
 		}
 		returnedIDs[epKey{sn, en}] = cid
 	}
+	rows.Close()
 	if err := rows.Err(); err != nil {
 		return fmt.Errorf("iterating bulk upsert episode results: %w", err)
 	}
@@ -561,8 +586,11 @@ func (r *EpisodeRepository) BulkUpsert(ctx context.Context, seriesID string, epi
 	// series (audit 2026-05-01 §2.1 hot path #1). BulkUpsert is called for
 	// a single series, but the SQL uses ANY($1::text[]) to be future-proof
 	// for multi-series scanner batches.
-	if _, err := r.pool.Exec(ctx, batchUpdateSeriesLastAirDateSQL, []string{seriesID}); err != nil {
+	if _, err := tx.Exec(ctx, batchUpdateSeriesLastAirDateSQL, []string{seriesID}); err != nil {
 		return fmt.Errorf("batch update last_air_date_at: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit bulk episode upsert: %w", err)
 	}
 
 	return nil
@@ -653,6 +681,39 @@ func (r *EpisodeRepository) GetByIDs(ctx context.Context, contentIDs []string) (
 	return scanEpisodes(rows)
 }
 
+// ListBySeriesAndNumbers returns the requested episode rows for one series in a
+// single query. It intentionally does not apply episodeAvailabilityPredicate:
+// metadata persistence must see provider-only episodes before library links
+// exist so it can preserve their identity and merge state.
+func (r *EpisodeRepository) ListBySeriesAndNumbers(
+	ctx context.Context,
+	seriesID string,
+	seasonNumbers []int32,
+	episodeNumbers []int32,
+) ([]*models.Episode, error) {
+	if len(seasonNumbers) != len(episodeNumbers) {
+		return nil, fmt.Errorf("listing episodes by series and numbers: season and episode number counts differ")
+	}
+	if len(seasonNumbers) == 0 {
+		return nil, nil
+	}
+	query := `SELECT ` + episodeColumns + `
+		FROM episodes
+		JOIN unnest($2::int[], $3::int[]) AS requested(requested_season_number, requested_episode_number)
+		  ON episodes.season_number = requested.requested_season_number
+		 AND episodes.episode_number = requested.requested_episode_number
+		WHERE series_id = $1
+		ORDER BY season_number ASC, episode_number ASC`
+
+	rows, err := r.pool.Query(ctx, query, seriesID, seasonNumbers, episodeNumbers)
+	if err != nil {
+		return nil, fmt.Errorf("listing episodes by series and numbers: %w", err)
+	}
+	defer rows.Close()
+
+	return scanEpisodes(rows)
+}
+
 // HasFilesByIDs reports which of the given episodes are backed by at least one
 // live (non-missing) media file. Episodes absent from the result map have no
 // file — e.g. provider-metadata-only entries for unaired episodes.
@@ -723,6 +784,43 @@ func (r *EpisodeRepository) ListBySeriesIDs(ctx context.Context, seriesIDs []str
 		result[episode.SeriesID] = append(result[episode.SeriesID], episode)
 	}
 	return result, nil
+}
+
+// ListIDsBySeriesIDs returns the available episode IDs used to determine
+// whether a series is completed, without loading episode metadata.
+func (r *EpisodeRepository) ListIDsBySeriesIDs(ctx context.Context, seriesIDs []string) (map[string][]string, error) {
+	return r.listIDsByParent(ctx, "series_id", seriesIDs)
+}
+
+// ListIDsBySeasonIDs is the season counterpart of ListIDsBySeriesIDs.
+func (r *EpisodeRepository) ListIDsBySeasonIDs(ctx context.Context, seasonIDs []string) (map[string][]string, error) {
+	return r.listIDsByParent(ctx, "season_id", seasonIDs)
+}
+
+func (r *EpisodeRepository) listIDsByParent(ctx context.Context, parentColumn string, parentIDs []string) (map[string][]string, error) {
+	result := make(map[string][]string, len(parentIDs))
+	if len(parentIDs) == 0 {
+		return result, nil
+	}
+
+	// parentColumn comes only from the two fixed-column wrappers above.
+	// Completion is order-independent; preserve the same availability rule
+	// as ListBySeriesIDs and ListBySeasonIDs, including missing-file rows.
+	query := fmt.Sprintf(`SELECT content_id, %s FROM episodes
+		WHERE %s = ANY($1) AND %s`, parentColumn, parentColumn, episodeAvailabilityPredicate)
+	rows, err := r.pool.Query(ctx, query, parentIDs)
+	if err != nil {
+		return nil, fmt.Errorf("listing episode ids by %s: %w", parentColumn, err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var contentID, parentID string
+		if err := rows.Scan(&contentID, &parentID); err != nil {
+			return nil, fmt.Errorf("scanning episode ids by %s: %w", parentColumn, err)
+		}
+		result[parentID] = append(result[parentID], contentID)
+	}
+	return result, rows.Err()
 }
 
 // buildListBySeriesGroupedBySeasonQuery returns the SQL and bound args used by

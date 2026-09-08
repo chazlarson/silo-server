@@ -14,6 +14,8 @@ import (
 	"github.com/Silo-Server/silo-server/internal/models"
 )
 
+const browseSortRecentlyAdded = "recently_added"
+
 // BrowseFilters represents all supported filter, sort, and pagination parameters
 // for the /items browse endpoint.
 type BrowseFilters struct {
@@ -23,7 +25,7 @@ type BrowseFilters struct {
 	ContentIDs         []string // optional allowlist of exact content IDs
 	LibraryID          int      // filter by specific library
 	LibraryIDs         []int    // accessible library IDs (nil = all)
-	DisabledLibraryIDs []int    // user-disabled libraries to exclude (only used when LibraryIDs is nil)
+	DisabledLibraryIDs []int    // libraries whose membership globally hides an item
 	MaxContentRating   string   // maximum allowed content rating ceiling
 	YearMin            int      // minimum year (inclusive)
 	YearMax            int      // maximum year (inclusive)
@@ -37,6 +39,9 @@ type BrowseFilters struct {
 	Offset             int
 	SnapshotAt         *time.Time // pagination fence: exclude items created after this timestamp
 	RequireBackdrop    bool       // only return items with a non-empty backdrop_path (Jellyfin ImageTypes=Backdrop filter)
+	// Internal source scope stays in SQL instead of materializing an ID allowlist.
+	contentSourceSQL  string
+	contentSourceArgs []any
 }
 
 // BrowseResult contains the paginated result of a browse query.
@@ -169,14 +174,7 @@ func (r *BrowseRepository) BrowseRecentlyAddedAcrossLibraries(ctx context.Contex
 	perLibrary := make([][]*models.MediaItem, 0, len(libraryIDs))
 	anyLibraryHasMore := false
 	for _, id := range libraryIDs {
-		sub := base
-		sub.LibraryID = id
-		// Clearing the multi-library scopes is what selects the
-		// singleLibraryNoDedup fast path in buildBrowsePlan.
-		sub.LibraryIDs = nil
-		sub.DisabledLibraryIDs = nil
-		sub.Offset = 0
-		sub.Limit = limit
+		sub := recentlyAddedLibraryBrowseFilters(base, id, limit)
 		res, err := r.BrowsePage(ctx, sub, false)
 		if err != nil {
 			return nil, fmt.Errorf("browse recently added in library %d: %w", id, err)
@@ -206,6 +204,17 @@ func (r *BrowseRepository) BrowseRecentlyAddedAcrossLibraries(ctx context.Contex
 	}
 
 	return &BrowseResult{Items: merged, Total: total, HasMore: hasMore}, nil
+}
+
+func recentlyAddedLibraryBrowseFilters(base BrowseFilters, libraryID, limit int) BrowseFilters {
+	base.LibraryID = libraryID
+	// Clear the multi-library allowlist to select the direct single-library
+	// index path. Keep the global deny list: an item also linked to a disabled
+	// library must remain hidden even while this subquery walks an enabled one.
+	base.LibraryIDs = nil
+	base.Offset = 0
+	base.Limit = limit
+	return base
 }
 
 // mergeRecentlyAddedItems merges per-library recently_added result slices — each
@@ -399,6 +408,8 @@ func (r *BrowseRepository) buildBrowsePlan(filters BrowseFilters) (browseQueryPl
 		argIdx++
 	}
 
+	appendBrowseContentSource(filters, &conditions, &args, &argIdx)
+
 	// Genre filter (GIN array containment).
 	if filters.Genre != "" {
 		conditions = append(conditions, fmt.Sprintf("mi.genres @> ARRAY[$%d]::text[]", argIdx))
@@ -455,7 +466,7 @@ func (r *BrowseRepository) buildBrowsePlan(filters BrowseFilters) (browseQueryPl
 	}
 
 	// Library access control: restrict to user's accessible libraries.
-	needsLibJoin := filters.LibraryID > 0 || filters.LibraryIDs != nil || len(filters.DisabledLibraryIDs) > 0 || filters.Sort == "recently_added"
+	needsLibJoin := filters.LibraryID > 0 || filters.LibraryIDs != nil || filters.Sort == browseSortRecentlyAdded
 	needsPersonJoin := filters.PersonID > 0
 	// When filtering by exactly one library and no person join, each
 	// content_id matches at most one mil row, so the GROUP BY usually added
@@ -463,7 +474,7 @@ func (r *BrowseRepository) buildBrowsePlan(filters BrowseFilters) (browseQueryPl
 	// mil.first_seen_at exploit idx_item_libraries_folder_seen_content
 	// directly — turning a full-library scan + heapsort into a top-N index
 	// walk.
-	singleLibraryNoDedup := filters.LibraryID > 0 && filters.LibraryIDs == nil && len(filters.DisabledLibraryIDs) == 0 && !needsPersonJoin
+	singleLibraryNoDedup := filters.LibraryID > 0 && filters.LibraryIDs == nil && !needsPersonJoin
 
 	if filters.PersonID > 0 {
 		conditions = append(conditions, fmt.Sprintf("ip.person_id = $%d", argIdx))
@@ -488,7 +499,15 @@ func (r *BrowseRepository) buildBrowsePlan(filters BrowseFilters) (browseQueryPl
 	}
 
 	if len(filters.DisabledLibraryIDs) > 0 {
-		conditions = append(conditions, fmt.Sprintf("NOT (mil.media_folder_id = ANY($%d))", argIdx))
+		if !needsLibJoin {
+			conditions = append(conditions,
+				"EXISTS (SELECT 1 FROM media_item_libraries mil_scope_any WHERE mil_scope_any.content_id = mi.content_id)",
+			)
+		}
+		conditions = append(conditions, fmt.Sprintf(
+			"NOT EXISTS (SELECT 1 FROM media_item_libraries mil_scope_out WHERE mil_scope_out.content_id = mi.content_id AND mil_scope_out.media_folder_id = ANY($%d))",
+			argIdx,
+		))
 		args = append(args, filters.DisabledLibraryIDs)
 		argIdx++
 	}
@@ -573,6 +592,15 @@ func (r *BrowseRepository) buildBrowsePlan(filters BrowseFilters) (browseQueryPl
 // ListXxx distinct-value methods.  If the returned earlyEmpty flag is true the
 // caller should return an empty result immediately (e.g. when LibraryIDs is an
 // empty slice).
+func appendBrowseContentSource(filters BrowseFilters, conditions *[]string, args *[]any, argIdx *int) {
+	if filters.contentSourceSQL == "" {
+		return
+	}
+	*conditions = append(*conditions, "mi.content_id IN ("+rebindSQLPlaceholders(filters.contentSourceSQL, *argIdx-1)+")")
+	*args = append(*args, filters.contentSourceArgs...)
+	*argIdx += len(filters.contentSourceArgs)
+}
+
 func filterWhereClause(filters BrowseFilters) (fromClause, whereClause string, args []any, earlyEmpty bool) {
 	return filterWhereClauseForSource(filters, "media_items mi", "")
 }
@@ -580,6 +608,8 @@ func filterWhereClause(filters BrowseFilters) (fromClause, whereClause string, a
 func filterWhereClauseForSource(filters BrowseFilters, baseRelation string, mediaScope string) (fromClause, whereClause string, args []any, earlyEmpty bool) {
 	var conditions []string
 	argIdx := 1
+	libraryContentExpr := catalogLibraryContentExprForScope(mediaScope, "mi")
+	membershipTable, membershipKey := catalogLibraryMembershipTableAndKeyForScope(mediaScope)
 
 	if filters.Type != "" {
 		types := splitTypes(filters.Type)
@@ -613,8 +643,9 @@ func filterWhereClauseForSource(filters BrowseFilters, baseRelation string, medi
 		args = append(args, filters.PersonID)
 		argIdx++
 	}
+	var positiveLibraryConditions []string
 	if filters.LibraryID > 0 {
-		conditions = append(conditions, fmt.Sprintf("mil.media_folder_id = $%d", argIdx))
+		positiveLibraryConditions = append(positiveLibraryConditions, fmt.Sprintf("mil_scope_in.media_folder_id = $%d", argIdx))
 		args = append(args, filters.LibraryID)
 		argIdx++
 	}
@@ -626,29 +657,59 @@ func filterWhereClauseForSource(filters BrowseFilters, baseRelation string, medi
 		args = append(args, filters.ContentIDs)
 		argIdx++
 	}
+	appendBrowseContentSource(filters, &conditions, &args, &argIdx)
+
 	if filters.LibraryIDs != nil {
 		if len(filters.LibraryIDs) == 0 {
 			return "", "", nil, true
 		}
-		conditions = append(conditions, fmt.Sprintf("mil.media_folder_id = ANY($%d)", argIdx))
+		positiveLibraryConditions = append(positiveLibraryConditions, fmt.Sprintf("mil_scope_in.media_folder_id = ANY($%d)", argIdx))
 		args = append(args, filters.LibraryIDs)
 		argIdx++
 	}
+	if len(positiveLibraryConditions) > 0 {
+		conditions = append(conditions, fmt.Sprintf(
+			"EXISTS (SELECT 1 FROM %s mil_scope_in WHERE mil_scope_in.%s = %s AND %s)",
+			membershipTable,
+			membershipKey,
+			libraryContentExpr,
+			strings.Join(positiveLibraryConditions, " AND "),
+		))
+	}
 
 	if len(filters.DisabledLibraryIDs) > 0 {
-		conditions = append(conditions, fmt.Sprintf("NOT (mil.media_folder_id = ANY($%d))", argIdx))
+		if len(positiveLibraryConditions) == 0 {
+			conditions = append(conditions, fmt.Sprintf(
+				"EXISTS (SELECT 1 FROM %s mil_scope_any WHERE mil_scope_any.%s = %s)",
+				membershipTable,
+				membershipKey,
+				libraryContentExpr,
+			))
+		}
+		conditions = append(conditions, fmt.Sprintf(
+			"NOT EXISTS (SELECT 1 FROM %s mil_scope_out WHERE mil_scope_out.%s = %s AND mil_scope_out.media_folder_id = ANY($%d))",
+			membershipTable,
+			membershipKey,
+			libraryContentExpr,
+			argIdx,
+		))
 		args = append(args, filters.DisabledLibraryIDs)
 		argIdx++
+	}
+
+	if isEpisodeCatalogScope(mediaScope) {
+		parentAccess := AccessFilter{DisabledLibraryIDs: filters.DisabledLibraryIDs}
+		if filters.LibraryIDs != nil {
+			parentAccess.AllowedLibraryIDs = filters.LibraryIDs
+		} else if filters.LibraryID > 0 {
+			parentAccess.AllowedLibraryIDs = []int{filters.LibraryID}
+		}
+		appendEpisodeParentLibraryAccessByEpisodeID(libraryContentExpr, parentAccess, &conditions, &args, &argIdx)
 	}
 
 	applyAccessFilter("mi", AccessFilter{MaxContentRating: filters.MaxContentRating}, &conditions, &args, &argIdx)
 
 	fromClause = baseRelation
-	libraryContentExpr := catalogLibraryContentExprForScope(mediaScope, "mi")
-	if filters.LibraryID > 0 || filters.LibraryIDs != nil || len(filters.DisabledLibraryIDs) > 0 {
-		membershipTable, membershipKey := catalogLibraryMembershipTableAndKeyForScope(mediaScope)
-		fromClause += " JOIN " + membershipTable + " mil ON " + libraryContentExpr + " = mil." + membershipKey
-	}
 	if filters.PersonID > 0 {
 		fromClause += " JOIN item_people ip ON ip.content_id = mi.content_id"
 	}
@@ -1294,14 +1355,14 @@ func browseItemColumns(alias string) string {
 // mangaCountColumns returns two index-backed correlated subqueries feeding the
 // "X Volumes · X Chapters" poster chip: distinct volume tokens (many chapter
 // rows can share one volume) and loose chapter rows without a volume token.
-// They return 0 for non-manga rows (no matching manga_chapters), which the
-// scan path nils out so only manga cards carry the counts. The subqueries are
-// functionally dependent on alias.content_id (the media_items PK, which leads
+// Only manga rows need these lookups. The scan path already nils the counts
+// for other types; the CASE avoids doing that discarded work in mixed scopes.
+// The subqueries depend on alias.content_id (the media_items PK, which leads
 // browseGroupByColumns), so they remain valid under the dedup GROUP BY without
 // being listed there.
 func mangaCountColumns(alias string) string {
-	return "(SELECT count(*) FROM manga_chapters mc WHERE mc.series_content_id = " + alias + ".content_id AND (mc.volume IS NULL OR mc.volume = '')) AS manga_chapter_count, " +
-		"(SELECT count(DISTINCT mc.volume) FROM manga_chapters mc WHERE mc.series_content_id = " + alias + ".content_id AND mc.volume IS NOT NULL AND mc.volume <> '') AS manga_volume_count"
+	return "CASE WHEN " + alias + ".type = 'manga' THEN (SELECT count(*) FROM manga_chapters mc WHERE mc.series_content_id = " + alias + ".content_id AND (mc.volume IS NULL OR mc.volume = '')) END AS manga_chapter_count, " +
+		"CASE WHEN " + alias + ".type = 'manga' THEN (SELECT count(DISTINCT mc.volume) FROM manga_chapters mc WHERE mc.series_content_id = " + alias + ".content_id AND mc.volume IS NOT NULL AND mc.volume <> '') END AS manga_volume_count"
 }
 
 // nullMangaCountColumns substitutes NULL placeholders for the manga count
@@ -1507,7 +1568,7 @@ func buildOrderByPlan(sort, order string, snapshot *time.Time, argIdx int, singl
 			direction,
 			direction,
 		), nil
-	case "recently_added":
+	case browseSortRecentlyAdded:
 		// Without GROUP BY (single-library filter), reference mil.first_seen_at
 		// directly so the planner can drive the order from
 		// idx_item_libraries_folder_seen_content instead of materializing

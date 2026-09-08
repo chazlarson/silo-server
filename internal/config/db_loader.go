@@ -317,8 +317,16 @@ func LoadFromDB(m map[string]string) (*Config, error) {
 	cfg.Metadata.CacheImages = cacheImages
 
 	// Playback
-	cfg.Playback.FFmpegPath = stringOr(m, "playback.ffmpeg_path", "/usr/lib/jellyfin-ffmpeg/ffmpeg")
+	cfg.Playback.FFmpegPath = stringOr(m, "playback.ffmpeg_path", "")
 	cfg.Playback.TranscodeDir = stringOr(m, playbackTranscodeDirSettingKey, DefaultTranscodeDir)
+	segmentRetentionSeconds, err := intOr(m, playbackSegmentRetentionSettingKey, 600)
+	if err != nil {
+		return nil, err
+	}
+	if segmentRetentionSeconds != 0 && (segmentRetentionSeconds < 120 || segmentRetentionSeconds > 86400) {
+		return nil, fmt.Errorf("%s must be 0 or between 120 and 86400", playbackSegmentRetentionSettingKey)
+	}
+	cfg.Playback.SegmentRetentionSeconds = segmentRetentionSeconds
 	cfg.Playback.HWAccel = stringOr(m, "playback.hw_accel", "auto")
 	cfg.Playback.HWDevice = stringOr(m, "playback.hw_device", "")
 	chapterThumbnailWorkers, err := intOr(m, "playback.chapter_thumbnail_workers", 1)
@@ -337,6 +345,10 @@ func LoadFromDB(m map[string]string) (*Config, error) {
 		return nil, err
 	}
 	cfg.Playback.TranscodeEnabled = transcodeEnabled
+	cfg.Playback.Routing = playbackRoutingPolicyFromSettings(m)
+	if err := validatePlaybackRoutingPolicy(cfg.Playback.Routing); err != nil {
+		return nil, err
+	}
 
 	// Redis
 	cfg.Redis.URL = stringOr(m, "redis.url", "")

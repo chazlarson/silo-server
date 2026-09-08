@@ -23,6 +23,7 @@ import { usePluginSettingsList } from "@/hooks/queries/pluginSettings";
 import { useRequestFeatureStatus } from "@/hooks/queries/useRequests";
 import { useSidebarPins, useToggleSidebarPin } from "@/hooks/queries/sidebarPins";
 import { useViewTransitionNavigate } from "@/hooks/useViewTransition";
+import { SEARCH_SHORTCUT_LABEL } from "@/lib/keyboardShortcut";
 import { pluginRouteHref } from "@/lib/pluginRouteHref";
 import {
   buildLibraryCollectionCatalogHref,
@@ -68,7 +69,7 @@ import {
   Send,
   Bell,
 } from "lucide-react";
-import { useTheme } from "@/hooks/useTheme";
+import { isKeyboardFocus, useTheme } from "@/hooks/useTheme";
 import { CURATED_THEME_IDS, THEMES } from "@/lib/themes";
 import { cn } from "@/lib/utils";
 import { useUICustomization } from "@/hooks/useUICustomization";
@@ -741,7 +742,7 @@ export default function AppSidebar({ onNavigate, collapsed = false }: AppSidebar
                       showLabels ? "opacity-100" : "opacity-0"
                     }`}
                   >
-                    {"\u2318"}K
+                    {SEARCH_SHORTCUT_LABEL}
                   </kbd>
                 </ViewTransitionLink>
               </li>
@@ -1067,7 +1068,12 @@ export default function AppSidebar({ onNavigate, collapsed = false }: AppSidebar
                         }}
                         onMouseEnter={() => previewTheme(id)}
                         onMouseLeave={resetPreviewTheme}
-                        onFocus={() => previewTheme(id)}
+                        // Radix focuses whichever item the pointer is over, so
+                        // an unconditional focus preview would bypass the hover
+                        // intent delay. Keyboard focus only.
+                        onFocus={(event) => {
+                          if (isKeyboardFocus(event.currentTarget)) previewTheme(id);
+                        }}
                         onBlur={resetPreviewTheme}
                         aria-label={def.label}
                         title={def.label}

@@ -15,6 +15,7 @@ import (
 
 	"github.com/Silo-Server/silo-server/internal/access"
 	"github.com/Silo-Server/silo-server/internal/artworkkey"
+	"github.com/Silo-Server/silo-server/internal/imagesize"
 	"github.com/Silo-Server/silo-server/internal/lang"
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/overlays"
@@ -43,8 +44,27 @@ type batchDurationFetcher interface {
 	FirstDurationsByEpisodeIDs(ctx context.Context, ids []string) (map[string]int, error)
 }
 
+// PlaybackProbeEnsurer repairs probe metadata for catalog responses. Neither
+// half of it runs the H.264 bitstream scan: no catalog surface may block on it.
 type PlaybackProbeEnsurer interface {
-	Ensure(ctx context.Context, file *models.MediaFile) (*models.MediaFile, error)
+	// EnsureProbeOnly does the probe repair alone. Browse surfaces use it — see
+	// prepareBrowseFiles.
+	EnsureProbeOnly(ctx context.Context, file *models.MediaFile) (*models.MediaFile, error)
+	// EnsureCopySafetyCached adds the copy-safety verdict when it is already
+	// known, and never execs ffmpeg. Watch surfaces use it — see
+	// preparePlaybackFiles.
+	EnsureCopySafetyCached(ctx context.Context, file *models.MediaFile) (*models.MediaFile, error)
+}
+
+// CopySafetyRacer resolves an unknown H.264 copy-safety verdict out of band.
+// The watch page asks for it and never waits: the verdict is not part of the
+// response, and any session that later ends up on a stream-copy route for the
+// file is switched off it by the playback-side notifier when the scan lands.
+//
+// It is a narrow injected interface so the catalog keeps no dependency on the
+// playback session machinery that implements it.
+type CopySafetyRacer interface {
+	RaceScan(fileID int)
 }
 
 type ChapterThumbnailQueuer interface {
@@ -58,7 +78,12 @@ type ImageResolver interface {
 	// ResolveImageURL resolves a single image path. Plugin-prefixed paths (e.g.,
 	// "metadb://images/abc/original.jpg") are resolved via the owning plugin's RPC.
 	// HTTP(S) URLs pass through unchanged. Empty paths return "".
-	// The variant parameter is a semantic size hint: "card", "featured", "full", "original".
+	//
+	// The variant parameter is a semantic size hint. The vocabulary is "card",
+	// "featured", "large", "full", and "original", and it is an open string:
+	// per the plugin SDK contract a resolver that does not recognize a name
+	// falls back to a usable image rather than failing, so names may be added
+	// here without gating on a plugin capability.
 	ResolveImageURL(ctx context.Context, path string, variant string) string
 
 	// ResolveImageURLs resolves multiple image paths in a single call. Returns a
@@ -138,8 +163,9 @@ func (s *DetailService) ProbedDurationsByEpisodeIDs(ctx context.Context, ids []s
 // ItemDetail is the full detail response for a single media item, including
 // metadata, file versions, subtitles, intro/credits markers, and presigned image URLs.
 type ItemDetail struct {
-	ContentID string `json:"content_id"`
-	Type      string `json:"type"`
+	ContentID     string `json:"content_id"`
+	PlayContentID string `json:"play_content_id,omitempty"`
+	Type          string `json:"type"`
 
 	// Metadata (served inline from Postgres).
 	Title         string `json:"title"`
@@ -658,6 +684,7 @@ type DetailService struct {
 	workSummary       WorkSummaryProvider
 	originalLangFn    func(context.Context, string) string
 	probeEnsurer      PlaybackProbeEnsurer
+	copySafetyRacer   CopySafetyRacer
 	chapterThumbs     ChapterThumbnailQueuer
 
 	// resolver is built once on first use; see settingsResolver.
@@ -706,6 +733,15 @@ func (s *DetailService) SetWorkSummaryProvider(provider WorkSummaryProvider) {
 
 func (s *DetailService) SetProbeEnsurer(ensurer PlaybackProbeEnsurer) {
 	s.probeEnsurer = ensurer
+}
+
+// SetCopySafetyRacer wires the out-of-band H.264 copy-safety scan the watch
+// surfaces trigger. Optional: without it an unknown verdict is simply left
+// unknown until a play resolves it.
+func (s *DetailService) SetCopySafetyRacer(racer CopySafetyRacer) {
+	if s != nil {
+		s.copySafetyRacer = racer
+	}
 }
 
 func (s *DetailService) SetChapterThumbnailQueuer(queuer ChapterThumbnailQueuer) {
@@ -1271,6 +1307,75 @@ func (s *DetailService) LocalizeEpisodeModels(ctx context.Context, episodes []*m
 
 // GetItemDetail retrieves a full item detail with presigned URLs and file versions.
 func (s *DetailService) GetItemDetail(ctx context.Context, contentID string, filter AccessFilter) (*ItemDetail, error) {
+	target, err := s.resolveDetailTarget(ctx, contentID, filter)
+	if err != nil {
+		return nil, err
+	}
+	switch {
+	case target.item != nil:
+		return s.buildMediaItemDetail(ctx, target.item, contentID, filter, nil)
+	case target.season != nil:
+		return s.buildSeasonDetail(ctx, target.season, filter)
+	case target.episode != nil:
+		seriesCtx, err := s.buildSeriesDetailContext(ctx, target.episode.SeriesID, filter)
+		if err != nil {
+			return nil, err
+		}
+		return s.buildEpisodeDetail(ctx, target.episode, seriesCtx, filter)
+	default:
+		return s.buildExtraItemDetail(ctx, target.extra, filter)
+	}
+}
+
+const detailTypeAudiobook = "audiobook"
+
+// GetItemVersions builds the browse version selector without loading unrelated
+// presentation data. It shares detail authorization and playback metadata, but
+// does not require localization, credits, artwork, or recommendations to succeed.
+func (s *DetailService) GetItemVersions(ctx context.Context, contentID string, filter AccessFilter) ([]FileVersion, error) {
+	target, err := s.resolveDetailTarget(ctx, contentID, filter)
+	if err != nil {
+		return nil, err
+	}
+	var files []*models.MediaFile
+	audioPreferenceContentID := contentID
+	switch {
+	case target.season != nil || (target.item != nil && target.item.Type == playableTypeSeries):
+		return []FileVersion{}, nil
+	case target.item != nil:
+		files, err = s.fileFetcher.GetByContentID(ctx, contentID)
+	case target.episode != nil:
+		files, err = s.fileFetcher.GetByEpisodeID(ctx, contentID)
+		audioPreferenceContentID = target.episode.SeriesID
+	default:
+		fetcher, ok := s.fileFetcher.(extraFileFetcher)
+		if !ok {
+			return nil, ErrItemNotFound
+		}
+		files, err = fetcher.GetByExtraID(ctx, contentID)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("fetching file versions: %w", err)
+	}
+	files = FilterMediaFilesByAccess(files, filter)
+	if target.item != nil && target.item.Type == detailTypeAudiobook {
+		sortAudiobookMediaFiles(files)
+	}
+	files = s.prepareBrowseFiles(ctx, files)
+	versions, _, _, _, _, _, _ := s.buildPlaybackInfo(ctx, files, filter, audioPreferenceContentID)
+	return versions, nil
+}
+
+// detailTarget is exactly one authorized catalog row. Keeping target resolution
+// shared prevents versions-only reads from drifting from detail access rules.
+type detailTarget struct {
+	item    *models.MediaItem
+	season  *models.Season
+	episode *models.Episode
+	extra   *models.MediaExtra
+}
+
+func (s *DetailService) resolveDetailTarget(ctx context.Context, contentID string, filter AccessFilter) (*detailTarget, error) {
 	item, err := s.itemRepo.GetByID(ctx, contentID)
 	switch {
 	case err == nil:
@@ -1280,7 +1385,7 @@ func (s *DetailService) GetItemDetail(ctx context.Context, contentID string, fil
 		if err := s.validatePresentationItemAccess(ctx, filter, contentID); err != nil {
 			return nil, err
 		}
-		return s.buildMediaItemDetail(ctx, item, contentID, filter, nil)
+		return &detailTarget{item: item}, nil
 	case !errors.Is(err, ErrItemNotFound):
 		return nil, err
 	}
@@ -1297,7 +1402,7 @@ func (s *DetailService) GetItemDetail(ctx context.Context, contentID string, fil
 		if err := s.validatePresentationItemAccess(ctx, filter, season.SeriesID); err != nil {
 			return nil, err
 		}
-		return s.buildSeasonDetail(ctx, season, filter)
+		return &detailTarget{season: season}, nil
 	} else if !errors.Is(err, ErrSeasonNotFound) {
 		return nil, err
 	}
@@ -1309,11 +1414,23 @@ func (s *DetailService) GetItemDetail(ctx context.Context, contentID string, fil
 	episode, err := s.episodeRepo.GetByID(ctx, contentID)
 	if err != nil {
 		if errors.Is(err, ErrEpisodeNotFound) {
-			// Fourth tier: a local extra. Serving it from GetItemDetail keeps
-			// per-item consumers that resolve arbitrary content ids
-			// (jellycompat PlaybackInfo in particular) playable without a
-			// separate lookup path.
-			return s.buildExtraItemDetail(ctx, contentID, filter)
+			if s.extraRepo == nil {
+				return nil, ErrItemNotFound
+			}
+			extra, err := s.extraRepo.GetByID(ctx, contentID)
+			if err != nil {
+				if errors.Is(err, ErrExtraNotFound) {
+					return nil, ErrItemNotFound
+				}
+				return nil, err
+			}
+			if err := s.itemRepo.EnsureAccessible(ctx, extra.ParentID, filter); err != nil {
+				return nil, err
+			}
+			if err := s.validatePresentationItemAccess(ctx, filter, extra.ParentID); err != nil {
+				return nil, err
+			}
+			return &detailTarget{extra: extra}, nil
 		}
 		return nil, err
 	}
@@ -1323,33 +1440,13 @@ func (s *DetailService) GetItemDetail(ctx context.Context, contentID string, fil
 	if err := s.validatePresentationItemAccess(ctx, filter, episode.ContentID); err != nil {
 		return nil, err
 	}
-	seriesCtx, err := s.buildSeriesDetailContext(ctx, episode.SeriesID, filter)
-	if err != nil {
-		return nil, err
-	}
-	return s.buildEpisodeDetail(ctx, episode, seriesCtx, filter)
+	return &detailTarget{episode: episode}, nil
 }
 
 // buildExtraItemDetail resolves a local extra as a minimal ItemDetail:
 // title/kind plus the ordinary playback surface (versions, subtitles) built
 // from its backing files. Access control is the parent item's.
-func (s *DetailService) buildExtraItemDetail(ctx context.Context, contentID string, filter AccessFilter) (*ItemDetail, error) {
-	if s.extraRepo == nil {
-		return nil, ErrItemNotFound
-	}
-	extra, err := s.extraRepo.GetByID(ctx, contentID)
-	if err != nil {
-		if errors.Is(err, ErrExtraNotFound) {
-			return nil, ErrItemNotFound
-		}
-		return nil, err
-	}
-	if err := s.itemRepo.EnsureAccessible(ctx, extra.ParentID, filter); err != nil {
-		return nil, err
-	}
-	if err := s.validatePresentationItemAccess(ctx, filter, extra.ParentID); err != nil {
-		return nil, err
-	}
+func (s *DetailService) buildExtraItemDetail(ctx context.Context, extra *models.MediaExtra, filter AccessFilter) (*ItemDetail, error) {
 	fetcher, ok := s.fileFetcher.(extraFileFetcher)
 	if !ok {
 		return nil, ErrItemNotFound
@@ -1359,7 +1456,7 @@ func (s *DetailService) buildExtraItemDetail(ctx context.Context, contentID stri
 		return nil, fmt.Errorf("fetching extra files: %w", err)
 	}
 	files = FilterMediaFilesByAccess(files, filter)
-	files = s.preparePlaybackFiles(ctx, files)
+	files = s.prepareBrowseFiles(ctx, files)
 
 	detail := &ItemDetail{
 		ContentID: extra.ContentID,
@@ -1420,13 +1517,13 @@ func (s *DetailService) buildSeriesDetailContext(ctx context.Context, seriesID s
 	if err != nil {
 		return nil, fmt.Errorf("localizing episode series detail: %w", err)
 	}
-	castCredits, crewCredits := s.fetchCredits(ctx, seriesID)
+	castCredits, crewCredits := s.fetchCredits(ctx, seriesID, filter)
 	return &seriesDetailContext{
 		series:      series,
 		castCredits: castCredits,
 		crewCredits: crewCredits,
 		versionPref: s.effectiveVersionDefaults(ctx, filter, seriesID),
-		backdropURL: s.PresignImageURL(ctx, series.BackdropPath, "backdrop", ""),
+		backdropURL: s.PresignImageURL(ctx, series.BackdropPath, "backdrop", string(filter.ImageSize)),
 	}, nil
 }
 
@@ -1632,7 +1729,7 @@ func (s *DetailService) GetItemDetailsByIDs(ctx context.Context, contentIDs []st
 			haveCredits:        s.personRepo != nil,
 		}
 		if s.personRepo != nil {
-			pf.castCredits, pf.crewCredits = splitCastCrew(s.personCredits(ctx, creditsByID[id]))
+			pf.castCredits, pf.crewCredits = splitCastCrew(s.personCredits(ctx, creditsByID[id], filter))
 		}
 		if item.Type != "series" && haveFileBatch {
 			pf.haveFiles = true
@@ -1726,7 +1823,7 @@ func (s *DetailService) fetchItemExtras(ctx context.Context, contentID string, p
 }
 
 // fetchCredits returns cast and crew credits for the given content ID.
-func (s *DetailService) fetchCredits(ctx context.Context, contentID string) ([]CastCredit, []CrewCredit) {
+func (s *DetailService) fetchCredits(ctx context.Context, contentID string, filter AccessFilter) ([]CastCredit, []CrewCredit) {
 	if s.personRepo == nil {
 		return []CastCredit{}, []CrewCredit{}
 	}
@@ -1734,7 +1831,7 @@ func (s *DetailService) fetchCredits(ctx context.Context, contentID string) ([]C
 	if err != nil {
 		people = nil
 	}
-	credits := s.personCredits(ctx, people)
+	credits := s.personCredits(ctx, people, filter)
 	return splitCastCrew(credits)
 }
 
@@ -1767,8 +1864,22 @@ func (s *DetailService) buildMediaItemDetail(ctx context.Context, item *models.M
 		pendingTranslation = pf.pendingTranslation
 		item = pf.localizedItem
 	} else {
-		pendingTranslation = s.PendingTranslationLanguage(ctx, item, filter)
-		localizedItem, err := s.LocalizeItemModel(ctx, item, filter)
+		// Share the language and row with the pending-translation decision,
+		// just as the batch detail path does.
+		targets, localizations, err := s.loadItemLocalizations(ctx, []*models.MediaItem{item}, filter)
+		var localizedItem *models.MediaItem
+		if err != nil && strings.TrimSpace(item.Overview) != "" && s.itemLocRepo != nil {
+			// PendingTranslationLanguage historically suppressed its lookup
+			// error before the required localization read. Preserve that retry
+			// on failure without repeating successful lookups.
+			localizedItem, err = s.LocalizeItemModel(ctx, item, filter)
+		} else if err == nil {
+			language, loc := targets[item.ContentID], localizations[item.ContentID]
+			if s.itemLocRepo != nil {
+				pendingTranslation = pendingTranslationLanguageWith(item, language, loc)
+			}
+			localizedItem = s.localizeItemModelWith(item, language, loc)
+		}
 		if err != nil {
 			return nil, fmt.Errorf("localizing item detail: %w", err)
 		}
@@ -1779,7 +1890,7 @@ func (s *DetailService) buildMediaItemDetail(ctx context.Context, item *models.M
 	if pf != nil && pf.haveCredits {
 		castCredits, crewCredits = pf.castCredits, pf.crewCredits
 	} else {
-		castCredits, crewCredits = s.fetchCredits(ctx, contentID)
+		castCredits, crewCredits = s.fetchCredits(ctx, contentID, filter)
 	}
 	detail := &ItemDetail{
 		ContentID:                  item.ContentID,
@@ -1823,9 +1934,9 @@ func (s *DetailService) buildMediaItemDetail(ctx context.Context, item *models.M
 
 	// Resolve image URLs: full URLs (TVDB/TMDB) pass through; S3 cached base paths get
 	// variant-resolved and presigned.
-	detail.PosterURL = s.PresignImageURL(ctx, item.PosterPath, "poster", "")
-	detail.BackdropURL = s.PresignImageURL(ctx, item.BackdropPath, "backdrop", "")
-	detail.LogoURL = s.PresignImageURL(ctx, item.LogoPath, "logo", "")
+	detail.PosterURL = s.PresignImageURL(ctx, item.PosterPath, "poster", string(filter.ImageSize))
+	detail.BackdropURL = s.PresignImageURL(ctx, item.BackdropPath, "backdrop", string(filter.ImageSize))
+	detail.LogoURL = s.PresignImageURL(ctx, item.LogoPath, "logo", string(filter.ImageSize))
 
 	// File versions and subtitle aggregation only apply to movies.
 	// For series, each episode file shares the series content_id, so
@@ -1843,10 +1954,10 @@ func (s *DetailService) buildMediaItemDetail(ctx context.Context, item *models.M
 		}
 
 		files = FilterMediaFilesByAccess(files, filter)
-		if item.Type == "audiobook" {
+		if item.Type == detailTypeAudiobook {
 			sortAudiobookMediaFiles(files)
 		}
-		files = s.preparePlaybackFiles(ctx, files)
+		files = s.prepareBrowseFiles(ctx, files)
 		detail.Versions, detail.PlaybackVariants, detail.Subtitles, detail.Intro, detail.Credits, detail.Recap, detail.Preview = s.buildPlaybackInfo(
 			ctx,
 			files,
@@ -1870,7 +1981,7 @@ func (s *DetailService) buildMediaItemDetail(ctx context.Context, item *models.M
 		detail.Extras = s.fetchItemExtras(ctx, contentID, pf)
 	}
 
-	if item.Type == "audiobook" {
+	if item.Type == detailTypeAudiobook {
 		detail.Audiobook = s.buildAudiobookExtension(ctx, item, detail.Versions, crewCredits, filter)
 	}
 	if item.Type == "ebook" {
@@ -1956,9 +2067,39 @@ func applyWorkSummaryValue(detail *ItemDetail, summary *WorkSummary) {
 }
 
 // personCredits converts ItemPerson slice to PersonCredit slice with presigned URLs.
-func (s *DetailService) personCredits(ctx context.Context, people []models.ItemPerson) []PersonCredit {
+func (s *DetailService) personCredits(ctx context.Context, people []models.ItemPerson, filter AccessFilter) []PersonCredit {
+	photoPaths := make([]string, len(people))
+	paths := make([]string, 0, len(people))
+	seen := make(map[string]struct{}, len(people))
+	variant := imagesize.PluginVariantFeatured
+	if filter.ImageSize != imagesize.Unset {
+		variant = sizeToVariant(string(filter.ImageSize))
+	}
+	for i, person := range people {
+		path := person.PhotoPath
+		if path == "" || path == "-" || strings.HasPrefix(path, "http://") || strings.HasPrefix(path, "https://") {
+			continue
+		}
+		// An absent size preserves the stored key and historical plugin hint;
+		// explicit sizes use the same profile ladder as individual resolution.
+		if filter.ImageSize != imagesize.Unset {
+			path = cachedImageVariantPath(path, artworkkey.ImageProfile, string(filter.ImageSize))
+		}
+		photoPaths[i] = path
+		if _, ok := seen[path]; !ok {
+			seen[path] = struct{}{}
+			paths = append(paths, path)
+		}
+	}
+	photoURLs := s.PresignURLsWithExpiry(ctx, paths, variant)
+	for _, path := range paths {
+		if photoURLs[path].URL == "" {
+			// Partial batch implementations retain their individual fallback.
+			photoURLs[path] = s.PresignURLWithExpiry(ctx, path, variant)
+		}
+	}
 	credits := make([]PersonCredit, 0, len(people))
-	for _, p := range people {
+	for i, p := range people {
 		pc := PersonCredit{
 			PersonID:  p.ID,
 			Name:      p.Name,
@@ -1970,8 +2111,10 @@ func (s *DetailService) personCredits(ctx context.Context, people []models.ItemP
 			TvdbID:    p.TvdbID,
 			PlexGUID:  p.PlexGUID,
 		}
-		if p.PhotoPath != "" && p.PhotoPath != "-" {
-			pc.PhotoURL = s.PresignURL(ctx, p.PhotoPath, "featured")
+		if strings.HasPrefix(p.PhotoPath, "http://") || strings.HasPrefix(p.PhotoPath, "https://") {
+			pc.PhotoURL = p.PhotoPath
+		} else if photoPaths[i] != "" {
+			pc.PhotoURL = photoURLs[photoPaths[i]].URL
 		}
 		if p.PhotoThumbhash != "" && p.PhotoThumbhash != "-" {
 			pc.PhotoThumbhash = p.PhotoThumbhash
@@ -2184,7 +2327,7 @@ func (s *DetailService) fetchMangaChapters(ctx context.Context, seriesContentID 
 	}
 	// Presign every chapter poster in one batch rather than per chapter — a
 	// long-running series has hundreds of chapters.
-	resolved := s.PresignImageURLs(ctx, posterPaths, "poster", "")
+	resolved := s.PresignImageURLs(ctx, posterPaths, "poster", string(filter.ImageSize))
 	for i := range chapters {
 		chapters[i].PosterURL = resolved[chapters[i].PosterURL]
 	}
@@ -2216,8 +2359,8 @@ func firstNonEmptyString(values []string) string {
 	return ""
 }
 
-func (s *DetailService) presignAudiobookPosterURL(ctx context.Context, posterPath string) string {
-	return s.PresignImageURL(ctx, posterPath, "poster", "")
+func (s *DetailService) presignAudiobookPosterURL(ctx context.Context, posterPath string, filter AccessFilter) string {
+	return s.PresignImageURL(ctx, posterPath, "poster", string(filter.ImageSize))
 }
 
 func appendAudiobookItemAccessConditions(
@@ -2313,7 +2456,7 @@ func (s *DetailService) fetchBookAlsoByAuthor(ctx context.Context, contentID str
 			continue
 		}
 		seen[item.ContentID] = struct{}{}
-		item.PosterURL = s.presignAudiobookPosterURL(ctx, posterPath)
+		item.PosterURL = s.presignAudiobookPosterURL(ctx, posterPath, filter)
 		out = append(out, item)
 	}
 	return out
@@ -2380,7 +2523,7 @@ func (s *DetailService) fetchBookSimilarByGenres(ctx context.Context, contentID 
 		if err := rows.Scan(&item.ContentID, &item.Title, &item.Year, &posterPath); err != nil {
 			return []AudiobookRelatedItem{}
 		}
-		item.PosterURL = s.presignAudiobookPosterURL(ctx, posterPath)
+		item.PosterURL = s.presignAudiobookPosterURL(ctx, posterPath, filter)
 		out = append(out, item)
 	}
 	return out
@@ -2454,7 +2597,7 @@ func (s *DetailService) fetchBookSeries(ctx context.Context, contentID string, m
 				item.SeriesIndex = &n
 			}
 		}
-		item.PosterURL = s.presignAudiobookPosterURL(ctx, poster)
+		item.PosterURL = s.presignAudiobookPosterURL(ctx, poster, filter)
 		entries = append(entries, item)
 	}
 	if len(entries) < 2 {
@@ -2614,7 +2757,7 @@ func (s *DetailService) buildSeasonDetail(ctx context.Context, season *models.Se
 
 	episodeCount := len(episodes)
 	seasonNumber := season.SeasonNumber
-	castCredits, crewCredits := s.fetchCredits(ctx, season.SeriesID)
+	castCredits, crewCredits := s.fetchCredits(ctx, season.SeriesID, filter)
 	detail := &ItemDetail{
 		ContentID:                  season.ContentID,
 		Type:                       "season",
@@ -2639,8 +2782,8 @@ func (s *DetailService) buildSeasonDetail(ctx context.Context, season *models.Se
 		detail.AirDate = &airDate
 	}
 
-	detail.PosterURL = s.PresignImageURL(ctx, season.PosterPath, "poster", "")
-	detail.BackdropURL = s.PresignImageURL(ctx, series.BackdropPath, "backdrop", "")
+	detail.PosterURL = s.PresignImageURL(ctx, season.PosterPath, "poster", string(filter.ImageSize))
+	detail.BackdropURL = s.PresignImageURL(ctx, series.BackdropPath, "backdrop", string(filter.ImageSize))
 	return detail, nil
 }
 
@@ -2689,7 +2832,7 @@ func (s *DetailService) buildEpisodeDetail(ctx context.Context, episode *models.
 		detail.Title = fmt.Sprintf("Episode %d", episode.EpisodeNumber)
 	}
 
-	detail.PosterURL = s.PresignImageURL(ctx, episode.StillPath, "still", "")
+	detail.PosterURL = s.PresignImageURL(ctx, episode.StillPath, "still", string(filter.ImageSize))
 	detail.BackdropURL = seriesCtx.backdropURL
 
 	files, err := s.fileFetcher.GetByEpisodeID(ctx, episode.ContentID)
@@ -2697,7 +2840,7 @@ func (s *DetailService) buildEpisodeDetail(ctx context.Context, episode *models.
 		return nil, fmt.Errorf("fetching file versions: %w", err)
 	}
 	files = FilterMediaFilesByAccess(files, filter)
-	files = s.preparePlaybackFiles(ctx, files)
+	files = s.prepareBrowseFiles(ctx, files)
 	detail.Versions, detail.PlaybackVariants, detail.Subtitles, detail.Intro, detail.Credits, detail.Recap, detail.Preview = s.buildPlaybackInfo(
 		ctx,
 		files,
@@ -3694,7 +3837,28 @@ func fileIDOrZero(version *FileVersion) int {
 	return version.FileID
 }
 
+// preparePlaybackFiles repairs probe metadata and stamps the H.264 copy-safety
+// verdict when it is already known. Used by the watch surfaces, where a play is
+// about to be prepared and the verdict is about to matter.
+//
+// It deliberately does not wait for an unknown verdict: the bitstream scan is
+// started in the background instead, so opening the watch page costs nothing
+// even for a file nobody has played yet. No session exists at this point — if
+// one appears and lands on a stream-copy route before the scan finishes, the
+// playback-side notifier switches it off that route when the verdict lands.
 func (s *DetailService) preparePlaybackFiles(ctx context.Context, files []*models.MediaFile) []*models.MediaFile {
+	return s.prepareFiles(ctx, files, true)
+}
+
+// prepareBrowseFiles repairs probe metadata only. Item, episode and extra
+// detail pages never consume the copy-safety verdict — it is not serialized
+// into their responses — so scanning for it there was pure warm-up that cost a
+// multi-second read per H.264 file on remote storage.
+func (s *DetailService) prepareBrowseFiles(ctx context.Context, files []*models.MediaFile) []*models.MediaFile {
+	return s.prepareFiles(ctx, files, false)
+}
+
+func (s *DetailService) prepareFiles(ctx context.Context, files []*models.MediaFile, withCopySafety bool) []*models.MediaFile {
 	if len(files) == 0 {
 		return files
 	}
@@ -3705,10 +3869,19 @@ func (s *DetailService) preparePlaybackFiles(ctx context.Context, files []*model
 			continue
 		}
 		if s.probeEnsurer != nil {
-			ensured, err := s.probeEnsurer.Ensure(ctx, file)
+			var ensured *models.MediaFile
+			var err error
+			if withCopySafety {
+				ensured, err = s.probeEnsurer.EnsureCopySafetyCached(ctx, file)
+			} else {
+				ensured, err = s.probeEnsurer.EnsureProbeOnly(ctx, file)
+			}
 			if err == nil && ensured != nil {
 				file = ensured
 			}
+		}
+		if withCopySafety && s.copySafetyRacer != nil && file.ID > 0 && file.VideoCopySafetyUnknown() {
+			s.copySafetyRacer.RaceScan(file.ID)
 		}
 		prepared = append(prepared, file)
 	}
@@ -3839,7 +4012,7 @@ func firstNonEmpty(values ...string) string {
 //   - Bare path (legacy) → logs warning and returns "" (no longer resolvable)
 //
 // The variant parameter is a semantic size hint forwarded to plugin resolvers:
-// "card", "featured", "full", "original".
+// "card", "featured", "large", "full", "original".
 func (s *DetailService) PresignURL(ctx context.Context, path string, variant string) string {
 	return s.PresignURLWithExpiry(ctx, path, variant).URL
 }
@@ -3966,7 +4139,15 @@ func (s *DetailService) PresignURLsWithExpiry(ctx context.Context, paths []strin
 
 // sizeToVariant maps the existing S3 size hints used by the frontend to
 // semantic variant names understood by plugins.
+//
+// An explicitly requested size is resolved by internal/imagesize, which owns
+// the client-facing size contract. Anything else — an absent or unparseable
+// hint — keeps the historical mapping below unchanged.
 func sizeToVariant(size string) string {
+	if parsed, err := imagesize.Parse(size); err == nil && parsed != imagesize.Unset {
+		return imagesize.PluginVariant(parsed)
+	}
+
 	switch size {
 	case "small":
 		return "card"
@@ -4034,6 +4215,14 @@ func imageTypeFromCachedPath(path string) string {
 	return dir[strings.LastIndex(dir, "/")+1:]
 }
 
+// ImageTypeFromCachedPath returns the image type ("poster", "backdrop",
+// "logo", "still", "profile") encoded in a cached S3 image path, or "" when the
+// path is a full URL, plugin-prefixed, or has no directory segment. Callers
+// outside this package need it to pick the variant ladder that governs a path.
+func ImageTypeFromCachedPath(path string) string {
+	return imageTypeFromCachedPath(path)
+}
+
 // BackdropVariantPath rewrites a cached "/original." image path to the
 // requested backdrop variant (e.g. "w1280" or "w1920"). Episode "backdrops"
 // are frequently the episode still, which the cache only generates at
@@ -4055,7 +4244,20 @@ func BackdropVariantPath(path, desiredVariant string) string {
 	return strings.Replace(path, "/original.", "/"+variant+".", 1)
 }
 
+// cachedImageVariantKey picks the cached artwork variant for an image type and
+// the size hint carried on the request.
+//
+// An explicitly requested size is resolved by internal/imagesize, which owns
+// the client-facing size contract and derives its rungs from
+// artworkkey.VariantWidths. Anything else — an absent hint, which is what most
+// call sites pass, or an unparseable one — falls through to the per-type
+// defaults below, which are retained verbatim as the record of what the server
+// returned before image_size existed.
 func cachedImageVariantKey(imageType, size string) string {
+	if parsed, err := imagesize.Parse(size); err == nil && parsed != imagesize.Unset {
+		return imagesize.Variant(imageType, parsed)
+	}
+
 	if size == "original" {
 		return "original"
 	}

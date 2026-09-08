@@ -1208,11 +1208,11 @@ func latestFastPathEligible(params url.Values, libraryItemType string) bool {
 }
 
 // loadLatestViaSections serves a per-library /Items/Latest through the native
-// recently-added section fetch, reusing the shared resolved-list cache. The
-// synthetic section carries the same type+config+limit+scope the native library
-// rail uses, so with the identity-independent cache key both surfaces collapse
-// to one shared entry. The cached *models.MediaItem values are treated
-// read-only; LocalizeItemModels deep-copies before any presign mutation.
+// recently-added section fetch. Jellyfin expects a flat list of parent series,
+// so this compatibility path explicitly opts out of the native TV scan-event
+// grouping that may return episode cards or repeat a series across scan runs.
+// The cached *models.MediaItem values are treated read-only;
+// LocalizeItemModels deep-copies before any presign mutation.
 func (h *ItemsHandler) loadLatestViaSections(ctx context.Context, session *Session, query itemsQuery) ([]baseItemDTO, error) {
 	// The caller has already restricted this to movies/series libraries. Pin the
 	// exact single type the BrowseItems fallback would use (movie or series) so
@@ -1245,11 +1245,12 @@ func (h *ItemsHandler) loadLatestViaSections(ctx context.Context, session *Sessi
 	// process-global cache entry per Limit value; with the fixed budget every
 	// compat Latest request for a scope+library shares exactly one entry.
 	resolved := sections.ResolvedSection{
-		ID:          "compat-latest",
-		SectionType: sections.SectionRecentlyAdded,
-		Title:       "Latest",
-		ItemLimit:   compatLatestCacheFetchLimit,
-		Config:      cfg,
+		ID:                     "compat-latest",
+		SectionType:            sections.SectionRecentlyAdded,
+		Title:                  "Latest",
+		ItemLimit:              compatLatestCacheFetchLimit,
+		Config:                 cfg,
+		DisableTVEventGrouping: true,
 	}
 
 	withItems, err := h.sectionsFetcher.FetchOne(ctx, resolved, &libraryID, nil, session.StreamAppUserID, session.ProfileID, filter)
@@ -1565,10 +1566,37 @@ func (h *ItemsHandler) HandleEpisodes(w http.ResponseWriter, r *http.Request) {
 	}
 	query := parseItemsQuery(r, h.codec)
 
-	seriesID, err := h.codec.DecodeStringID(EncodedIDItem, chi.URLParam(r, "id"))
-	if err != nil {
-		writeError(w, http.StatusNotFound, "NotFound", "Series not found")
-		return
+	var seriesID string
+	var requestedSeasonID string
+
+	if rawSeasonID := strings.TrimSpace(newCaseInsensitiveQuery(r.URL.Query()).Get("SeasonId")); rawSeasonID != "" {
+		decodedSeasonID, decodeErr := h.codec.DecodeStringID(EncodedIDSeason, rawSeasonID)
+		if decodeErr != nil {
+			writeError(w, http.StatusNotFound, "NotFound", "Season not found")
+			return
+		}
+		requestedSeasonID = decodedSeasonID
+		if h.seasonRepo != nil {
+			season, seasonErr := h.seasonRepo.GetByID(r.Context(), requestedSeasonID)
+			if seasonErr != nil && !errors.Is(seasonErr, catalog.ErrSeasonNotFound) {
+				writeError(w, http.StatusInternalServerError, "InternalServerError", "Database error")
+				return
+			}
+			if season != nil {
+				seriesID = season.SeriesID
+			}
+		}
+		if seriesID == "" {
+			writeError(w, http.StatusNotFound, "NotFound", "Season not found")
+			return
+		}
+	} else {
+		id, err := h.codec.DecodeStringID(EncodedIDItem, chi.URLParam(r, "id"))
+		if err != nil {
+			writeError(w, http.StatusNotFound, "NotFound", "Series not found")
+			return
+		}
+		seriesID = id
 	}
 
 	// AdjacentTo (Wholphin autoplay/skip) only needs the requested episode plus
@@ -1577,16 +1605,6 @@ func (h *ItemsHandler) HandleEpisodes(w http.ResponseWriter, r *http.Request) {
 	if query.adjacentTo != "" {
 		h.writeAdjacentEpisodesResponse(w, r, session, query, seriesID)
 		return
-	}
-
-	var requestedSeasonID string
-	if rawSeasonID := strings.TrimSpace(newCaseInsensitiveQuery(r.URL.Query()).Get("SeasonId")); rawSeasonID != "" {
-		decodedSeasonID, decodeErr := h.codec.DecodeStringID(EncodedIDSeason, rawSeasonID)
-		if decodeErr != nil {
-			writeError(w, http.StatusNotFound, "NotFound", "Season not found")
-			return
-		}
-		requestedSeasonID = decodedSeasonID
 	}
 
 	h.writeSeriesEpisodesResponse(w, r, session, query, seriesID, requestedSeasonID, false)

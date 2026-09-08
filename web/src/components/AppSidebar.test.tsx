@@ -6,6 +6,7 @@ import { MemoryRouter, Route, Routes } from "react-router";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { PluginSettingsSummary } from "@/api/types";
+import { SEARCH_SHORTCUT_LABEL } from "@/lib/keyboardShortcut";
 
 import AppSidebar from "./AppSidebar";
 import {
@@ -143,14 +144,15 @@ vi.mock("@/hooks/useServerBranding", () => ({
 vi.mock("@/hooks/useTheme", () => ({
   useTheme: () => ({
     theme: "dark",
+    activeTheme: "dark",
     setTheme: vi.fn(),
     previewTheme: vi.fn(),
     resetPreviewTheme: vi.fn(),
   }),
-}));
-
-vi.mock("@/components/ThemeSwitcher", () => ({
-  default: () => <div>Theme switcher</div>,
+  isKeyboardFocus: () => false,
+  // SiloBrand reads the appearance through the optional hook; null keeps it on
+  // the dark built-in assets, matching the sidebar's own surface.
+  useOptionalTheme: () => null,
 }));
 
 vi.mock("@/components/ui/avatar", () => ({
@@ -196,6 +198,12 @@ describe("AppSidebar", () => {
 
     expect(markup).toContain("text-sidebar-accent-foreground bg-sidebar-accent");
     expect(markup).not.toContain("text-sidebar-primary-foreground bg-sidebar-accent");
+  });
+
+  it("uses the shared platform-aware label for the search shortcut", () => {
+    const markup = renderSidebar("/");
+
+    expect(markup).toContain(`>${SEARCH_SHORTCUT_LABEL}</kbd>`);
   });
 
   it("renders the Silo brand mark instead of the old play glyph", () => {

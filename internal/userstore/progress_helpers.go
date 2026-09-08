@@ -31,6 +31,56 @@ func AddVisibleHistory(ctx context.Context, store UserStore, entry WatchHistoryE
 	return entry, nil
 }
 
+// MarkWatchedTarget is one leaf item to mark watched, carrying the duration
+// that belongs on its progress row.
+type MarkWatchedTarget struct {
+	MediaItemID     string
+	DurationSeconds float64
+}
+
+// WatchedBatchWriter is an optional store capability: mark every target
+// watched and insert its history row in a single transaction, so a canceled
+// request leaves nothing marked instead of a partial subset. Marking a large
+// series is the motivating case — the per-target fallback below commits each
+// episode independently, so losing the request mid-loop strands the series
+// half-watched.
+//
+// Semantics must match the fallback: per-target duration lands on the progress
+// row, each entry gets exactly one history row, and both respect the
+// hidden-history watermark the single-row MarkWatched/AddVisibleHistory paths
+// apply. The returned entries carry the resolved (possibly watermark-adjusted)
+// WatchedAt, in the order given.
+type WatchedBatchWriter interface {
+	MarkWatchedBatch(ctx context.Context, profileID string, targets []MarkWatchedTarget, entries []WatchHistoryEntry) ([]WatchHistoryEntry, error)
+}
+
+// MarkWatchedBatch marks every target watched and records its history entry,
+// atomically where the store supports it. targets and entries are parallel:
+// entries[i] is the history row for targets[i].
+func MarkWatchedBatch(ctx context.Context, store UserStore, profileID string, targets []MarkWatchedTarget, entries []WatchHistoryEntry) ([]WatchHistoryEntry, error) {
+	if len(targets) == 0 {
+		return nil, nil
+	}
+	if writer, ok := store.(WatchedBatchWriter); ok {
+		return writer.MarkWatchedBatch(ctx, profileID, targets, entries)
+	}
+	written := make([]WatchHistoryEntry, 0, len(entries))
+	for i, target := range targets {
+		if err := store.MarkWatched(ctx, profileID, target.MediaItemID, target.DurationSeconds); err != nil {
+			return written, err
+		}
+		if i >= len(entries) {
+			continue
+		}
+		entry, err := AddVisibleHistory(ctx, store, entries[i])
+		if err != nil {
+			return written, err
+		}
+		written = append(written, entry)
+	}
+	return written, nil
+}
+
 func VisibleHistoryTimestamps(ctx context.Context, store UserStore, profileID string, mediaItemIDs []string, at time.Time) (map[string]string, error) {
 	mediaItemIDs = compactHistoryMediaItemIDs(mediaItemIDs)
 	result := make(map[string]string, len(mediaItemIDs))
@@ -82,6 +132,17 @@ type SeriesWatchCounts struct {
 // progress row has position_seconds > 0.
 type SeriesEpisodeRollupStore interface {
 	SeriesEpisodeWatchCounts(ctx context.Context, profileID string, seriesIDs []string) (map[string]SeriesWatchCounts, error)
+}
+
+// EpisodeParentCompletionStore determines whether every available episode of a
+// series or season is completed. Empty parents are not completed. Implementations
+// must use the same progress and completed-history visibility rules as
+// ListProgressWithCompletedHistory, and count episode-library membership as
+// availability, including missing files. Callers needing only a played flag can
+// stop at the first incomplete episode instead of materializing all child IDs.
+type EpisodeParentCompletionStore interface {
+	SeriesCompletion(ctx context.Context, profileID string, seriesIDs []string) (map[string]bool, error)
+	SeasonCompletion(ctx context.Context, profileID string, seasonIDs []string) (map[string]bool, error)
 }
 
 // CompletedHistoryItemMap returns the latest completed-history item row for a

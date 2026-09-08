@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useSearchParams } from "react-router";
-import { CheckSquare, Search, Trash2, X } from "lucide-react";
+import { CheckSquare, RefreshCw, Search, Trash2, X } from "lucide-react";
 
+import { captureProfileRequestContext } from "@/api/client";
 import type { BrowseItem } from "@/api/types";
 import ItemGrid from "@/components/ItemGrid";
 import { RequestToAddSection } from "@/components/RequestToAddSection";
@@ -34,6 +35,7 @@ import {
 import type { CatalogSearchState } from "./catalogSearchParams";
 
 const REQUEST_SEARCH_DEBOUNCE_MS = 100;
+const INTERACTIVE_SEARCH_GC_TIME_MS = 30_000;
 
 function defaultCatalogTitle(source: string, searchQuery?: string) {
   if (source === "favorites") return "Favorites";
@@ -104,6 +106,8 @@ function CatalogResults({
   const isHistorySource = state.source === "history";
   const isCollectionSource =
     state.source === "library_collection" || state.source === "user_collection";
+  const hasSavedSortPreference =
+    isCollectionSource || state.source === "watchlist" || state.source === "favorites";
   const allowPersonalizedOverlayControls = catalogSourceAllowsOverlay(state.source);
   const removeHistory = useRemoveHistory();
   const [selectionMode, setSelectionMode] = useState(false);
@@ -160,14 +164,14 @@ function CatalogResults({
     visibleRange,
     includeTotal: showExactResultCount,
   });
-  // The server resolves a collection's effective order (viewer override, then
-  // the collection's default, then source order) when the URL carries no sort.
+  // The server resolves a collection or personal list's effective order when
+  // the URL carries no sort.
   // Reflect that back into the filter bar so the menu shows what is actually
   // applied, without writing it into the URL — leaving it out of the URL is what
   // lets a later change to the saved preference take effect on the next visit.
   const effectiveSort = catalogQuery.data?.effectiveSort;
   const sortedState = useMemo(() => {
-    if (!isCollectionSource || !effectiveState.uses_source_order || !effectiveSort?.field) {
+    if (!hasSavedSortPreference || !effectiveState.uses_source_order || !effectiveSort?.field) {
       return effectiveState;
     }
     return {
@@ -179,13 +183,24 @@ function CatalogResults({
         sort: { field: effectiveSort.field, order: effectiveSort.order },
       },
     };
-  }, [effectiveSort, effectiveState, isCollectionSource]);
+  }, [effectiveSort, effectiveState, hasSavedSortPreference]);
 
-  const setCollectionSortPreference = useSetCollectionSortPreference();
+  const saveCollectionSortPreference = useSetCollectionSortPreference();
   const rememberCollectionSort = useCallback(
     (nextState: CatalogSearchState) => {
       const collectionId = nextState.collection_id?.trim();
-      if (!isCollectionSource || !collectionId) return;
+      let collectionKind: "library" | "user" | "watchlist" | "favorites";
+      if (nextState.source === "library_collection") {
+        if (!collectionId) return;
+        collectionKind = "library";
+      } else if (nextState.source === "user_collection") {
+        if (!collectionId) return;
+        collectionKind = "user";
+      } else if (nextState.source === "watchlist" || nextState.source === "favorites") {
+        collectionKind = nextState.source;
+      } else {
+        return;
+      }
       const nextValue = nextState.uses_source_order
         ? ""
         : querySortToSelectValue(nextState.query_definition.sort);
@@ -193,15 +208,21 @@ function CatalogResults({
         ? ""
         : querySortToSelectValue(sortedState.query_definition.sort);
       if (nextValue === currentValue) return;
+      // Captured here, at the moment of the pick, rather than inside the
+      // mutation: these writes are serialized, so one that runs later must
+      // still land on the profile that actually chose the sort.
+      const profileAuth = captureProfileRequestContext();
+      if (!profileAuth) return;
       const [field, order] = nextValue ? nextValue.split(":") : ["", ""];
-      setCollectionSortPreference.mutate({
-        collection_kind: nextState.source === "library_collection" ? "library" : "user",
+      void saveCollectionSortPreference({
+        collection_kind: collectionKind,
         collection_id: collectionId,
         field: field ?? "",
         order: order === "asc" || order === "desc" ? order : "",
+        profileAuth,
       });
     },
-    [isCollectionSource, setCollectionSortPreference, sortedState],
+    [saveCollectionSortPreference, sortedState],
   );
 
   const canRequest = useCanRequest();
@@ -212,11 +233,15 @@ function CatalogResults({
     enabled: canRequest.discoveryEnabled && isQuerySource,
     requireProfile: true,
     staleTime: 5 * 60 * 1000,
+    gcTime: INTERACTIVE_SEARCH_GC_TIME_MS,
+    retry: false,
   });
   const tmdbMissingCount =
     tmdbQuery.data?.results?.filter((result) => result.availability !== "available").length ?? 0;
-  const libraryHasResults = (catalogQuery.data?.totalItems ?? 0) > 0;
-  const libraryEmpty = !catalogQuery.isLoading && !libraryHasResults;
+  const libraryResultsKnown =
+    !catalogQuery.isLoading && !catalogQuery.isPlaceholderData && !catalogQuery.isError;
+  const libraryHasResults = libraryResultsKnown && (catalogQuery.data?.totalItems ?? 0) > 0;
+  const libraryEmpty = libraryResultsKnown && !libraryHasResults;
   // When the library is empty and the request section will (or might) render,
   // hide ItemGrid entirely. The previous approach pinned ItemGrid's `loading`
   // prop to true, which renders 24 skeleton tiles forever above the section.
@@ -337,7 +362,13 @@ function CatalogResults({
         }}
         allowLibrarySelection={!isCollectionSource}
         allowPersonalizedFilters={allowPersonalizedOverlayControls}
-        allowPersonalizedSorts={allowPersonalizedOverlayControls}
+        allowPersonalizedSorts={
+          isHistorySource
+            ? "date_viewed"
+            : state.source === "favorites" || state.source === "watchlist"
+              ? false
+              : allowPersonalizedOverlayControls
+        }
       />
 
       {isHistorySource && (
@@ -396,13 +427,34 @@ function CatalogResults({
         </section>
       )}
 
-      {tmdbMayRescueLibrary ? null : (
+      {catalogQuery.isError ? (
+        <div
+          className="search-paint-surface flex flex-col items-center justify-center gap-3 rounded-2xl border px-4 py-16 text-center"
+          role="alert"
+        >
+          <p className="font-medium">
+            {isQuerySource
+              ? "Search stopped before it could finish."
+              : "Catalog stopped before it could finish."}
+          </p>
+          <p className="text-muted-foreground max-w-md text-sm">
+            {isQuerySource
+              ? "The server ended the lookup so it could not keep using CPU in the background. Try a more specific title or retry once."
+              : "The server could not load every requested result. Retry the catalog once."}
+          </p>
+          <Button variant="outline" size="sm" onClick={() => void catalogQuery.refetch()}>
+            <RefreshCw className="size-4" />
+            {isQuerySource ? "Retry search" : "Retry catalog"}
+          </Button>
+        </div>
+      ) : tmdbMayRescueLibrary ? null : (
         <ItemGrid
           totalItems={catalogQuery.data?.totalItems ?? 0}
           pages={catalogQuery.data?.pages ?? new Map()}
           pageSize={limit}
           loading={catalogQuery.isLoading}
           onVisibleRangeChange={handleVisibleRangeChange}
+          narrowPosterActions={state.source === "favorites" || state.source === "watchlist"}
           selectionMode={isHistorySource && selectionMode}
           selectedIds={selectedIds}
           onToggleSelect={toggleHistorySelection}
@@ -414,6 +466,7 @@ function CatalogResults({
           variant="grid"
           query={tmdbDebouncedQ}
           libraryHadHits={libraryHasResults}
+          libraryResultsKnown={libraryResultsKnown}
         />
       ) : null}
 

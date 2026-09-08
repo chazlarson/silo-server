@@ -1,5 +1,7 @@
+import { useState } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { api } from "@/api/client";
+import { toast } from "sonner";
+import { ApiClientError, api } from "@/api/client";
 import type {
   SectionsResponse,
   HomeLayoutResponse,
@@ -13,6 +15,19 @@ import type {
 } from "@/api/types";
 import { sectionKeys } from "./keys";
 import { invalidateAdminCollectionQueries } from "./collectionSurfaceRefresh";
+import { runBulkDelete, type BulkDeleteProgress } from "./bulkDelete";
+
+/**
+ * Home section data outlives the default client-wide gcTime on purpose.
+ *
+ * The layout query loses its observer the moment home unmounts, and the section
+ * items are fetched observer-less through `queryClient.fetchQuery`, so the
+ * 10 minute default evicts everything home needs mid-session and the next visit
+ * repaints the whole skeleton grid. Keeping the entries for an hour makes a
+ * return render from cache; invalidation still drives real refreshes.
+ */
+export const HOME_SECTION_STALE_TIME = 10 * 60 * 1000;
+export const HOME_SECTION_GC_TIME = 60 * 60 * 1000;
 
 interface RawSectionOverride {
   ID?: string;
@@ -78,7 +93,8 @@ export function useHomeLayout() {
   return useQuery({
     queryKey: sectionKeys.homeLayout(),
     queryFn: () => api<HomeLayoutResponse>("/home/layout"),
-    staleTime: 5 * 60 * 1000,
+    staleTime: HOME_SECTION_STALE_TIME,
+    gcTime: HOME_SECTION_GC_TIME,
   });
 }
 
@@ -193,6 +209,49 @@ export function useDeleteSection() {
       void invalidateAdminCollectionQueries(qc);
     },
   });
+}
+
+export function useDeleteSections() {
+  const qc = useQueryClient();
+  const [progress, setProgress] = useState<BulkDeleteProgress | null>(null);
+
+  const mutation = useMutation({
+    onMutate: (ids) => {
+      setProgress({ completed: 0, total: new Set(ids).size });
+    },
+    mutationFn: (ids: string[]) =>
+      runBulkDelete(
+        ids,
+        (id) =>
+          api<void>(`/admin/sections/${encodeURIComponent(id)}`, {
+            method: "DELETE",
+          }),
+        (error) => (error instanceof ApiClientError && error.status === 404 ? "deleted" : "failed"),
+        setProgress,
+      ),
+    onSuccess: async ({ requested, deleted, failed, firstError }) => {
+      if (failed === 0) {
+        toast.success(`Deleted ${deleted} section${deleted === 1 ? "" : "s"}`);
+      } else if (deleted > 0) {
+        toast.warning(`Deleted ${deleted} of ${requested} sections`, {
+          description: firstError,
+        });
+      } else {
+        toast.error(`Failed to delete ${failed} section${failed === 1 ? "" : "s"}`, {
+          description: firstError,
+        });
+      }
+      await Promise.all([
+        qc.invalidateQueries({ queryKey: sectionKeys.all }),
+        invalidateAdminCollectionQueries(qc),
+      ]);
+    },
+    onSettled: () => {
+      setProgress(null);
+    },
+  });
+
+  return { ...mutation, progress };
 }
 
 export function useReorderSections() {

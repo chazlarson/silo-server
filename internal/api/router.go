@@ -36,6 +36,7 @@ import (
 	"github.com/Silo-Server/silo-server/internal/downloads"
 	evt "github.com/Silo-Server/silo-server/internal/events"
 	"github.com/Silo-Server/silo-server/internal/historyimport"
+	"github.com/Silo-Server/silo-server/internal/httpstream"
 	"github.com/Silo-Server/silo-server/internal/intromarkers"
 	"github.com/Silo-Server/silo-server/internal/invitations"
 	"github.com/Silo-Server/silo-server/internal/libraryingest"
@@ -48,7 +49,9 @@ import (
 	"github.com/Silo-Server/silo-server/internal/metadata/tmdb"
 	metatrakt "github.com/Silo-Server/silo-server/internal/metadata/trakt"
 	metadatatranslation "github.com/Silo-Server/silo-server/internal/metadata/translation"
+	"github.com/Silo-Server/silo-server/internal/nodemetrics"
 	"github.com/Silo-Server/silo-server/internal/nodepool"
+	"github.com/Silo-Server/silo-server/internal/noderecipe"
 	"github.com/Silo-Server/silo-server/internal/notifications"
 	"github.com/Silo-Server/silo-server/internal/onboarding"
 	"github.com/Silo-Server/silo-server/internal/opslog"
@@ -65,6 +68,7 @@ import (
 	"github.com/Silo-Server/silo-server/internal/secret"
 	"github.com/Silo-Server/silo-server/internal/sections"
 	"github.com/Silo-Server/silo-server/internal/settingscontract"
+	"github.com/Silo-Server/silo-server/internal/streamtelemetry"
 	"github.com/Silo-Server/silo-server/internal/subtitles"
 	subtitleai "github.com/Silo-Server/silo-server/internal/subtitles/ai"
 	"github.com/Silo-Server/silo-server/internal/subtitles/opensubtitles"
@@ -93,70 +97,91 @@ type Dependencies struct {
 	BootstrapSensitiveValues     map[string]string
 	RedisBootstrapAvailable      bool
 	AppContext                   context.Context
-	DB                           *pgxpool.Pool
-	SecretCipher                 *secret.Cipher // at-rest credential cipher (required when DB is set)
-	FrontendFS                   fs.FS
-	S3Public                     *s3client.Client                 // public assets bucket client (may be nil)
-	S3Private                    *s3client.Client                 // private internal bucket client (may be nil)
-	S3UserDB                     *s3client.Client                 // user-db bucket client (may be nil)
-	BrandingService              *branding.Service                // white-label branding (nil when DB unavailable)
-	FolderRepo                   *catalog.FolderRepository        // media folder repository (may be nil)
-	FileRepo                     *scanner.FileRepository          // media file repository (may be nil)
-	Scanner                      *scanner.Scanner                 // scanner instance (may be nil)
-	LibraryIngester              *libraryingest.Executor          // shared library ingest executor (may be nil)
-	ProbeEnsurer                 handlers.PlaybackProbeEnsurer    // on-demand probe repair for playback/detail (may be nil)
-	UserStoreProvider            userstore.UserStoreProvider      // user store provider (may be nil)
-	SessionMgr                   *playback.SessionManager         // playback session manager (may be nil)
-	SkippedRootRepo              *metadata.SkippedRootRepository  // skipped root repository (may be nil)
-	StaleIDRepo                  *metadata.StaleMediaIDRepository // stale media ID repository (may be nil)
-	MovieMatchQueueRepo          *metadata.MovieMatchQueueRepository
-	SeriesRootMatchQueueRepo     *metadata.SeriesRootMatchQueueRepository
-	Refresher                    handlers.AdminMetadataRefresher // metadata refresher (may be nil)
-	NodeRepo                     *nodepool.Repository            // stream node repository (may be nil)
-	ProxyPool                    *nodepool.ProxyPool             // proxy node pool (may be nil)
-	TranscodePool                *nodepool.TranscodePool         // transcode node pool (may be nil)
-	NodePlanner                  *nodepool.Planner               // group/cap-aware node selection (may be nil)
-	SessionSyncer                handlers.PlaybackSessionSyncer  // optional; immediate playback session sync trigger
-	EventBus                     cache.EventBus
-	AdminStatsProvider           handlers.AdminStatsSource
-	Recommender                  recommendations.Recommender // nil when disabled
-	RecWorker                    *recommendations.Worker     // nil when disabled
-	CatalogSearchVectorizer      catalog.CatalogSearchQueryVectorizer
-	RatingsRepo                  *catalog.RatingsRepo
-	PersonRepo                   *catalog.PersonRepository
-	PersonRefreshQueue           handlers.PersonRefreshQueue
-	PersonRefresher              handlers.PersonRefresher
-	RateLimitMW                  *ratelimit.Middleware
-	ClientIPResolver             *clientip.Resolver
-	NodeID                       string
-	LogStreamHub                 *logstream.Hub
-	RealtimeHub                  *notifications.Hub
-	Notifications                *notifications.System // user-facing release notifications (may be nil)
-	PolicySystem                 *policy.System        // policy engine lifecycle (may be nil)
-	EventsHub                    *evt.Hub
-	ScanRegistry                 *evt.ScanRegistry
-	LibraryScanQueue             *scanqueue.Service
-	ActivityLogWriter            activitylog.Writer
-	ActivityLogRepo              *activitylog.Repo
-	OpsLogRepo                   *opslog.Repo
-	FFmpegLogSink                playback.FFmpegLogSink
-	RedisClient                  *redis.Client              // for session listing (may be nil)
-	TaskManager                  *taskmanager.TaskManager   // task manager (may be nil)
-	ArtifactManager              *downloads.ArtifactManager // download prepare-to-file pipeline (may be nil)
-	AdminJobCancelRegistry       *adminjob.CancelRegistry
-	IntroRepository              *intromarkers.Repository
-	IntroAnalyzer                *intromarkers.Analyzer
-	MarkerRegistry               *markers.Registry
-	MarkerResolver               markers.ExternalIDResolver
-	MarkerProviderConfig         *markers.ProviderConfigStore
-	MarkerContributionStore      *markers.ContributionStore
-	MarkerContributionService    *markers.ContributionService
-	WatchProviderService         handlers.WatchProviderService
-	WatchCompletionObserver      watchstate.CompletionObserver
-	PluginService                *plugins.Service
-	PluginHTTPProxy              *plugins.HTTPProxy
-	PluginUserConfig             *plugins.UserConfigStore
-	AuthProviders                []auth.RegisteredProvider
+	// RegisterShutdownWork retains asynchronous cleanup completion until main's
+	// graceful-shutdown deadline. Nil is valid in tests and embedded routers.
+	RegisterShutdownWork func(<-chan struct{})
+
+	DB                *pgxpool.Pool
+	SecretCipher      *secret.Cipher // at-rest credential cipher (required when DB is set)
+	FrontendFS        fs.FS
+	S3Public          *s3client.Client              // public assets bucket client (may be nil)
+	S3Private         *s3client.Client              // private internal bucket client (may be nil)
+	S3UserDB          *s3client.Client              // user-db bucket client (may be nil)
+	BrandingService   *branding.Service             // white-label branding (nil when DB unavailable)
+	FolderRepo        *catalog.FolderRepository     // media folder repository (may be nil)
+	FileRepo          *scanner.FileRepository       // media file repository (may be nil)
+	Scanner           *scanner.Scanner              // scanner instance (may be nil)
+	LibraryIngester   *libraryingest.Executor       // shared library ingest executor (may be nil)
+	ProbeEnsurer      handlers.PlaybackProbeEnsurer // on-demand probe repair for playback/detail (may be nil)
+	UserStoreProvider userstore.UserStoreProvider   // user store provider (may be nil)
+	SessionMgr        *playback.SessionManager      // playback session manager (may be nil)
+	StreamTelemetry   *streamtelemetry.Registry     // local observation-only stream telemetry (may be nil)
+	// StreamTelemetryViewCache serves the merged global view with bounded
+	// staleness so the admin parity endpoint never rebuilds it per request.
+	StreamTelemetryViewCache *streamtelemetry.ViewCache
+	SkippedRootRepo          *metadata.SkippedRootRepository  // skipped root repository (may be nil)
+	StaleIDRepo              *metadata.StaleMediaIDRepository // stale media ID repository (may be nil)
+	MovieMatchQueueRepo      *metadata.MovieMatchQueueRepository
+	SeriesRootMatchQueueRepo *metadata.SeriesRootMatchQueueRepository
+	Refresher                handlers.AdminMetadataRefresher // metadata refresher (may be nil)
+	NodeRepo                 *nodepool.Repository            // stream node repository (may be nil)
+	ProxyPool                *nodepool.ProxyPool             // proxy node pool (may be nil)
+	TranscodePool            *nodepool.TranscodePool         // transcode node pool (may be nil)
+	NodePlanner              *nodepool.Planner               // group/cap-aware node selection (may be nil)
+	NodeHealthChecker        *nodepool.HealthChecker         // periodic node health/capability sweep (may be nil)
+	// NodeCapabilityInvalidator drops one node's cached capability inventory
+	// outside the playback handler — the prepared-download preparer holds its
+	// own. nil where downloads are not wired; set before NewRouter runs.
+	NodeCapabilityInvalidator func(nodeURL string)
+	ResourceSampler           *nodemetrics.Sampler           // this host's own resource sampler (may be nil)
+	SessionSyncer             handlers.PlaybackSessionSyncer // optional; immediate playback session sync trigger
+	EventBus                  cache.EventBus
+	AdminStatsProvider        handlers.AdminStatsSource
+	Recommender               recommendations.Recommender // nil when disabled
+	RecWorker                 *recommendations.Worker     // nil when disabled
+	CatalogSearchVectorizer   catalog.CatalogSearchQueryVectorizer
+	// CatalogSearchSettings is the process-lifetime startup snapshot shared by
+	// every native/jellycompat provider and the index maintenance worker.
+	CatalogSearchSettings     *catalog.CatalogSearchSettings
+	RatingsRepo               *catalog.RatingsRepo
+	PersonRepo                *catalog.PersonRepository
+	PersonRefreshQueue        handlers.PersonRefreshQueue
+	PersonRefresher           handlers.PersonRefresher
+	RateLimitMW               *ratelimit.Middleware
+	ClientIPResolver          *clientip.Resolver
+	NodeID                    string
+	LogStreamHub              *logstream.Hub
+	RealtimeHub               *notifications.Hub
+	Notifications             *notifications.System // user-facing release notifications (may be nil)
+	PolicySystem              *policy.System        // policy engine lifecycle (may be nil)
+	EventsHub                 *evt.Hub
+	ScanRegistry              *evt.ScanRegistry
+	LibraryScanQueue          *scanqueue.Service
+	ActivityLogWriter         activitylog.Writer
+	ActivityLogRepo           *activitylog.Repo
+	OpsLogRepo                *opslog.Repo
+	FFmpegLogSink             playback.FFmpegLogSink
+	RedisClient               *redis.Client              // for session listing (may be nil)
+	TaskManager               *taskmanager.TaskManager   // task manager (may be nil)
+	ArtifactManager           *downloads.ArtifactManager // download prepare-to-file pipeline (may be nil)
+	AdminJobCancelRegistry    *adminjob.CancelRegistry
+	IntroRepository           *intromarkers.Repository
+	IntroAnalyzer             *intromarkers.Analyzer
+	MarkerRegistry            *markers.Registry
+	MarkerResolver            markers.ExternalIDResolver
+	MarkerProviderConfig      *markers.ProviderConfigStore
+	MarkerContributionStore   *markers.ContributionStore
+	MarkerContributionService *markers.ContributionService
+	WatchProviderService      handlers.WatchProviderService
+	// WatchProviderRegistry is the watchsync registry, used by the admin stats
+	// to list every provider — built-in or plugin-contributed — even when none
+	// of them has any activity yet.
+	WatchProviderRegistry   handlers.WatchProviderLister
+	WatchCompletionObserver watchstate.CompletionObserver
+	PluginService           *plugins.Service
+	PluginHTTPProxy         *plugins.HTTPProxy
+	PluginUserConfig        *plugins.UserConfigStore
+	AuthProviders           []auth.RegisteredProvider
 	// PublicURL is the externally-reachable origin (scheme + host) for this
 	// silo instance. Used to build redirect_uri values handed to OAuth
 	// IdPs. Empty disables the /oauth/{install_id}/{init,callback} routes.
@@ -187,6 +212,13 @@ type Dependencies struct {
 	// that case rather than failing.
 	MDBListClient *mdblist.Client
 
+	// Admin dashboard aggregates, cached like AdminStatsProvider. Each is
+	// optional: without one, the matching route queries Postgres per request.
+	AdminPlaybackActivityProvider handlers.AdminPlaybackActivitySource
+	AdminTopActivityProvider      handlers.AdminTopActivitySource
+	AdminTimeseriesProvider       handlers.AdminTimeseriesSource
+	AdminDownloadsStatsProvider   handlers.AdminDownloadsStatsSource
+
 	// ABSHandler is the Audiobookshelf-compatible HTTP handler. When non-nil
 	// it is mounted at the root router level (not under /api/v1/) so that ABS
 	// clients hitting /login, /api/*, /abs/api/*, and /abs/socket.io/* all
@@ -214,29 +246,29 @@ func (d *Dependencies) CurrentConfig() *config.Config {
 // NewRouter creates a chi.Router with all middleware and routes mounted
 // under /api/v1/. ABS-compat routes (/abs/*, /login, /socket.io/*) are
 // mounted at the root level when deps.ABSHandler is non-nil.
+// invalidateNodeCapabilities drops every cached view of one node's hardware.
+//
+// There is more than one: protocol-v3 planning holds an inventory, and prepared
+// downloads hold their own with its own TTL. A policy edit or a capability hash
+// change invalidates the node itself, not one reader of it, so anything that
+// caches the answer has to be told — otherwise a QSV-to-NVENC edit keeps
+// selecting the node for a tone-map executor it no longer has, and the
+// reconfigured worker rejects the recipe or the download falls back locally for
+// no reason.
+func (deps Dependencies) invalidateNodeCapabilities(playbackHandler *handlers.PlaybackHandler) func(nodeURL string) {
+	return func(nodeURL string) {
+		playbackHandler.RefreshNodeCapabilitiesV3(nodeURL)
+		if deps.NodeCapabilityInvalidator != nil {
+			deps.NodeCapabilityInvalidator(nodeURL)
+		}
+	}
+}
+
 func NewRouter(deps Dependencies) chi.Router {
+	declareNativeMediaRoutes()
 	r := chi.NewRouter()
 
-	// Standard middleware.
-	r.Use(middleware.RequestID)
-
-	// Client IP resolution must run before request logging.
-	if deps.ClientIPResolver != nil {
-		r.Use(clientip.Middleware(deps.ClientIPResolver))
-	}
-
-	r.Use(apimw.RequestLogger(deps.NodeID))
-	r.Use(middleware.Recoverer)
-	r.Use(apimw.Metrics)
-
-	// Compress text-like responses (JSON, SVG, …); media content types are
-	// not in the middleware's allowlist and stream through untouched.
-	r.Use(middleware.Compress(5))
-
-	// Activity logging (before auth — captures all requests including failed auth).
-	if deps.ActivityLogWriter != nil {
-		r.Use(activitylog.NewMiddleware(deps.ActivityLogWriter, deps.NodeID))
-	}
+	useBaseMiddleware(r, deps)
 
 	// Build the readiness handler with optional S3 check.
 	var s3Checker handlers.S3HealthChecker
@@ -421,6 +453,10 @@ func NewRouter(deps Dependencies) chi.Router {
 			profileTokenService,
 		)
 		authHandler = handlers.NewAuthHandler(authService, jwtService, deviceLoginService)
+		authHandler.SetPrimaryProfileChecker(checkPrimaryProfile)
+		if accessGroupStore != nil {
+			authHandler.SetAccessGroupProvider(accessGroupStore)
+		}
 		authMiddleware = apimw.NewAuthMiddleware(jwtService, sessionRepo, apiKeyRepo, userRepo)
 		if deps.UserStoreProvider != nil {
 			if deps.PolicySystem != nil {
@@ -447,6 +483,7 @@ func NewRouter(deps Dependencies) chi.Router {
 					userRepo,
 					metadataLibraries,
 					checkPrimaryProfile,
+					accessGroupStore,
 				).RequireMetadataCurationForItem
 			}
 		}
@@ -499,6 +536,9 @@ func NewRouter(deps Dependencies) chi.Router {
 	var libraryHandler *handlers.LibraryHandler
 	if deps.FolderRepo != nil {
 		libraryHandler = handlers.NewLibraryHandler(deps.FolderRepo, deps.LibraryIngester, userRepo, deps.DB, deps.Refresher, deps.AppContext)
+		if accessGroupStore != nil {
+			libraryHandler.AccessGroups = accessGroupStore
+		}
 		libraryHandler.EventBus = deps.EventBus
 		libraryHandler.EventsHub = deps.EventsHub
 		libraryHandler.ScanRegistry = deps.ScanRegistry
@@ -582,13 +622,22 @@ func NewRouter(deps Dependencies) chi.Router {
 		browseRepo := catalog.NewBrowseRepository(deps.DB)
 		itemRepo = catalog.NewItemRepository(deps.DB)
 		searchIndexEvents := catalog.NewSearchIndexEventRepository(deps.DB)
-		catalogSearchService = catalog.NewCatalogSearchService(
-			context.Background(),
-			settingsRepo,
-			itemRepo,
-			searchIndexEvents,
-			deps.CatalogSearchVectorizer,
-		)
+		if deps.CatalogSearchSettings != nil {
+			catalogSearchService = catalog.NewCatalogSearchServiceFromSettings(
+				*deps.CatalogSearchSettings,
+				itemRepo,
+				searchIndexEvents,
+				deps.CatalogSearchVectorizer,
+			)
+		} else {
+			catalogSearchService = catalog.NewCatalogSearchService(
+				context.Background(),
+				settingsRepo,
+				itemRepo,
+				searchIndexEvents,
+				deps.CatalogSearchVectorizer,
+			)
+		}
 		if catalogSearchService != nil {
 			catalogSearchService.StartCoverageRefresh(deps.AppContext)
 		}
@@ -650,6 +699,9 @@ func NewRouter(deps Dependencies) chi.Router {
 		}
 		itemsHandler.EventsHub = deps.EventsHub
 		itemsHandler.UserRepo = userRepo
+		if accessGroupStore != nil {
+			itemsHandler.AccessGroups = accessGroupStore
+		}
 		if requester, ok := deps.MetadataService.(handlers.MetadataRefreshRequester); ok {
 			itemsHandler.SetMetadataRefreshRequester(requester)
 		}
@@ -704,6 +756,9 @@ func NewRouter(deps Dependencies) chi.Router {
 		)
 		AttachRequestRouter(requestSvc, deps.PluginService)
 		requestSvc.SetGroupPolicyProvider(accessGroupStore)
+		if userRepo != nil {
+			requestSvc.SetUserRepository(userRepo)
+		}
 		requestSvc.SetRequesterIdentityResolver(plugins.RequesterIdentityFromLookup(plugins.NewPgUserIdentityLookup(deps.DB)))
 		if viewerResolver != nil {
 			requestSvc.SetEntitlementResolver(scopeEntitlementResolver{resolver: viewerResolver})
@@ -945,6 +1000,7 @@ func NewRouter(deps Dependencies) chi.Router {
 		} else {
 			playbackHandler = handlers.NewPlaybackHandler(deps.SessionMgr)
 		}
+		playbackHandler.StreamTelemetry = deps.StreamTelemetry
 		if deps.DB != nil {
 			playbackHandler.PlanStoreV3 = planstore.NewPostgres(deps.DB)
 		}
@@ -992,6 +1048,15 @@ func NewRouter(deps Dependencies) chi.Router {
 		if deps.Config != nil && deps.Config.Auth.JWTSecret != "" {
 			playbackHandler.JWTSecret = deps.Config.Auth.JWTSecret
 		}
+		// Hand proxy nodes the recipes they serve header-authenticated sessions
+		// from, so an attempt that negotiated authorized media origins egresses
+		// from the pool instead of this server. Nil-safe: without Redis the
+		// store reports itself disabled and every such attempt stays API-local.
+		playbackHandler.ProxyGrantStore = noderecipe.NewProxyGrantStore(deps.RedisClient, 0)
+		// Hand transcode nodes the recipes they rebuild header-authenticated remote
+		// transcodes from after a restart. Same nil-safety: without Redis such a
+		// session replans instead of recovering, as it did before.
+		playbackHandler.NodeRecipeStore = noderecipe.NewStore(deps.RedisClient, 0)
 		if deps.Config != nil {
 			playbackHandler.PlaybackConfig = func() config.PlaybackConfig {
 				return deps.CurrentConfig().Playback
@@ -1003,6 +1068,10 @@ func NewRouter(deps Dependencies) chi.Router {
 			// from its token/recipe, so the worst case is a wasted rebuild. A shared
 			// active-set source across both managers would remove even that.
 			playback.StartPeriodicOrphanCleanup(deps.AppContext, "api", deps.Config.Playback.TranscodeDir, playbackHandler.CleanupOrphanedTranscodes, playback.OrphanCleanupInterval)
+			cleanupDone := playbackHandler.TranscodeManager().StartShutdownCleanup(deps.AppContext)
+			if deps.RegisterShutdownWork != nil {
+				deps.RegisterShutdownWork(cleanupDone)
+			}
 		}
 		playbackHandler.ProbeEnsurer = deps.ProbeEnsurer
 		playbackHandler.ChapterThumbnailQueuer = deps.ChapterThumbnailQueuer
@@ -1019,6 +1088,11 @@ func NewRouter(deps Dependencies) chi.Router {
 			playbackHandler.SetProfileStaler(recsRepoForStale)
 			playbackHandler.SetProfileRefreshRequester(deps.RecWorker)
 		}
+		playbackHandler.StartCapabilityWarmupV3(deps.AppContext)
+		// The health sweep sees a node's capability hash change long before this
+		// cache would expire, so let it invalidate directly. Wired here rather
+		// than at checker construction because the handler does not exist yet.
+		deps.NodeHealthChecker.SetCapabilitiesChangedCallback(deps.invalidateNodeCapabilities(playbackHandler))
 
 		realtimeHub := deps.PlaybackRealtimeHub
 		if realtimeHub == nil {
@@ -1037,6 +1111,37 @@ func NewRouter(deps Dependencies) chi.Router {
 			playbackHandler.MarkerUpserter = deps.FileRepo
 		}
 		playbackHandler.MarkerUpdateNotifier = playback.NewMarkerUpdateNotifier(deps.SessionMgr, realtimeHub)
+		// Optimistic remux: a play is never blocked on the H.264 copy-safety
+		// scan, so the scan runs behind the issued plan and the notifier moves
+		// any session that is already stream-copying an unsafe source off that
+		// route (or stops it, for a client that cannot be told). Both halves
+		// need the same probe ensurer the playback and detail surfaces use.
+		if copySafetyScanner, ok := deps.ProbeEnsurer.(playback.CopySafetyScanner); ok && deps.FileRepo != nil {
+			copySafetyRace := playback.NewCopySafetyRace(
+				copySafetyScanner,
+				deps.FileRepo,
+				playback.NewCopySafetyNotifier(
+					deps.SessionMgr,
+					playbackHandler.PlanStoreV3,
+					playbackHandler.CommandDispatcher,
+					handlers.NewCopySafetyPlaybackControl(playbackHandler),
+				),
+			)
+			if copySafetyRace != nil {
+				playbackHandler.CopySafetyRacer = copySafetyRace
+				if detailSvc != nil {
+					detailSvc.SetCopySafetyRacer(copySafetyRace)
+				}
+				if streamHandler != nil {
+					// The progressive remux serve path revives stream-copy
+					// transports of its own, and its single long response is
+					// the one thing no later request can gate. It needs the
+					// same racer to refuse a condemned revival and to cover an
+					// undecided one.
+					streamHandler.CopySafetyRacer = copySafetyRace
+				}
+			}
+		}
 		// A resolver lets subtitle realtime events carry the combined ordinal
 		// the new track will hold in the next plan. Without a file repository
 		// the notifier still fires; its events just omit the track block.
@@ -1106,6 +1211,12 @@ func NewRouter(deps Dependencies) chi.Router {
 		adminHandler.EventsHub = deps.EventsHub
 		adminHandler.ImpersonationService = authService
 		adminHandler.StatsSource = deps.AdminStatsProvider
+		adminHandler.WatchProviders = deps.WatchProviderRegistry
+		adminHandler.PlaybackActivitySource = deps.AdminPlaybackActivityProvider
+		adminHandler.TopActivitySource = deps.AdminTopActivityProvider
+		adminHandler.TimeseriesSource = deps.AdminTimeseriesProvider
+		adminHandler.DownloadsStatsSource = deps.AdminDownloadsStatsProvider
+		adminHandler.RedisClient = deps.RedisClient
 		adminHandler.RealtimeHub = deps.RealtimeHub
 		adminHandler.AccessGroups = accessGroupStore
 		adminHandler.BootstrapSensitiveConfigured = deps.BootstrapSensitiveConfigured
@@ -1114,6 +1225,11 @@ func NewRouter(deps Dependencies) chi.Router {
 		adminHandler.RestartStatus = restartStatus
 		adminHandler.CatalogSearchStatus = catalogSearchService
 		adminHandler.DiagnosticsStore = diagnosticsStore
+		// Same source branding asset uploads and the metadata image cacher use:
+		// the public S3 client only exists when a public bucket is configured,
+		// and both features are wired off it.
+		publicAssetStore := deps.S3Public
+		adminHandler.PublicStorageConfigured = func() bool { return publicAssetStore != nil }
 		if settingsRepo != nil {
 			adminHandler.SettingsRepo = settingsRepo
 		}
@@ -1432,6 +1548,9 @@ func NewRouter(deps Dependencies) chi.Router {
 		if userRepo != nil {
 			sectionHandler.UserRepo = userRepo
 		}
+		if accessGroupStore != nil {
+			sectionHandler.AccessGroups = accessGroupStore
+		}
 		if settingsRepo != nil {
 			sectionHandler.Settings = settingsRepo
 			sectionSettingsHandler = &handlers.SectionSettingsHandler{Settings: settingsRepo}
@@ -1481,19 +1600,12 @@ func NewRouter(deps Dependencies) chi.Router {
 				client: tmdb.NewClient(apiKey, 40),
 			}
 		}
-		traktClientID := ""
-		if settingsRepo != nil {
-			ctx := deps.AppContext
-			if ctx == nil {
-				ctx = context.Background()
-			}
-			if value, err := settingsRepo.Get(ctx, "watchsync.trakt.client_id"); err == nil {
-				traktClientID = value
-			}
-		}
 		if libraryCollectionService.TraktCollections == nil {
+			// The client ID is resolved per call rather than captured here, so
+			// saving new Trakt credentials applies without a server restart.
 			libraryCollectionService.TraktCollections = &traktCollectionAdapter{
-				client: metatrakt.NewClient(traktClientID, 5),
+				client:   metatrakt.NewClient("", 5),
+				settings: settingsRepo,
 			}
 		}
 		if libraryCollectionService.TraktTokenResolver == nil && deps.DB != nil && settingsRepo != nil {
@@ -1834,6 +1946,9 @@ func NewRouter(deps Dependencies) chi.Router {
 
 			if invitationService != nil {
 				invitationHandler := handlers.NewInvitationHandler(invitationService)
+				if accessGroupStore != nil {
+					invitationHandler.SetAccessGroupProvider(accessGroupStore)
+				}
 				r.Route("/invitations/{token}", func(r chi.Router) {
 					if deps.RateLimitMW != nil {
 						r.With(deps.RateLimitMW.AuthEndpointHandler("invitation")).Get("/", invitationHandler.HandleLookupInvitation)
@@ -1892,6 +2007,19 @@ func NewRouter(deps Dependencies) chi.Router {
 						r.Get("/me", authHandler.HandleMe)
 						r.Get("/sessions", authHandler.HandleListSessions)
 						r.Delete("/sessions/{id}", authHandler.HandleDeleteSession)
+						r.With(optionalProfileViewerAccess(viewerAccessMiddleware)).
+							Get("/account/capability", authHandler.HandleAccountPasswordCapability)
+						passwordChangeMiddlewares := []func(http.Handler) http.Handler{
+							optionalProfileViewerAccess(viewerAccessMiddleware),
+						}
+						if deps.RateLimitMW != nil {
+							passwordChangeMiddlewares = append(
+								passwordChangeMiddlewares,
+								deps.RateLimitMW.AuthEndpointHandler("password_change"),
+							)
+						}
+						r.With(passwordChangeMiddlewares...).
+							Post("/account/password", authHandler.HandleChangePassword)
 						r.Post("/device/approve", authHandler.HandleDeviceApprove)
 						r.Post("/device/deny", authHandler.HandleDeviceDeny)
 					})
@@ -1952,6 +2080,7 @@ func NewRouter(deps Dependencies) chi.Router {
 				r.Route("/api-keys", func(r chi.Router) {
 					r.Post("/", apiKeyHandler.HandleCreateAPIKey)
 					r.Get("/", apiKeyHandler.HandleListAPIKeys)
+					r.Get("/scopes", apiKeyHandler.HandleListAPIKeyScopes)
 					r.Delete("/{id}", apiKeyHandler.HandleDeleteAPIKey)
 				})
 			})
@@ -2013,6 +2142,49 @@ func NewRouter(deps Dependencies) chi.Router {
 			})
 		}
 
+		// Apple notification display metadata: authenticated by either the
+		// normal access token or the long-lived display token minted at Apple
+		// push registration. Sits outside the RequireAuth group because the
+		// display token is not an access token; RequireApplePushDisplayAuth
+		// still validates the session and binds the profile from the claims.
+		if authMiddleware != nil && deps.Notifications != nil {
+			// The route only left the authenticated group to accept the
+			// display token. Both credential paths share the same
+			// post-auth chain: the limiter (per-API-key budgets need
+			// claims), then viewer access so a deleted or foreign profile
+			// is rejected and rejected resolutions still consume budget.
+			// The limiter also runs once before auth: a display token lives
+			// as long as a refresh token, so its session lookup must not be
+			// reachable outside the global and per-IP budgets.
+			var limiter func(http.Handler) http.Handler
+			if deps.RateLimitMW != nil {
+				limiter = deps.RateLimitMW.Handler
+			}
+			postAuth := func(next http.Handler) http.Handler {
+				chain := apimw.RequireProfile(next)
+				if viewerAccessMiddleware != nil {
+					chain = viewerAccessMiddleware.RequireViewerAccess(chain)
+				}
+				if limiter != nil {
+					chain = limiter(chain)
+				}
+				return chain
+			}
+			standardDisplayAuth := func(next http.Handler) http.Handler {
+				return authMiddleware.RequireAuth(postAuth(next))
+			}
+			displayMiddlewares := []func(http.Handler) http.Handler{}
+			if limiter != nil {
+				displayMiddlewares = append(displayMiddlewares, limiter)
+			}
+			displayMiddlewares = append(displayMiddlewares,
+				authMiddleware.RequireApplePushDisplayAuth(standardDisplayAuth, postAuth))
+			r.With(displayMiddlewares...).Get(
+				"/notifications/push/apple/display/{delivery_id}",
+				handlers.NewNotificationsHandler(deps.Notifications, deps.EventsHub).HandleApplePushDisplay,
+			)
+		}
+
 		// All remaining routes require auth.
 		if authMiddleware != nil {
 			r.Group(func(r chi.Router) {
@@ -2046,6 +2218,10 @@ func NewRouter(deps Dependencies) chi.Router {
 					r.Get("/events/capability", eventsHandler.HandleCapability)
 				}
 
+				// Artwork size selection. Static: the answer depends only on
+				// the server's variant ladder, not on the caller.
+				r.Get("/images/capability", handlers.HandleImagesCapability)
+
 				// User notifications: profile-scoped inbox, preferences, and
 				// the websocket handshake ticket.
 				if deps.Notifications != nil {
@@ -2053,6 +2229,7 @@ func NewRouter(deps Dependencies) chi.Router {
 						deps.Notifications.SetImageResolver(detailSvc)
 					}
 					notificationsHandler := handlers.NewNotificationsHandler(deps.Notifications, deps.EventsHub)
+					notificationsHandler.SetApplePushDisplayTokenIssuer(jwtService)
 					r.With(apimw.RequireProfile).Post("/events/ws-ticket", notificationsHandler.HandleMintWSTicket)
 					r.With(apimw.RequireProfile).Post("/devices/push/apple", notificationsHandler.HandleRegisterApplePushDevice)
 					// Discord DM channel: the linked identity and mode hang off
@@ -2073,7 +2250,6 @@ func NewRouter(deps Dependencies) chi.Router {
 						r.Get("/capability", notificationsHandler.HandleCapability)
 						r.Get("/preferences", notificationsHandler.HandleGetPreferences)
 						r.Put("/preferences", notificationsHandler.HandleUpdatePreferences)
-						r.Get("/push/apple/display/{delivery_id}", notificationsHandler.HandleApplePushDisplay)
 						// Platform-generic registration used by the Android
 						// client; Apple keeps its dedicated route above.
 						r.Post("/push/devices", notificationsHandler.HandleRegisterPushDevice)
@@ -2516,8 +2692,8 @@ func NewRouter(deps Dependencies) chi.Router {
 					r.Route("/ebooks", func(r chi.Router) {
 						r.Use(apimw.RequireProfile)
 						r.Get("/capability", ebookReaderHandler.HandleConversionCapability)
-						r.Get("/{content_id}/files/{file_id}/read", ebookReaderHandler.HandleReadFile)
-						r.Head("/{content_id}/files/{file_id}/read", ebookReaderHandler.HandleReadFile)
+						r.Get("/{content_id}/files/{file_id}/read", observeNative(deps.StreamTelemetry, http.MethodGet, "/api/v1/ebooks/{content_id}/files/{file_id}/read", ebookReaderHandler.HandleReadFile))
+						r.Head("/{content_id}/files/{file_id}/read", observeNative(deps.StreamTelemetry, http.MethodHead, "/api/v1/ebooks/{content_id}/files/{file_id}/read", ebookReaderHandler.HandleReadFile))
 						r.Get("/{content_id}/progress", ebookReaderHandler.HandleGetProgress)
 						r.Put("/{content_id}/progress", ebookReaderHandler.HandleSaveProgress)
 						r.Get("/{content_id}/reader-config", ebookReaderHandler.HandleGetConfig)
@@ -2634,11 +2810,11 @@ func NewRouter(deps Dependencies) chi.Router {
 
 					r.Route("/playback", func(r chi.Router) {
 						r.Get("/capability", playbackHandler.HandlePlaybackCapabilityV3)
-						// HLS transcode delivery — no profile auth needed;
-						// session ID (UUID) serves as the access token, same
-						// pattern as /stream/{session_id}.
-						r.Get("/transcode/{session_id}/master.m3u8", playbackHandler.HandleGetTranscodeManifest)
-						r.Get("/transcode/{session_id}/segment/{name}", playbackHandler.HandleGetTranscodeSegment)
+						// HLS transcode delivery. Legacy sessions treat the UUID
+						// as a bearer capability; negotiated V3 sessions require
+						// the authenticated owner inside the handler.
+						r.Get("/transcode/{session_id}/master.m3u8", observeNative(deps.StreamTelemetry, http.MethodGet, "/api/v1/playback/transcode/{session_id}/master.m3u8", playbackHandler.HandleGetTranscodeManifest))
+						r.Get("/transcode/{session_id}/segment/{name}", observeNative(deps.StreamTelemetry, http.MethodGet, "/api/v1/playback/transcode/{session_id}/segment/{name}", playbackHandler.HandleGetTranscodeSegment))
 
 						// Playback realtime control socket — needs auth but not profile.
 						r.Get("/sessions/{session_id}/control/ws", playbackHandler.HandleSessionWebSocket)
@@ -2678,11 +2854,11 @@ func NewRouter(deps Dependencies) chi.Router {
 
 				// Stream routes.
 				if streamHandler != nil {
-					r.Get("/stream/{session_id}", streamHandler.HandleStream)
-					r.Head("/stream/{session_id}", streamHandler.HandleStream)
-					r.Get("/stream/{session_id}/subtitles/{track}", streamHandler.HandleSubtitle)
-					r.Head("/stream/{session_id}/subtitles/{track}", streamHandler.HandleSubtitle)
-					r.Get("/stream/{session_id}/subtitles/{track}/fonts", streamHandler.HandleSubtitleFonts)
+					r.Get("/stream/{session_id}", observeNative(deps.StreamTelemetry, http.MethodGet, "/api/v1/stream/{session_id}", streamHandler.HandleStream))
+					r.Head("/stream/{session_id}", observeNative(deps.StreamTelemetry, http.MethodHead, "/api/v1/stream/{session_id}", streamHandler.HandleStream))
+					r.Get("/stream/{session_id}/subtitles/{track}", observeNative(deps.StreamTelemetry, http.MethodGet, "/api/v1/stream/{session_id}/subtitles/{track}", streamHandler.HandleSubtitle))
+					r.Head("/stream/{session_id}/subtitles/{track}", observeNative(deps.StreamTelemetry, http.MethodHead, "/api/v1/stream/{session_id}/subtitles/{track}", streamHandler.HandleSubtitle))
+					r.Get("/stream/{session_id}/subtitles/{track}/fonts", observeNative(deps.StreamTelemetry, http.MethodGet, "/api/v1/stream/{session_id}/subtitles/{track}/fonts", streamHandler.HandleSubtitleFonts))
 				}
 
 				// Download routes.
@@ -2706,18 +2882,18 @@ func NewRouter(deps Dependencies) chi.Router {
 					// GET+HEAD: background download stacks probe with HEAD
 					// before issuing ranged GETs; http.ServeContent handles
 					// HEAD natively.
-					r.Get("/{id}/file", downloadHandler.HandleDownloadFile)
-					r.Head("/{id}/file", downloadHandler.HandleDownloadFile)
-					r.Get("/{id}/file-proxy", downloadHandler.HandleDownloadFileViaProxy)
-					r.Head("/{id}/file-proxy", downloadHandler.HandleDownloadFileViaProxy)
+					r.Get("/{id}/file", observeNative(deps.StreamTelemetry, http.MethodGet, "/api/v1/downloads/{id}/file", downloadHandler.HandleDownloadFile))
+					r.Head("/{id}/file", observeNative(deps.StreamTelemetry, http.MethodHead, "/api/v1/downloads/{id}/file", downloadHandler.HandleDownloadFile))
+					r.Get("/{id}/file-proxy", observeNative(deps.StreamTelemetry, http.MethodGet, "/api/v1/downloads/{id}/file-proxy", downloadHandler.HandleDownloadFileViaProxy))
+					r.Head("/{id}/file-proxy", observeNative(deps.StreamTelemetry, http.MethodHead, "/api/v1/downloads/{id}/file-proxy", downloadHandler.HandleDownloadFileViaProxy))
 					r.Get("/{id}/manifest", downloadHandler.HandleManifest)
 					r.Get("/{id}/artwork/{kind}", downloadHandler.HandleArtwork)
-					r.Get("/{id}/subtitles/{ref}", downloadHandler.HandleSubtitle)
+					r.Get("/{id}/subtitles/{ref}", observeNative(deps.StreamTelemetry, http.MethodGet, "/api/v1/downloads/{id}/subtitles/{ref}", downloadHandler.HandleSubtitle))
 				})
-				r.Get("/direct-download", downloadHandler.HandleDirectDownload)
-				r.Head("/direct-download", downloadHandler.HandleDirectDownload)
-				r.Get("/direct-download-proxy", downloadHandler.HandleDirectDownloadViaProxy)
-				r.Head("/direct-download-proxy", downloadHandler.HandleDirectDownloadViaProxy)
+				r.Get("/direct-download", observeNative(deps.StreamTelemetry, http.MethodGet, "/api/v1/direct-download", downloadHandler.HandleDirectDownload))
+				r.Head("/direct-download", observeNative(deps.StreamTelemetry, http.MethodHead, "/api/v1/direct-download", downloadHandler.HandleDirectDownload))
+				r.Get("/direct-download-proxy", observeNative(deps.StreamTelemetry, http.MethodGet, "/api/v1/direct-download-proxy", downloadHandler.HandleDirectDownloadViaProxy))
+				r.Head("/direct-download-proxy", observeNative(deps.StreamTelemetry, http.MethodHead, "/api/v1/direct-download-proxy", downloadHandler.HandleDirectDownloadViaProxy))
 
 				// Recipe gallery catalog (no profile required — purely static metadata).
 				recipeHandler := &handlers.RecipeHandler{}
@@ -2836,11 +3012,43 @@ func NewRouter(deps Dependencies) chi.Router {
 							}
 
 							r.Get("/sessions", adminHandler.HandleListSessions)
+							// P0d parity projection: the merged telemetry view beside
+							// both legacy live-session projections and their diff. It
+							// compares only — the repoint is the separate retirement
+							// change, which this endpoint exists to give evidence for.
+							r.Get("/stream-telemetry/parity", (&handlers.StreamTelemetryParityHandler{
+								Registry:  deps.StreamTelemetry,
+								ViewCache: deps.StreamTelemetryViewCache,
+								Pool:      deps.DB,
+								Redis:     deps.RedisClient,
+							}).HandleGetStreamTelemetryParity)
 							r.Get("/sessions/capabilities", adminHandler.HandleGetSessionsCapabilities)
+							r.Get("/playback-routing/capabilities", adminHandler.HandleGetPlaybackRoutingCapabilities)
 							r.Get("/playback-history", adminHandler.HandleListPlaybackHistory)
 							r.Get("/unmatched", adminHandler.HandleListUnmatched)
 							r.Get("/stats", adminHandler.HandleGetStats)
+							// Dashboard aggregates. Both are cached reads over the
+							// same catalog/playback tables /stats uses, split out
+							// because their windows and refresh rates differ.
+							r.Get("/stats/playback-activity", adminHandler.HandleGetPlaybackActivity)
+							r.Get("/stats/top-activity", adminHandler.HandleGetTopActivity)
+							// Offline-download aggregate for the dashboard's
+							// downloads widget. Reads the downloads table, which
+							// exists whether or not the feature is enabled, so a
+							// download-less deployment answers zeros.
+							r.Get("/stats/downloads", adminHandler.HandleGetDownloadsStats)
+							// Minute-resolution samples written by the dashboard
+							// metrics sampler (internal/dashmetrics); the only
+							// history for concurrent streams and egress.
+							r.Get("/stats/timeseries", adminHandler.HandleGetTimeseries)
 							r.Get("/server/status", adminHandler.HandleGetServerStatus)
+							// Per-admin-account dashboard arrangement. The server
+							// stores it as an opaque JSON object; the web client
+							// owns widget-id and span validation.
+							r.Get("/dashboard/capabilities", adminHandler.HandleGetDashboardCapabilities)
+							r.Get("/dashboard/layout", adminHandler.HandleGetDashboardLayout)
+							r.Put("/dashboard/layout", adminHandler.HandlePutDashboardLayout)
+							r.Delete("/dashboard/layout", adminHandler.HandleDeleteDashboardLayout)
 							r.Get("/catalog/search/status", adminHandler.HandleGetCatalogSearchStatus)
 							if policyHandler != nil {
 								r.Route("/policy", func(r chi.Router) {
@@ -2874,6 +3082,7 @@ func NewRouter(deps Dependencies) chi.Router {
 							r.Post("/jellyfin-compat/web/update", adminHandler.HandleUpdateJellyfinCompatWeb)
 							r.Post("/jellyfin-compat/web/remove", adminHandler.HandleRemoveJellyfinCompatWeb)
 							r.Get("/settings/sensitive-status", adminHandler.HandleGetSensitiveStatus)
+							r.Get("/settings/restart-keys", adminHandler.HandleGetRestartKeys)
 							r.Post("/settings/check/{kind}", adminHandler.HandleCheckSettingsConnection)
 							if sectionSettingsHandler != nil {
 								r.Get("/settings/sections", sectionSettingsHandler.HandleGet)
@@ -3089,6 +3298,23 @@ func NewRouter(deps Dependencies) chi.Router {
 									jwtSecret = deps.Config.Auth.JWTSecret
 								}
 								nodeHandler := handlers.NewNodeHandler(deps.NodeRepo, deps.ProxyPool, deps.TranscodePool, deps.NodeRepo, deps.EventBus, deps.RedisClient, jwtSecret)
+								// A re-probe stores the node's new inventory through the
+								// sweep's own refresh, so the drift and persist rules have
+								// one implementation. Without a health checker the node
+								// still re-probes and the row catches up on a later sweep.
+								if deps.NodeHealthChecker != nil {
+									nodeHandler.SetCapabilityRefresher(deps.NodeHealthChecker)
+								}
+								// An acceleration override change makes this
+								// server's cached view of the node wrong the
+								// moment it lands; the same invalidation the
+								// health sweep uses drops it.
+								nodeHandler.SetCapabilityInvalidator(deps.invalidateNodeCapabilities(playbackHandler))
+								// A node with no override of its own runs the
+								// cluster's acceleration policy, and how many
+								// devices that names is what decides how long its
+								// re-probe may take.
+								nodeHandler.SetClusterPlaybackPolicy(playbackHandler.PlaybackConfig)
 								r.Route("/nodes", func(r chi.Router) {
 									r.Get("/", nodeHandler.HandleListNodes)
 									r.Post("/", nodeHandler.HandleCreateNode)
@@ -3097,6 +3323,7 @@ func NewRouter(deps Dependencies) chi.Router {
 									r.Post("/{id}/check", nodeHandler.HandleCheckNode)
 									r.Post("/force-reload", nodeHandler.HandleForceReloadNodes)
 									r.Post("/{id}/force-reload", nodeHandler.HandleForceReloadNode)
+									r.Post("/{id}/reprobe", nodeHandler.HandleReprobeNode)
 								})
 								// Live node sessions (reads from Redis)
 								// Note: /admin/sessions is already used for playback sessions from PostgreSQL.
@@ -3106,15 +3333,29 @@ func NewRouter(deps Dependencies) chi.Router {
 							// System inspection.
 							{
 								sysJWTSecret := ""
-								sysFFmpegPath := ""
 								if deps.Config != nil {
 									sysJWTSecret = deps.Config.Auth.JWTSecret
-									sysFFmpegPath = deps.Config.Playback.FFmpegPath
 								}
-								systemHandler := handlers.NewSystemHandler(deps.TranscodePool, sysJWTSecret, sysFFmpegPath)
+								// Read per request, not captured: playback
+								// settings hot reload, and a probe against the
+								// values this process started with would show an
+								// operator a result for the configuration they
+								// just replaced.
+								systemHandler := handlers.NewSystemHandler(deps.TranscodePool, sysJWTSecret,
+									func() (string, string, string) {
+										cfg := deps.CurrentConfig()
+										if cfg == nil {
+											return "", "", ""
+										}
+										return cfg.Playback.FFmpegPath, cfg.Playback.HWAccel, cfg.Playback.HWDevice
+									})
+								if deps.ResourceSampler != nil {
+									systemHandler.SetResourceSampler(deps.ResourceSampler)
+								}
 								r.Route("/system", func(r chi.Router) {
 									r.Get("/build", systemHandler.HandleBuildInfo)
 									r.Get("/hw-accel", systemHandler.HandleHWAccel)
+									r.Get("/resources", systemHandler.HandleSystemResources)
 								})
 							}
 
@@ -3277,6 +3518,58 @@ func NewRouter(deps Dependencies) chi.Router {
 	return r
 }
 
+// useBaseMiddleware mounts the middleware chain every native request passes
+// through, in order. It is factored out of NewRouter so a test can drive the
+// real chain over a real socket: re-declaring the stack in a test would let the
+// two drift, and a drifted copy is exactly how a broken writer chain passes its
+// own tests (see the §4.4 conformance requirement in the stream-telemetry design).
+func useBaseMiddleware(r chi.Router, deps Dependencies) {
+	// Standard middleware.
+	r.Use(middleware.RequestID)
+
+	// Client IP resolution must run before request logging.
+	if deps.ClientIPResolver != nil {
+		r.Use(clientip.Middleware(deps.ClientIPResolver))
+	}
+
+	r.Use(apimw.RequestLogger(deps.NodeID))
+	r.Use(middleware.Recoverer)
+	r.Use(apimw.Metrics)
+
+	// Compress text-like responses (JSON, SVG, …), while leaving exact bulk
+	// media routes unwrapped so their io.ReaderFrom/sendfile path survives.
+	r.Use(httpstream.CompressExcept(5, skipNativeMediaCompression))
+
+	// Activity logging (before auth — captures all requests including failed auth).
+	if deps.ActivityLogWriter != nil {
+		r.Use(activitylog.NewMiddleware(deps.ActivityLogWriter, deps.NodeID))
+	}
+}
+
+func skipNativeMediaCompression(r *http.Request) bool {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		return false
+	}
+	p := strings.Split(strings.TrimPrefix(r.URL.Path, "/"), "/")
+	if len(p) < 3 || p[0] != "api" || p[1] != "v1" {
+		return false
+	}
+	switch {
+	case len(p) == 4 && p[2] == "stream" && p[3] != "":
+		return true
+	case len(p) == 7 && p[2] == "playback" && p[3] == "transcode" && p[4] != "" && p[5] == "segment" && p[6] != "":
+		return true
+	case len(p) == 5 && p[2] == "downloads" && p[3] != "" && (p[4] == "file" || p[4] == "file-proxy"):
+		return true
+	case len(p) == 3 && (p[2] == "direct-download" || p[2] == "direct-download-proxy"):
+		return true
+	case len(p) == 7 && p[2] == "ebooks" && p[3] != "" && p[4] == "files" && p[5] != "" && p[6] == "read":
+		return true
+	default:
+		return false
+	}
+}
+
 // optionalProfileViewerAccess preserves the established profile-less plugin
 // launch path while validating any profile a newer caller asks the launch
 // cookie to carry. A missing viewer resolver must not remove this existing v1
@@ -3393,6 +3686,11 @@ func resolveOptionalPluginAccessUser(
 		}
 		apiKey, err := apiKeyRepo.GetByKey(r.Context(), token)
 		if err != nil {
+			return false, false, 0, ""
+		}
+		// Scoped keys are allowlist credentials for the routes their scopes
+		// name; plugin access is not on any scope's allowlist.
+		if len(apiKey.Scopes) > 0 {
 			return false, false, 0, ""
 		}
 		user, err := userRepo.GetByID(r.Context(), apiKey.UserID)
@@ -3529,11 +3827,33 @@ func (a *tmdbDiscoverAdapter) Discover(ctx context.Context, mediaType string, pa
 	return entries, nil
 }
 
+// traktClientIDSettingKey holds the Trakt app client ID. It is deliberately
+// not in config.restartRequiredKeys: the adapter re-reads it before every
+// upstream call, so a saved change converges without a restart.
+const traktClientIDSettingKey = "watchsync.trakt.client_id"
+
 type traktCollectionAdapter struct {
 	client *metatrakt.Client
+	// settings is the live source of the app client ID. Nil only where no
+	// settings store exists (tests), where the client ID stays empty and the
+	// upstream call fails the same way it always did.
+	settings catalog.SettingsStore
+}
+
+// refreshClientID pushes the currently saved app client ID onto the shared
+// client. A read failure leaves the last known value in place: failing the
+// request at Trakt is more useful than failing it here on a transient DB blip.
+func (a *traktCollectionAdapter) refreshClientID(ctx context.Context) {
+	if a.settings == nil {
+		return
+	}
+	if clientID, err := a.settings.Get(ctx, traktClientIDSettingKey); err == nil {
+		a.client.SetClientID(clientID)
+	}
 }
 
 func (a *traktCollectionAdapter) GetCollectionPreset(ctx context.Context, preset, mediaType string, limit int, accessToken string) ([]catalog.TraktCollectionEntry, error) {
+	a.refreshClientID(ctx)
 	results, err := a.client.GetCollectionPreset(ctx, preset, mediaType, limit, accessToken)
 	if err != nil {
 		return nil, err
@@ -3555,6 +3875,7 @@ func (a *traktCollectionAdapter) GetCollectionPreset(ctx context.Context, preset
 }
 
 func (a *traktCollectionAdapter) GetUserList(ctx context.Context, user, list string, limit int, accessToken string) ([]catalog.TraktCollectionEntry, error) {
+	a.refreshClientID(ctx)
 	results, err := a.client.GetUserList(ctx, user, list, limit, accessToken)
 	if err != nil {
 		return nil, err

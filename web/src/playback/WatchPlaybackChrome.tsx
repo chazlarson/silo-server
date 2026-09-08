@@ -1,4 +1,6 @@
 import {
+  lazy,
+  Suspense,
   useCallback,
   useContext,
   useEffect,
@@ -11,15 +13,25 @@ import {
 import { flushSync } from "react-dom";
 import { useQueryClient } from "@tanstack/react-query";
 import { Pause, PictureInPicture2, Play, SkipBack, SkipForward, Tv, X } from "lucide-react";
-import { useLocation, useNavigate } from "react-router";
+import { useLocation } from "react-router";
 import type { WatchDetail } from "@/api/types";
-import { getAccessToken, getOrCreateDeviceId, getProfileToken } from "@/api/client";
+import {
+  getAccessToken,
+  getAuthContextVersion,
+  getOrCreateDeviceId,
+  getProfileToken,
+  refreshAuthentication,
+} from "@/api/client";
 import { Button } from "@/components/ui/button";
 import { Slider } from "@/components/ui/slider";
 import { useDocumentTitle } from "@/hooks/useDocumentTitle";
 import { fetchCatalogItemDetail } from "@/hooks/queries/catalogRead";
 import { useContinueWatching } from "@/hooks/queries/progress";
-import { useEffectiveSettings } from "@/hooks/queries/settingValues";
+import {
+  settingsCapabilitiesSupportKey,
+  useEffectiveSettings,
+  useSettingsCapabilities,
+} from "@/hooks/queries/settingValues";
 import { SETTING_KEYS, type SettingKey } from "@/lib/settingsContract";
 import { useWatchDetail } from "@/hooks/queries/items";
 import { catalogKeys } from "@/hooks/queries/keys";
@@ -27,13 +39,14 @@ import { applyPlaybackProgressToCache } from "@/hooks/queries/playbackProgressCa
 import { invalidatePlaybackSurfaceQueries } from "@/hooks/queries/playbackSurfaceRefresh";
 import { useAuth } from "@/hooks/useAuth";
 import { useCurrentProfile } from "@/hooks/useCurrentProfile";
-import { PlayerConfigProvider, WatchPage } from "@/player";
+import { useViewTransitionNavigate } from "@/hooks/useViewTransition";
+import { PlayerConfigProvider, type PlayerConfig } from "@/player/context/PlayerConfigContext";
 import type {
   EpisodeRef,
+  IntroSkipMode,
   PlaybackExitState,
-  PlayerConfig,
   PlayerPictureInPictureChange,
-} from "@/player";
+} from "@/player/types";
 import { useSeriesEpisodes } from "@/player/hooks/useSeriesEpisodes";
 import { PlayingNextScreen } from "@/player/components/PlayingNextScreen";
 import { formatTime } from "@/player/components/SeekBar";
@@ -51,6 +64,10 @@ import {
   type WatchRouteRequest,
 } from "@/pages/watchRouteHelpers";
 import { canEditMarkers as canEditMarkersForUser } from "@/lib/permissions";
+
+const WatchPage = lazy(() =>
+  import("@/player/components/WatchPage").then((module) => ({ default: module.WatchPage })),
+);
 
 function normalizeWatchPlaybackRequest(
   input: WatchPlaybackStartInput | WatchRouteRequest,
@@ -139,8 +156,28 @@ function buildWatchLocationState(request: WatchRouteRequest) {
   };
 }
 
+function PlaybackPreparingScreen() {
+  return (
+    <div
+      className="bg-background fixed inset-0 z-50 flex items-center justify-center px-6"
+      role="status"
+      aria-live="polite"
+    >
+      <div className="surface-panel-subtle animate-in fade-in flex min-w-[260px] flex-col items-center gap-4 rounded-[1.8rem] px-8 py-7 text-center duration-300">
+        <div className="h-8 w-8 animate-spin rounded-full border-2 border-white/20 border-t-white" />
+        <div className="space-y-1">
+          <p className="text-sm font-medium text-white">Preparing playback</p>
+          <p className="text-xs text-white/55">
+            Loading stream details, subtitles, and resume state.
+          </p>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export function WatchPlaybackProvider({ children }: { children: ReactNode }) {
-  const navigate = useNavigate();
+  const navigate = useViewTransitionNavigate();
   const [state, dispatch] = useReducer(watchPlaybackReducer, undefined, createEmptyPlaybackState);
   const stateRef = useRef(state);
   const suppressNextPictureInPictureExitRef = useRef<string | null>(null);
@@ -203,7 +240,6 @@ export function WatchPlaybackProvider({ children }: { children: ReactNode }) {
 
         navigate(buildWatchHref(request), {
           state: buildWatchLocationState(request),
-          viewTransition: true,
         });
       };
 
@@ -279,7 +315,6 @@ export function WatchPlaybackProvider({ children }: { children: ReactNode }) {
     navigate(buildWatchHref(request), {
       replace: true,
       state: buildWatchLocationState(request),
-      viewTransition: true,
     });
   }, [navigate]);
 
@@ -385,10 +420,21 @@ export function WatchPlaybackHost() {
   } = controller;
   const queryClient = useQueryClient();
   const location = useLocation();
-  const navigate = useNavigate();
+  const navigate = useViewTransitionNavigate();
   const { user } = useAuth();
   const { profile: currentProfile } = useCurrentProfile();
   const canEditMarkers = canEditMarkersForUser(user, currentProfile);
+  const settingsCapabilities = useSettingsCapabilities();
+  // Three answers, not two: the connected server defines the enum, it provably
+  // does not, or nobody knows yet. settingsCapabilitiesSupportKey collapses the
+  // last two into false, so the query's own state is what separates them.
+  const capabilitiesKnown = settingsCapabilities.isSuccess;
+  const supportsIntroSkipMode =
+    capabilitiesKnown &&
+    settingsCapabilitiesSupportKey(
+      settingsCapabilities.data,
+      SETTING_KEYS.PLAYBACK_INTRO_SKIP_MODE,
+    );
   // Resolved through the contract, so a device override winning over the
   // profile's own choice is the manifest's resolution order rather than a
   // precedence rule spelled out here.
@@ -400,7 +446,9 @@ export function WatchPlaybackHost() {
   // key did and makes all three behave as the contract says they do.
   const { data: effectivePlaybackSettings } = useEffectiveSettings({
     keys: [
-      SETTING_KEYS.PLAYBACK_AUTO_SKIP_INTRO,
+      supportsIntroSkipMode
+        ? SETTING_KEYS.PLAYBACK_INTRO_SKIP_MODE
+        : SETTING_KEYS.PLAYBACK_AUTO_SKIP_INTRO,
       SETTING_KEYS.PLAYBACK_AUTO_SKIP_RECAP,
       SETTING_KEYS.PLAYBACK_AUTO_PLAY_NEXT_PREVIEW,
       // The resolution cap, which the quality picker writes canonically and
@@ -453,6 +501,8 @@ export function WatchPlaybackHost() {
       getProfileId: () => storage.get(storage.KEYS.PROFILE_ID),
       getProfileToken: () => getProfileToken(),
       getDeviceId: () => getOrCreateDeviceId(),
+      refreshToken: refreshAuthentication,
+      getAuthContext: getAuthContextVersion,
     }),
     [],
   );
@@ -483,7 +533,7 @@ export function WatchPlaybackHost() {
     const prefetchAndNavigate = async () => {
       if (request.returnHref) {
         clearPendingReturnNavigation(request.requestKey);
-        navigate(returnHref, { replace: true });
+        navigate(returnHref, { up: true, replace: true });
         return;
       }
 
@@ -498,7 +548,7 @@ export function WatchPlaybackHost() {
 
       if (!cancelled) {
         clearPendingReturnNavigation(request.requestKey);
-        navigate(fallbackItemHref, { replace: true });
+        navigate(fallbackItemHref, { up: true, replace: true });
       }
     };
 
@@ -563,9 +613,11 @@ export function WatchPlaybackHost() {
       if (activeRequest) {
         if (exitState?.destinationHref) {
           exitPlayback({ destinationHref: exitState.destinationHref });
+          // Leaving playback is backward motion, but `replace` still stands:
+          // the watch entry must not survive for Forward to walk back into.
           navigate(exitState.destinationHref, {
+            up: true,
             replace: true,
-            viewTransition: true,
           });
           return;
         }
@@ -573,8 +625,8 @@ export function WatchPlaybackHost() {
         if (activeRequest.roomId && activeRequest.roomToken) {
           exitPlayback();
           navigate(`/rooms/${activeRequest.roomId}?room_token=${activeRequest.roomToken}`, {
+            up: true,
             replace: true,
-            viewTransition: true,
             state: {
               suppressAutoStartSelection: {
                 contentId: activeRequest.contentId,
@@ -588,8 +640,8 @@ export function WatchPlaybackHost() {
 
         exitPlayback();
         navigate(buildPlaybackReturnHref(activeRequest), {
+          up: true,
           replace: true,
-          viewTransition: true,
         });
         return;
       }
@@ -613,8 +665,8 @@ export function WatchPlaybackHost() {
         minimizePlayback();
       });
       navigate(returnHref, {
+        up: true,
         replace: true,
-        viewTransition: true,
       });
     },
     [activeRequest, applyExitStateToCache, minimizePlayback, navigate, state.mode],
@@ -626,7 +678,6 @@ export function WatchPlaybackHost() {
       if (activeRequest.roomId && activeRequest.roomToken) {
         navigate(`/rooms/${activeRequest.roomId}?room_token=${activeRequest.roomToken}`, {
           replace: true,
-          viewTransition: true,
         });
         return;
       }
@@ -696,8 +747,8 @@ export function WatchPlaybackHost() {
       if (activeRequest?.roomId && activeRequest.roomToken) {
         stopPlayback();
         navigate(`/rooms/${activeRequest.roomId}?room_token=${activeRequest.roomToken}`, {
+          up: true,
           replace: true,
-          viewTransition: true,
         });
         return;
       }
@@ -731,7 +782,7 @@ export function WatchPlaybackHost() {
       if (!activeItem?.series_id) {
         if (activeRequest) {
           stopPlayback();
-          navigate(buildWatchItemHref(activeRequest));
+          navigate(buildWatchItemHref(activeRequest), { up: true });
         }
         return;
       }
@@ -756,7 +807,7 @@ export function WatchPlaybackHost() {
   const handlePostRollClose = useCallback(() => {
     if (activeRequest) {
       stopPlayback();
-      navigate(buildWatchItemHref(activeRequest));
+      navigate(buildWatchItemHref(activeRequest), { up: true });
     }
   }, [activeRequest, stopPlayback, navigate]);
 
@@ -815,19 +866,7 @@ export function WatchPlaybackHost() {
       return null;
     }
 
-    return (
-      <div className="bg-background fixed inset-0 z-50 flex items-center justify-center px-6">
-        <div className="surface-panel-subtle animate-in fade-in flex min-w-[260px] flex-col items-center gap-4 rounded-[1.8rem] px-8 py-7 text-center duration-300">
-          <div className="h-8 w-8 animate-spin rounded-full border-2 border-white/20 border-t-white" />
-          <div className="space-y-1">
-            <p className="text-sm font-medium text-white">Preparing playback</p>
-            <p className="text-xs text-white/55">
-              Loading stream details, subtitles, and resume state.
-            </p>
-          </div>
-        </div>
-      </div>
-    );
+    return <PlaybackPreparingScreen />;
   }
 
   if (error && isForeground) {
@@ -861,25 +900,45 @@ export function WatchPlaybackHost() {
     item: activeItem,
     currentProfile,
     seriesEpisodes,
-    // "original" means no cap, which every consumer already spells "auto".
+    // Passed through verbatim: "original" and "auto" are distinct wire values
+    // (the planner preserves the source for "original", adapts for "auto").
     // Undefined until the read resolves, which leaves the profile-column
     // fallback in place rather than blocking playback on a settings fetch.
-    qualityPreference:
-      canonicalQuality === undefined
-        ? undefined
-        : canonicalQuality === "original"
-          ? "auto"
-          : canonicalQuality,
+    qualityPreference: canonicalQuality,
   });
   // The resolved answer already folds in the profile layer, so the props built
   // from the profile record are only the pre-resolution fallback.
   const resolvedBool = (key: SettingKey, fallback: boolean | undefined) =>
     (effectivePlaybackSettings?.[key]?.value as boolean | undefined) ?? fallback ?? false;
 
-  const autoSkipIntro = resolvedBool(
-    SETTING_KEYS.PLAYBACK_AUTO_SKIP_INTRO,
-    watchPageProps.autoSkipIntro,
-  );
+  // null means "the connected server's answer is not in yet", which the player
+  // treats as "do not prompt and do not skip".
+  //
+  // Deferring is the deliberate choice over guessing. The profile DTO cannot
+  // express `never`: the server mirrors it as auto_skip_intro=false, which
+  // reads back as `ask`. Prompting on that guess can skip an intro the viewer
+  // explicitly asked to keep, while a prompt that arrives a moment late — or
+  // not at all — costs a manual seek. So the lossy fallback is used only where
+  // it is the whole truth: against a server that provably has no enum to read.
+  const introSkipMode: IntroSkipMode | null = (() => {
+    if (supportsIntroSkipMode) {
+      return (
+        (effectivePlaybackSettings?.[SETTING_KEYS.PLAYBACK_INTRO_SKIP_MODE]?.value as
+          | IntroSkipMode
+          | undefined) ?? null
+      );
+    }
+    if (!capabilitiesKnown) return null;
+    // Legacy server. The resolved boolean is read rather than the profile
+    // record so that a profile_device override — this browser told to skip
+    // intros while the household profile is not — keeps working; the record
+    // only carries the profile layer.
+    const legacy = effectivePlaybackSettings?.[SETTING_KEYS.PLAYBACK_AUTO_SKIP_INTRO]?.value as
+      | boolean
+      | undefined;
+    if (legacy === undefined) return watchPageProps.introSkipMode ?? null;
+    return legacy ? "always" : "ask";
+  })();
   const autoSkipRecap = resolvedBool(
     SETTING_KEYS.PLAYBACK_AUTO_SKIP_RECAP,
     watchPageProps.autoSkipRecap,
@@ -895,25 +954,27 @@ export function WatchPlaybackHost() {
   return (
     <PlayerConfigProvider config={playerConfig}>
       {(isForeground || isPostRoll) && <WatchPlaybackTitle title={activeItem.title} />}
-      <WatchPage
-        {...watchPageProps}
-        maxBitrateKbps={maxBitrateKbps ?? null}
-        autoSkipIntro={autoSkipIntro}
-        autoSkipRecap={autoSkipRecap}
-        autoPlayNextPreview={autoPlayNextPreview}
-        canEditMarkers={canEditMarkers}
-        playbackRequestKey={requestKeyValue}
-        onNavigateEpisode={handleNavigateEpisode}
-        onEnded={handleEnded}
-        onExit={handleExit}
-        onMinimize={handleMinimize}
-        displayMode={playerDisplayMode}
-        autoEnterPictureInPicture={state.autoEnterPictureInPicture}
-        onPictureInPictureChange={handlePictureInPictureChange}
-        onPlaybackStateChange={handlePlaybackStateChange}
-        onPlaybackTransportReady={handlePlaybackTransportReady}
-        onReturnFromPostRoll={isPostRoll ? handleReturnFromPostRoll : undefined}
-      />
+      <Suspense fallback={isForeground || isPostRoll ? <PlaybackPreparingScreen /> : null}>
+        <WatchPage
+          {...watchPageProps}
+          maxBitrateKbps={maxBitrateKbps ?? null}
+          introSkipMode={introSkipMode}
+          autoSkipRecap={autoSkipRecap}
+          autoPlayNextPreview={autoPlayNextPreview}
+          canEditMarkers={canEditMarkers}
+          playbackRequestKey={requestKeyValue}
+          onNavigateEpisode={handleNavigateEpisode}
+          onEnded={handleEnded}
+          onExit={handleExit}
+          onMinimize={handleMinimize}
+          displayMode={playerDisplayMode}
+          autoEnterPictureInPicture={state.autoEnterPictureInPicture}
+          onPictureInPictureChange={handlePictureInPictureChange}
+          onPlaybackStateChange={handlePlaybackStateChange}
+          onPlaybackTransportReady={handlePlaybackTransportReady}
+          onReturnFromPostRoll={isPostRoll ? handleReturnFromPostRoll : undefined}
+        />
+      </Suspense>
       {isPostRoll && (
         <PlayingNextScreen
           seriesId={activeItem.series_id}
