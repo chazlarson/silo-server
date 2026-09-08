@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"reflect"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -98,6 +99,22 @@ func candidateIDs(t testing.TB, pool *pgxpool.Pool, query string, args []any) []
 	return ids
 }
 
+// The new query and the legacy oracle select the same candidate *set* only up
+// to which rows survive the limit: the rewrite fills the window criterion-rank
+// first, so a provider hit can displace same-title rows that legacy title
+// ordering kept. Compare unordered; the ordered want check in the caller still
+// pins the rank-first order itself.
+func assertSameCandidateSet(t testing.TB, got, legacy []string) {
+	t.Helper()
+	sortedGot := append([]string(nil), got...)
+	sortedLegacy := append([]string(nil), legacy...)
+	sort.Strings(sortedGot)
+	sort.Strings(sortedLegacy)
+	if !reflect.DeepEqual(sortedGot, sortedLegacy) {
+		t.Fatalf("new=%v legacy=%v", sortedGot, sortedLegacy)
+	}
+}
+
 func TestCandidateLookupMatchesLegacy(t *testing.T) {
 	pool := candidateTestPool(t)
 	ctx := context.Background()
@@ -130,8 +147,12 @@ func TestCandidateLookupMatchesLegacy(t *testing.T) {
 		{"title", MatchItem{Title: "cOmMoN"}, 100, []string{"title-a", "title-b"}},
 		{"provider", MatchItem{ExternalIDs: map[string]string{"isbn": "123"}}, 100, []string{"provider"}},
 		{"series", MatchItem{SeriesName: "sEqUeNcE", SeriesIndex: &index}, 100, []string{"series", "title-a"}},
-		{"combined deduplicated", MatchItem{Title: "Common", ExternalIDs: map[string]string{"isbn": "123", "work": "456", "asin": "789"}, SeriesName: "Sequence", SeriesIndex: &index}, 100, []string{"provider", "series", "title-a", "title-b"}},
-		{"global limit", MatchItem{Title: "Common", ExternalIDs: map[string]string{"isbn": "123"}}, 2, []string{"provider", "title-a"}},
+		// title-a matches through the work-ID provider arm, so it fills the
+		// window at rank 1 alongside provider, before the series and title hits.
+		{"combined deduplicated", MatchItem{Title: "Common", ExternalIDs: map[string]string{"isbn": "123", "work": "456", "asin": "789"}, SeriesName: "Sequence", SeriesIndex: &index}, 100, []string{"provider", "title-a", "series", "title-b"}},
+		{"provider beats title crowd", MatchItem{Title: "Common", ExternalIDs: map[string]string{"isbn": "123"}}, 2, []string{"provider", "title-a"}},
+		{"provider survives title crowd", MatchItem{Title: "Common", ExternalIDs: map[string]string{"isbn": "123"}}, 1, []string{"provider"}},
+		{"series survives title crowd", MatchItem{Title: "Common", SeriesName: "sEqUeNcE", SeriesIndex: &index}, 1, []string{"series"}},
 		{"no match", MatchItem{Title: "Absent", ExternalIDs: map[string]string{"isbn": "missing"}}, 100, nil},
 		{"asin excluded", MatchItem{Title: "Absent", ExternalIDs: map[string]string{"asin": "789"}}, 100, nil},
 		{"empty criteria", MatchItem{}, 2, []string{"provider", "asin-only"}},
@@ -156,9 +177,7 @@ func TestCandidateLookupMatchesLegacy(t *testing.T) {
 				got := candidateIDs(t, pool, query, args)
 				oldQuery, oldArgs := legacyCandidateQuery(source, tc.limit)
 				old := candidateIDs(t, pool, oldQuery, oldArgs)
-				if !reflect.DeepEqual(got, old) {
-					t.Fatalf("new=%v legacy=%v", got, old)
-				}
+				assertSameCandidateSet(t, got, old)
 				if len(got) != len(tc.want) || (len(got) > 0 && !reflect.DeepEqual(got, tc.want)) {
 					t.Fatalf("got=%v want=%v", got, tc.want)
 				}
@@ -178,5 +197,56 @@ func TestCandidateParametersStable(t *testing.T) {
 	}
 	if !reflect.DeepEqual(args, []any{"source", FormatEbook, "a", "first", "z", "last", 100}) {
 		t.Fatalf("args=%v", args)
+	}
+}
+
+// Regression test for candidate windows filling by title order: the crowd
+// shares the source's title and its content IDs sort earliest, so legacy title
+// ordering fills the window with crowd rows and drops the shared-external-ID
+// (rank 1) and series+index (rank 2) hits. Rank-first ordering must keep them.
+func TestCandidateWindowPrefersStrongerCriteria(t *testing.T) {
+	pool := candidateTestPool(t)
+	ctx := context.Background()
+	_, err := pool.Exec(ctx, `
+ INSERT INTO media_items VALUES
+ ('source','ebook','Common'),
+ ('crowd-1','audiobook','Common'),('crowd-2','audiobook','Common'),
+ ('crowd-3','audiobook','Common'),('crowd-4','audiobook','Common'),
+ ('late-provider','audiobook','Zz provider'),('late-series','audiobook','Zz series');
+ INSERT INTO media_item_provider_ids VALUES
+ ('late-provider','isbn','late-isbn','audiobook');
+ INSERT INTO audiobook_series VALUES ('late-series','Backlog Series',2);
+ `)
+	if err != nil {
+		t.Fatal(err)
+	}
+	index := 2.0
+	combined := MatchItem{Title: "Common", ExternalIDs: map[string]string{"isbn": "late-isbn"}, SeriesName: "Backlog Series", SeriesIndex: &index}
+	cases := []struct {
+		name   string
+		source MatchItem
+		want   []string
+	}{
+		{"provider survives crowd", MatchItem{Title: "Common", ExternalIDs: map[string]string{"isbn": "late-isbn"}}, []string{"late-provider", "crowd-1", "crowd-2"}},
+		{"series survives crowd", MatchItem{Title: "Common", SeriesName: "backlog series", SeriesIndex: &index}, []string{"late-series", "crowd-1", "crowd-2"}},
+		{"provider before series before title", combined, []string{"late-provider", "late-series", "crowd-1"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			source := tc.source
+			source.Type = FormatEbook
+			source.ContentID = "source"
+			query, args := matchCandidateIDsQuery(source, 3)
+			got := candidateIDs(t, pool, query, args)
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("got=%v want=%v", got, tc.want)
+			}
+		})
+	}
+	// Document the divergence: legacy title ordering crowds the strong hits out
+	// of the same window, which is the behavior this test exists to prevent.
+	query, args := legacyCandidateQuery(combined, 3)
+	if legacy := candidateIDs(t, pool, query, args); reflect.DeepEqual(legacy, []string{"late-provider", "late-series", "crowd-1"}) {
+		t.Fatalf("legacy oracle unexpectedly matches rank-first result: %v", legacy)
 	}
 }

@@ -164,6 +164,9 @@ func (r *Repository) ListMatchCandidates(ctx context.Context, source MatchItem, 
 	// Two phases: pick candidate IDs with indexable base-table predicates, then
 	// hydrate only those rows. This keeps the per-row lateral aggregates in
 	// queryMatchItems off every opposite-format book and on the LIMIT rows we keep.
+	// The ID phase orders by criterion rank so high-signal lookups survive the
+	// limit; hydration re-orders by title and callers re-score, so the rank
+	// affects membership only.
 	contentIDs, err := r.listMatchCandidateIDs(ctx, source, limit)
 	if err != nil {
 		return nil, err
@@ -216,6 +219,14 @@ func (r *Repository) listMatchCandidateIDs(ctx context.Context, source MatchItem
 // matchCandidateIDsQuery keeps each criterion in an independent index lookup.
 // Combining title and correlated provider/series EXISTS predicates with OR makes
 // PostgreSQL scan the book catalog even when each lookup matches very few rows.
+//
+// Each arm tags its rows with a criterion rank mirroring ScoreCandidate's
+// confidence ordering — a shared external ID (0.98) beats a series+index hit
+// (0.92), which beats a bare title hit (0.9) — and the window fills rank-first.
+// Callers re-score whatever they receive and hydration re-orders by title, so
+// the rank decides which candidates make the cut, not the order they are
+// considered in: a shared-ISBN counterpart survives even when same-title books
+// would fill the window on their own.
 func matchCandidateIDsQuery(source MatchItem, limit int) (string, []any) {
 	seriesTable := "ebook_series"
 	if source.Type == "ebook" {
@@ -226,12 +237,14 @@ func matchCandidateIDsQuery(source MatchItem, limit int) (string, []any) {
 	if strings.TrimSpace(source.Title) != "" {
 		args = append(args, source.Title)
 		lookups = append(lookups, fmt.Sprintf(`
-			SELECT content_id FROM media_items
+			SELECT content_id, 3 AS criterion_rank FROM media_items
 			WHERE type IN ('ebook', 'audiobook') AND type <> $2
 			  AND LOWER(title) = LOWER($%d)`, len(args)))
 	}
-	// Stable parameter ordering lets the prepared-statement cache reuse queries
-	// regardless of Go map iteration order.
+	// Stable parameter ordering keeps the SQL text — and with it the
+	// prepared-statement cache key — identical for one source across rescans.
+	// Sources with different criteria shapes still produce different text and
+	// occupy separate cache entries.
 	providers := make([]string, 0, len(source.ExternalIDs))
 	for provider, providerID := range source.ExternalIDs {
 		if provider != "" && provider != "asin" && providerID != "" {
@@ -242,20 +255,25 @@ func matchCandidateIDsQuery(source MatchItem, limit int) (string, []any) {
 	for _, provider := range providers {
 		args = append(args, provider, source.ExternalIDs[provider])
 		lookups = append(lookups, fmt.Sprintf(`
-			SELECT content_id FROM media_item_provider_ids
+			SELECT content_id, 1 AS criterion_rank FROM media_item_provider_ids
 			WHERE provider = $%d AND provider_id = $%d`, len(args)-1, len(args)))
 	}
 	if strings.TrimSpace(source.SeriesName) != "" && source.SeriesIndex != nil {
 		args = append(args, source.SeriesName, *source.SeriesIndex)
 		lookups = append(lookups, fmt.Sprintf(`
-			SELECT content_id FROM %s
+			SELECT content_id, 2 AS criterion_rank FROM %s
 			WHERE LOWER(series_name) = LOWER($%d) AND series_index = $%d`,
 			seriesTable, len(args)-1, len(args)))
 	}
+	orderBy := "mi.title ASC, mi.content_id ASC"
 	candidateJoin := ""
 	if len(lookups) > 0 {
-		// UNION deduplicates across criteria before the global ordering and limit.
-		candidateJoin = " JOIN (" + strings.Join(lookups, " UNION ") + ") candidates ON candidates.content_id = mi.content_id"
+		// UNION ALL keeps arm costs additive; MIN(criterion_rank) collapses each
+		// content ID to its best criterion before the window fills rank-first.
+		candidateJoin = " JOIN (SELECT candidates.content_id, MIN(candidates.criterion_rank) AS criterion_rank FROM (" +
+			strings.Join(lookups, " UNION ALL ") +
+			") candidates GROUP BY candidates.content_id) ranked ON ranked.content_id = mi.content_id"
+		orderBy = "ranked.criterion_rank ASC, " + orderBy
 	}
 	// Preserve the existing opposite-format fallback when there are no usable
 	// criteria. In particular, an ASIN-only source still uses that fallback.
@@ -274,7 +292,7 @@ func matchCandidateIDsQuery(source MatchItem, limit int) (string, []any) {
 				OR (d.source_content_id = mi.content_id AND d.target_content_id = $1)
 			  )
 		  )
-		ORDER BY mi.title ASC, mi.content_id ASC
+		ORDER BY ` + orderBy + `
 		LIMIT $` + fmt.Sprint(len(args)), args
 }
 

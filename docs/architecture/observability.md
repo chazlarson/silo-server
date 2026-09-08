@@ -224,18 +224,24 @@ Media identifiers and titles are never labels.
 | `silo_literary_match_attempts_total` | Completed automatic calls with `linked`, `already_linked`, `no_match`, or `error` outcomes. |
 
 Candidate selection unions independent title, provider-ID, and series index
-lookups before applying ignored decisions, global ordering, and the limit.
+lookups before applying ignored decisions, ordering, and the limit.
 Combining these criteria with cross-table `OR EXISTS` predicates can scan the
-entire book catalog despite the lookup indexes. Keep deduplication before the
-limit and hydrate metadata only for selected IDs. Sources without usable criteria
-retain the opposite-format fallback. Already-linked automatic calls skip candidate
-selection; unchanged unlinked books are still reconsidered so newly added
-counterparts can be found.
+entire book catalog despite the lookup indexes. The union tags each row with a
+criterion rank that mirrors the scorer's confidence ordering (shared external
+ID, then series+index, then bare title) and the window fills rank-first, so a
+high-signal hit survives even when same-title rows would fill the window on
+their own. Sources without usable criteria retain the opposite-format fallback.
+Already-linked automatic calls skip candidate selection; unchanged unlinked
+books are still reconsidered so newly added counterparts can be found.
 
-The opt-in `TestCandidateLookupLargeCatalog` test compares the old and current
-queries with custom and generic prepared plans on a synthetic catalog. Set
-`SILO_TEST_DATABASE_URL` to a disposable PostgreSQL database and
-`SILO_TEST_LITERARY_PERF=1`, then run
+`TestCandidateLookupMatchesLegacy` compares the candidate sets of the current
+and legacy queries on temporary tables (both plan-cache modes), and
+`TestCandidateWindowPrefersStrongerCriteria` pins the rank-first window order.
+CI runs both against a disposable Postgres service container; locally they need
+`SILO_TEST_DATABASE_URL`. The opt-in `TestCandidateLookupLargeCatalog`
+compares the old and current queries with custom and generic prepared plans on
+a synthetic catalog. Set `SILO_TEST_DATABASE_URL` to a disposable PostgreSQL
+database and `SILO_TEST_LITERARY_PERF=1`, then run
 `go test ./internal/literaryworks -run TestCandidateLookupLargeCatalog -count=1 -v`.
 The fixture uses temporary tables and checks execution plans for catalog-wide
 work and unnecessary JIT. Treat reported timings as local test results rather
